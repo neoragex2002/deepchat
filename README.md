@@ -39,6 +39,7 @@
 - [👥 Community \& Contribution](#-community--contribution)
 - [⭐ Star History](#-star-history)
 - [👨‍💻 Contributors](#-contributors)
+- [�🏻 Thanks](#-thanks)
 - [📃 License](#-license)
 
 ## 🚀 Project Introduction
@@ -340,3 +341,4 @@ This project is built with the help of these awesome libraries:
 
 [LICENSE](./LICENSE)
 
+[![Ask DeepWiki](https://deepwiki.com/badge.svg)](https://deepwiki.com/neoragex2002/deepchat)
