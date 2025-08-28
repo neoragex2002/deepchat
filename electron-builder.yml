@@ -26,6 +26,8 @@ files:
 asarUnpack:
   - '**/node_modules/sharp/**/*'
   - '**/node_modules/@img/**/*'
+  - 'app.asar.unpacked/runtime/**'
+  - 'app.asar.unpacked/internal-proxy/**'
 extraResources:
   - from: ./runtime/
     to: app.asar.unpacked/runtime

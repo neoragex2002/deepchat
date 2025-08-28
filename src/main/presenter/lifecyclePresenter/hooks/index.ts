@@ -15,3 +15,6 @@ export { floatingDestroyHook } from './beforeQuit/floatingDestroyHook'
 export { presenterDestroyHook } from './beforeQuit/presenterDestroyHook'
 export { builtinKnowledgeDestroyHook } from './beforeQuit/builtinKnowledgeDestroyHook'
 export { windowQuittingHook } from './beforeQuit/windowQuittingHook'
+
+// 导出 proxyHooks.ts 中定义的钩子，使它们能够被 registerCoreHooks 发现
+export { unzipProxyHook, startProxyHook, stopProxyHook } from './proxyHooks'
