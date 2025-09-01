@@ -39,7 +39,9 @@
 - [👥 Community \& Contribution](#-community--contribution)
 - [⭐ Star History](#-star-history)
 - [👨‍💻 Contributors](#-contributors)
+- [�🏻 Thanks](#-thanks)
 - [📃 License](#-license)
+- [DEBUG](#debug)
 
 ## 🚀 Project Introduction
 
@@ -339,4 +341,23 @@ This project is built with the help of these awesome libraries:
 ## 📃 License
 
 [LICENSE](./LICENSE)
+
+## DEBUG
+```powershell
+//in powershell
+
+Remove-Item -Recurse -Force "node_modules"
+Remove-Item -Force "pnpm-lock.yaml"
+$env:ELECTRON_MIRROR="https://npmmirror.com/mirrors/electron/"
+pnpm install --registry=https://registry.npmmirror.com/
+pnpm exec electron --version
+
+$env:ELECTRON_MIRROR="https://npmmirror.com/mirrors/electron/"
+Remove-Item -Recurse -Force "node_modules\.pnpm\electron@37.4.0"
+pnpm install
+pnpm exec electron --version
+
+pnpm run installRuntime
+pnpm dev
+```
 
