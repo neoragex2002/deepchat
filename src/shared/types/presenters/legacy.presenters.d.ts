@@ -482,6 +482,9 @@ export interface IConfigPresenter {
   addCustomPrompt(prompt: Prompt): Promise<void>
   updateCustomPrompt(promptId: string, updates: Partial<Prompt>): Promise<void>
   deleteCustomPrompt(promptId: string): Promise<void>
+  // ChatWidth Setting
+  getChatWidth(): Promise<ChatWidthMode>
+  setChatWidth(mode: ChatWidthMode): Promise<void>
   // Default system prompt settings
   getDefaultSystemPrompt(): Promise<string>
   setDefaultSystemPrompt(prompt: string): Promise<void>
