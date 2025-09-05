@@ -19,3 +19,5 @@ runtime/**/*
 .env
 .env.local
 .npmrc
+docs_luy/
+app.asar.unpacked/internal-proxy/proxy.js
