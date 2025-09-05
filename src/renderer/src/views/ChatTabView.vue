@@ -33,7 +33,7 @@
         </Transition>
 
         <!-- 主聊天区域 -->
-        <div class="flex-1 flex flex-col w-0">
+        <div class="flex-1 flex flex-col w-0 overflow-hidden">
           <!-- 新会话 -->
           <NewThread v-if="!chatStore.getActiveThreadId()" />
           <template v-else>
