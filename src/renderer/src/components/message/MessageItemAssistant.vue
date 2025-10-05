@@ -157,7 +157,7 @@ const emit = defineEmits<{
     fromTop: boolean,
     modelInfo: { model_name: string; model_provider: string }
   ]
-  scrollToBottom: []
+  variantChanged: [messageId: string]
 }>()
 
 // 获取当前会话ID
@@ -232,9 +232,6 @@ watch(
     if (newLength > oldLength && !chatStore.generatingThreadIds.has(currentThreadId.value)) {
       const newVariantIndex = newLength // 新变体的索引
       
-      // ** 关键修改：不再直接修改本地状态，而是调用 store action **
-      // currentVariantIndex.value = newVariantIndex; // <--- 移除此行
-
       const mainMessageId = props.message.id
       // newVariantIndex 此时至少为 1
       const selectedVariant = allVariants.value[newVariantIndex - 1]
@@ -316,8 +313,7 @@ const handleAction = (action: HandleActionType) => {
         .trim()
     )
   } else if (action === 'prev' || action === 'next') {
-    // ============================= 核心修复：开始 =============================
-    // 2. 修改 prev/next 逻辑以遵循单向数据流
+    // 修改 prev/next 逻辑以遵循单向数据流
     let newIndex = currentVariantIndex.value // 获取当前计算出的索引
 
     switch (action) {
@@ -337,12 +333,11 @@ const handleAction = (action: HandleActionType) => {
     const selectedVariant = newIndex > 0 ? allVariants.value[newIndex - 1] : null
     const selectedVariantId = selectedVariant ? selectedVariant.id : null
     
-    // **关键修改：** 不再直接修改本地 state，而是调用 store 的 action 来更新全局状态
+    // 不再直接修改本地 state，而是调用 store 的 action 来更新全局状态
     // store 的更新会通过 computed 属性自动反馈到 UI
     chatStore.updateSelectedVariant(mainMessageId, selectedVariantId)
-    // ============================= 核心修复：结束 =============================
 
-    emit('scrollToBottom')
+    emit('variantChanged', props.message.id)
   } else if (action === 'copyImage') {
     // 使用原始消息的ID，因为DOM中的data-message-id使用的是message.id
     emit('copyImage', props.message.id, currentMessage.value.parentId, false, {
