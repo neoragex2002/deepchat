@@ -36,7 +36,14 @@ export const useChatStore = defineStore('chat', () => {
       dtThreads: CONVERSATION[]
     }[]
   >([])
+
+  // NOTE: messagesMap stores the RAW message objects fetched from the main process.
+  // For assistant messages, the `content` field holds the original main content,
+  // and the `variants` array contains all possible variations.
+  // This raw structure is ESSENTIAL for operations like deleting a specific variant.
+  // For displaying content, use the `variantAwareMessages` computed property instead.
   const messagesMap = ref<Map<number, AssistantMessage[] | UserMessage[]>>(new Map())
+
   const generatingThreadIds = ref(new Set<string>())
   const isSidebarOpen = ref(false)
   const isMessageNavigationOpen = ref(false)
@@ -112,6 +119,10 @@ export const useChatStore = defineStore('chat', () => {
     return threads.value.flatMap((t) => t.dtThreads).find((t) => t.id === getActiveThreadId())
   })
 
+  // NOTE: This computed property dynamically combines messages from `messagesMap` with
+  // the user's choices in `selectedVariantsMap`. It produces a "view-ready" list
+  // where each assistant message's content reflects the currently selected variant.
+  // ALWAYS use this for rendering or any logic that needs the displayed content.
   const variantAwareMessages = computed(() => {
     const messages = getMessages()
     const currentSelectedVariants = selectedVariantsMap.value
