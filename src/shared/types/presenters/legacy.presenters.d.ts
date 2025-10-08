@@ -707,7 +707,6 @@ export interface ILlmProviderPresenter {
   ): Promise<string>
 }
 
-/*
 export type CONVERSATION_SETTINGS = {
   systemPrompt: string
   temperature: number
@@ -723,8 +722,8 @@ export type CONVERSATION_SETTINGS = {
   searchStrategy?: 'turbo' | 'max'
   reasoningEffort?: 'minimal' | 'low' | 'medium' | 'high'
   verbosity?: 'low' | 'medium' | 'high'
+  selectedVariantsMap?: Record<string, string>
 }
-*/
 
 export type CONVERSATION = {
   id: string
