@@ -91,6 +91,9 @@ function isSessionError(error: unknown): error is SessionError {
   return false
 }
 
+// Define command categories for stdio transport
+type StdioCommandCategory = 'WSL' | 'AppBundledRuntime' | 'GenericSystem'
+
 // MCP client class
 export class McpClient {
   private client: Client | null = null
@@ -231,6 +234,14 @@ export class McpClient {
   ): { command: string; args: string[] } {
     const basename = path.basename(command)
 
+    // Handle WSL command: do not modify its arguments as they are meant for the WSL environment
+    if (basename.toLowerCase() === 'wsl') {
+      return {
+        command: this.replaceWithRuntimeCommand(command), // This usually returns 'wsl' unchanged
+        args: args // Return original args
+      }
+    }
+
     // Handle npx command
     if (basename === 'npx' || command.includes('npx')) {
       if (process.platform === 'win32') {
@@ -367,221 +378,8 @@ export class McpClient {
     try {
       console.info(`Starting MCP server ${this.serverName}...`, this.serverConfig)
 
-      // Handle customHeaders and AuthProvider
-      let authProvider: SimpleOAuthProvider | null = null
-      const customHeaders = this.serverConfig.customHeaders
-        ? { ...(this.serverConfig.customHeaders as Record<string, string>) } // Create copy for modification
-        : {}
-
-      if (customHeaders.Authorization) {
-        authProvider = new SimpleOAuthProvider(customHeaders.Authorization)
-        delete customHeaders.Authorization // Remove from headers as it will be handled by AuthProvider
-      }
-
-      if (this.serverConfig.type === 'inmemory') {
-        const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair()
-        const _args = Array.isArray(this.serverConfig.args) ? this.serverConfig.args : []
-        const _env = this.serverConfig.env ? (this.serverConfig.env as Record<string, string>) : {}
-        const _server = getInMemoryServer(this.serverName, _args, _env)
-        _server.startServer(serverTransport)
-        this.transport = clientTransport
-      } else if (this.serverConfig.type === 'stdio') {
-        // Create appropriate transport
-        let command = this.serverConfig.command as string
-        let args = this.serverConfig.args as string[]
-
-        // Handle path expansion (including ~ and environment variables)
-        command = this.expandPath(command)
-        args = args.map((arg) => this.expandPath(arg))
-
-        const HOME_DIR = app.getPath('home')
-
-        // Define allowed environment variables whitelist
-        const allowedEnvVars = [
-          'PATH',
-          'path',
-          'Path',
-          'npm_config_registry',
-          'npm_config_cache',
-          'npm_config_prefix',
-          'npm_config_tmp',
-          'NPM_CONFIG_REGISTRY',
-          'NPM_CONFIG_CACHE',
-          'NPM_CONFIG_PREFIX',
-          'NPM_CONFIG_TMP'
-          // 'GRPC_PROXY',
-          // 'grpc_proxy'
-        ]
-
-        // Fix env type issue
-        const env: Record<string, string> = {}
-
-        // Handle command and argument replacement
-        const processedCommand = this.processCommandWithArgs(command, args)
-        command = processedCommand.command
-        args = processedCommand.args
-
-        // Determine if it's Node.js/Bun/UV related command
-        const isNodeCommand = ['node', 'npm', 'npx', 'bun', 'uv', 'uvx'].some(
-          (cmd) => command.includes(cmd) || args.some((arg) => arg.includes(cmd))
-        )
-
-        if (isNodeCommand) {
-          // Node.js/Bun/UV commands use whitelist processing
-          if (process.env) {
-            const existingPaths: string[] = []
-
-            // Collect all PATH-related values
-            Object.entries(process.env).forEach(([key, value]) => {
-              if (value !== undefined) {
-                if (['PATH', 'Path', 'path'].includes(key)) {
-                  existingPaths.push(value)
-                } else if (
-                  allowedEnvVars.includes(key) &&
-                  !['PATH', 'Path', 'path'].includes(key)
-                ) {
-                  env[key] = value
-                }
-              }
-            })
-
-            // Get default paths
-            const defaultPaths = this.getDefaultPaths(HOME_DIR)
-
-            // 合并所有路径
-            const allPaths = [...existingPaths, ...defaultPaths]
-            // 添加运行时路径
-            if (process.platform === 'win32') {
-              // Windows平台只添加 node 和 uv 路径
-              if (this.uvRuntimePath) {
-                allPaths.unshift(this.uvRuntimePath)
-              }
-              if (this.nodeRuntimePath) {
-                allPaths.unshift(this.nodeRuntimePath)
-              }
-            } else {
-              // 其他平台优先级：bun > node > uv
-              if (this.uvRuntimePath) {
-                allPaths.unshift(this.uvRuntimePath)
-              }
-              if (this.nodeRuntimePath) {
-                allPaths.unshift(path.join(this.nodeRuntimePath, 'bin'))
-              }
-              if (this.bunRuntimePath) {
-                allPaths.unshift(this.bunRuntimePath)
-              }
-            }
-
-            // 规范化并设置PATH
-            const { key, value } = this.normalizePathEnv(allPaths)
-            env[key] = value
-          }
-        } else {
-          // 非 Node.js/Bun/UV 命令，保留所有系统环境变量，只补充 PATH
-          Object.entries(process.env).forEach(([key, value]) => {
-            if (value !== undefined) {
-              env[key] = value
-            }
-          })
-
-          // 补充 PATH
-          const existingPaths: string[] = []
-          if (env.PATH) {
-            existingPaths.push(env.PATH)
-          }
-          if (env.Path) {
-            existingPaths.push(env.Path)
-          }
-
-          // 获取默认路径
-          const defaultPaths = this.getDefaultPaths(HOME_DIR)
-
-          // 合并所有路径
-          const allPaths = [...existingPaths, ...defaultPaths]
-          // 添加运行时路径
-          if (process.platform === 'win32') {
-            // Windows平台只添加 node 和 uv 路径
-            if (this.uvRuntimePath) {
-              allPaths.unshift(this.uvRuntimePath)
-            }
-            if (this.nodeRuntimePath) {
-              allPaths.unshift(this.nodeRuntimePath)
-            }
-          } else {
-            // 其他平台优先级：bun > node > uv
-            if (this.uvRuntimePath) {
-              allPaths.unshift(this.uvRuntimePath)
-            }
-            if (this.nodeRuntimePath) {
-              allPaths.unshift(path.join(this.nodeRuntimePath, 'bin'))
-            }
-            if (this.bunRuntimePath) {
-              allPaths.unshift(this.bunRuntimePath)
-            }
-          }
-
-          // 规范化并设置PATH
-          const { key, value } = this.normalizePathEnv(allPaths)
-          env[key] = value
-        }
-
-        // 添加自定义环境变量
-        if (this.serverConfig.env) {
-          Object.entries(this.serverConfig.env as Record<string, string>).forEach(
-            ([key, value]) => {
-              if (value !== undefined) {
-                // 如果是PATH相关变量，合并到主PATH中
-                if (['PATH', 'Path', 'path'].includes(key)) {
-                  const currentPathKey = process.platform === 'win32' ? 'Path' : 'PATH'
-                  const separator = process.platform === 'win32' ? ';' : ':'
-                  env[currentPathKey] = env[currentPathKey]
-                    ? `${value}${separator}${env[currentPathKey]}`
-                    : value
-                } else {
-                  env[key] = value
-                }
-              }
-            }
-          )
-        }
-
-        if (this.npmRegistry) {
-          env.npm_config_registry = this.npmRegistry
-        }
-
-        if (this.uvRegistry) {
-          env.UV_DEFAULT_INDEX = this.uvRegistry
-          env.PIP_INDEX_URL = this.uvRegistry
-        }
-
-        // console.log('mcp env', command, env, args)
-        this.transport = new StdioClientTransport({
-          command,
-          args,
-          env,
-          stderr: 'pipe'
-        })
-        ;(this.transport as StdioClientTransport).stderr?.on('data', (data) => {
-          console.info('mcp StdioClientTransport error', this.serverName, data.toString())
-        })
-      } else if (this.serverConfig.baseUrl && this.serverConfig.type === 'sse') {
-        this.transport = new SSEClientTransport(new URL(this.serverConfig.baseUrl as string), {
-          requestInit: { headers: customHeaders },
-          // eslint-disable-next-line @typescript-eslint/no-explicit-any
-          authProvider: (authProvider ?? undefined) as any
-        })
-      } else if (this.serverConfig.baseUrl && this.serverConfig.type === 'http') {
-        this.transport = new StreamableHTTPClientTransport(
-          new URL(this.serverConfig.baseUrl as string),
-          {
-            requestInit: { headers: customHeaders },
-            // eslint-disable-next-line @typescript-eslint/no-explicit-any
-            authProvider: (authProvider ?? undefined) as any
-          }
-        )
-      } else {
-        throw new Error(`Unsupported transport type: ${this.serverConfig.type}`)
-      }
+      // Create transport using the new private helper method
+      this.transport = this._createTransport()
 
       // 创建 MCP 客户端
       this.client = new Client(
@@ -687,6 +485,7 @@ export class McpClient {
     // 关闭transport
     if (this.transport) {
       try {
+        // TODO: Remove stderr listener if StdioClientTransport to prevent memory leaks
         this.transport.close()
       } catch (error) {
         console.error(`Failed to close MCP transport:`, error)
@@ -1132,6 +931,300 @@ export class McpClient {
       this.cachedResources = null
       throw error
     }
+  }
+
+  // =================================================================
+  // Refactored private methods for transport creation
+  // =================================================================
+
+  /**
+   * Main dispatcher for creating the correct transport based on server config.
+   */
+  private _createTransport(): Transport {
+    // Handle customHeaders and AuthProvider (common for HTTP-based transports)
+    let authProvider: SimpleOAuthProvider | null = null
+    const customHeaders = this.serverConfig.customHeaders
+      ? { ...(this.serverConfig.customHeaders as Record<string, string>) }
+      : {}
+
+    if (customHeaders.Authorization) {
+      authProvider = new SimpleOAuthProvider(customHeaders.Authorization)
+      delete customHeaders.Authorization
+    }
+
+    const type = this.serverConfig.type
+    switch (type) {
+      case 'inmemory': {
+        const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair()
+        const _args = Array.isArray(this.serverConfig.args) ? this.serverConfig.args : []
+        const _env = this.serverConfig.env ? (this.serverConfig.env as Record<string, string>) : {}
+        const _server = getInMemoryServer(this.serverName, _args, _env)
+        _server.startServer(serverTransport)
+        return clientTransport
+      }
+      case 'stdio':
+        return this._createStdioTransport()
+      case 'sse':
+        if (!this.serverConfig.baseUrl) throw new Error('SSE transport requires a baseUrl')
+        return new SSEClientTransport(new URL(this.serverConfig.baseUrl as string), {
+          requestInit: { headers: customHeaders },
+          // eslint-disable-next-line @typescript-eslint/no-explicit-any
+          authProvider: (authProvider ?? undefined) as any
+        })
+      case 'http':
+        if (!this.serverConfig.baseUrl) throw new Error('HTTP transport requires a baseUrl')
+        return new StreamableHTTPClientTransport(new URL(this.serverConfig.baseUrl as string), {
+          requestInit: { headers: customHeaders },
+          // eslint-disable-next-line @typescript-eslint/no-explicit-any
+          authProvider: (authProvider ?? undefined) as any
+        })
+      default:
+        throw new Error(`Unsupported transport type: ${type}`)
+    }
+  }
+
+  /**
+   * Creates a StdioClientTransport after determining the correct command, args, and environment.
+   */
+  private _createStdioTransport(): StdioClientTransport {
+    // 1. Expand paths in command and args
+    const command = this.expandPath(this.serverConfig.command as string)
+    const args = (this.serverConfig.args as string[]).map((arg) => this.expandPath(arg))
+
+    // 2. Categorize the command to determine environment preparation strategy
+    const category = this._categorizeStdioCommand(command, args)
+
+    // 3. Prepare the final command, args, and environment based on the category
+    let finalCommand: string
+    let finalArgs: string[]
+    let finalEnv: Record<string, string>
+
+    switch (category) {
+      case 'WSL':
+        ;({
+          command: finalCommand,
+          args: finalArgs,
+          env: finalEnv
+        } = this._prepareWslEnvironment(command, args))
+        break
+      case 'AppBundledRuntime':
+        ;({
+          command: finalCommand,
+          args: finalArgs,
+          env: finalEnv
+        } = this._prepareAppBundledRuntimeEnvironment(command, args))
+        break
+      case 'GenericSystem':
+        ;({
+          command: finalCommand,
+          args: finalArgs,
+          env: finalEnv
+        } = this._prepareGenericSystemEnvironment(command, args))
+        break
+    }
+
+    // 4. Create and return the transport instance
+    const transport = new StdioClientTransport({
+      command: finalCommand,
+      args: finalArgs,
+      env: finalEnv,
+      stderr: 'pipe'
+    })
+    transport.stderr?.on('data', (data) => {
+      console.info('mcp StdioClientTransport error', this.serverName, data.toString())
+    })
+    return transport
+  }
+
+  /**
+   * Categorizes the stdio command to apply the correct environment setup.
+   */
+  private _categorizeStdioCommand(command: string, args: string[]): StdioCommandCategory {
+    const basename = path.basename(command)
+    if (basename.toLowerCase() === 'wsl') {
+      return 'WSL'
+    }
+
+    // This logic exactly mirrors the original `isNodeCommand` check
+    const isAppRuntimeCommand = ['node', 'npm', 'npx', 'bun', 'uv', 'uvx'].some(
+      (cmd) => command.includes(cmd) || args.some((arg) => arg.includes(cmd))
+    )
+
+    if (isAppRuntimeCommand) {
+      return 'AppBundledRuntime'
+    }
+
+    return 'GenericSystem'
+  }
+
+  /**
+   * Prepares the environment for WSL commands.
+   * Inherits the full process environment and does not inject Windows-specific paths.
+   */
+  private _prepareWslEnvironment(
+    command: string,
+    args: string[]
+  ): { command: string; args: string[]; env: Record<string, string> } {
+    const processed = this.processCommandWithArgs(command, args)
+    const env: Record<string, string> = {}
+
+    // Inherit the full environment, as WSL might need it. Avoid aggressive whitelisting.
+    Object.entries(process.env).forEach(([key, value]) => {
+      if (value !== undefined) {
+        env[key] = value
+      }
+    })
+
+    // Add custom environment variables from config
+    if (this.serverConfig.env) {
+      Object.assign(env, this.serverConfig.env)
+    }
+
+    // Do NOT inject Windows-based runtime paths or npm/uv registry env vars,
+    // as they are not applicable inside the WSL environment.
+
+    return { command: processed.command, args: processed.args, env }
+  }
+
+  /**
+   * Prepares the environment for commands that use the app's bundled runtimes (Node, Bun, UV).
+   * This contains the logic from the original `if (isNodeCommand)` block.
+   */
+  private _prepareAppBundledRuntimeEnvironment(
+    command: string,
+    args: string[]
+  ): { command: string; args: string[]; env: Record<string, string> } {
+    const processed = this.processCommandWithArgs(command, args)
+    const env: Record<string, string> = {}
+
+    // This is the moved logic from the original `if (isNodeCommand)` block
+    const allowedEnvVars = [
+      'PATH',
+      'path',
+      'Path',
+      'npm_config_registry',
+      'npm_config_cache',
+      'npm_config_prefix',
+      'npm_config_tmp',
+      'NPM_CONFIG_REGISTRY',
+      'NPM_CONFIG_CACHE',
+      'NPM_CONFIG_PREFIX',
+      'NPM_CONFIG_TMP'
+    ]
+
+    if (process.env) {
+      const existingPaths: string[] = []
+      Object.entries(process.env).forEach(([key, value]) => {
+        if (value !== undefined) {
+          if (['PATH', 'Path', 'path'].includes(key)) {
+            existingPaths.push(value)
+          } else if (allowedEnvVars.includes(key) && !['PATH', 'Path', 'path'].includes(key)) {
+            env[key] = value
+          }
+        }
+      })
+
+      const defaultPaths = this.getDefaultPaths(app.getPath('home'))
+      const allPaths = [...existingPaths, ...defaultPaths]
+
+      if (process.platform === 'win32') {
+        if (this.uvRuntimePath) allPaths.unshift(this.uvRuntimePath)
+        if (this.nodeRuntimePath) allPaths.unshift(this.nodeRuntimePath)
+      } else {
+        if (this.uvRuntimePath) allPaths.unshift(this.uvRuntimePath)
+        if (this.nodeRuntimePath) allPaths.unshift(path.join(this.nodeRuntimePath, 'bin'))
+        if (this.bunRuntimePath) allPaths.unshift(this.bunRuntimePath)
+      }
+
+      const { key, value } = this.normalizePathEnv(allPaths)
+      env[key] = value
+    }
+
+    if (this.serverConfig.env) {
+      Object.entries(this.serverConfig.env as Record<string, string>).forEach(([key, value]) => {
+        if (value !== undefined) {
+          if (['PATH', 'Path', 'path'].includes(key)) {
+            const currentPathKey = process.platform === 'win32' ? 'Path' : 'PATH'
+            const separator = process.platform === 'win32' ? ';' : ':'
+            env[currentPathKey] = env[currentPathKey]
+              ? `${value}${separator}${env[currentPathKey]}`
+              : value
+          } else {
+            env[key] = value
+          }
+        }
+      })
+    }
+
+    if (this.npmRegistry) env.npm_config_registry = this.npmRegistry
+    if (this.uvRegistry) {
+      env.UV_DEFAULT_INDEX = this.uvRegistry
+      env.PIP_INDEX_URL = this.uvRegistry
+    }
+
+    return { command: processed.command, args: processed.args, env }
+  }
+
+  /**
+   * Prepares the environment for generic system commands.
+   * This contains the logic from the original `else` block for non-node commands.
+   */
+  private _prepareGenericSystemEnvironment(
+    command: string,
+    args: string[]
+  ): { command: string; args: string[]; env: Record<string, string> } {
+    const processed = this.processCommandWithArgs(command, args)
+    const env: Record<string, string> = {}
+
+    // This is the moved logic from the original `else` block
+    Object.entries(process.env).forEach(([key, value]) => {
+      if (value !== undefined) {
+        env[key] = value
+      }
+    })
+
+    const existingPaths: string[] = []
+    if (env.PATH) existingPaths.push(env.PATH)
+    if (env.Path) existingPaths.push(env.Path)
+
+    const defaultPaths = this.getDefaultPaths(app.getPath('home'))
+    const allPaths = [...existingPaths, ...defaultPaths]
+
+    if (process.platform === 'win32') {
+      if (this.uvRuntimePath) allPaths.unshift(this.uvRuntimePath)
+      if (this.nodeRuntimePath) allPaths.unshift(this.nodeRuntimePath)
+    } else {
+      if (this.uvRuntimePath) allPaths.unshift(this.uvRuntimePath)
+      if (this.nodeRuntimePath) allPaths.unshift(path.join(this.nodeRuntimePath, 'bin'))
+      if (this.bunRuntimePath) allPaths.unshift(this.bunRuntimePath)
+    }
+
+    const { key, value } = this.normalizePathEnv(allPaths)
+    env[key] = value
+
+    if (this.serverConfig.env) {
+      Object.entries(this.serverConfig.env as Record<string, string>).forEach(([key, value]) => {
+        if (value !== undefined) {
+          if (['PATH', 'Path', 'path'].includes(key)) {
+            const currentPathKey = process.platform === 'win32' ? 'Path' : 'PATH'
+            const separator = process.platform === 'win32' ? ';' : ':'
+            env[currentPathKey] = env[currentPathKey]
+              ? `${value}${separator}${env[currentPathKey]}`
+              : value
+          } else {
+            env[key] = value
+          }
+        }
+      })
+    }
+
+    if (this.npmRegistry) env.npm_config_registry = this.npmRegistry
+    if (this.uvRegistry) {
+      env.UV_DEFAULT_INDEX = this.uvRegistry
+      env.PIP_INDEX_URL = this.uvRegistry
+    }
+
+    return { command: processed.command, args: processed.args, env }
   }
 }
 
