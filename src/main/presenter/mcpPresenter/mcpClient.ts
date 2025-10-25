@@ -117,6 +117,9 @@ export class McpClient {
   private isCleaningUp: boolean = false
   // Keep a reference to stderr listener to remove it on cleanup
   private stderrListener: ((data: Buffer) => void) | null = null
+  // Track stdio child process and its listeners for lifecycle handling
+  private stdioProcess: any | null = null
+  private stdioProcessListeners: { [event: string]: (...args: any[]) => void } | null = null
 
   constructor(
     serverName: string,
@@ -189,15 +192,15 @@ export class McpClient {
           const connectPromise = this.client
             .connect(this.transport)
             .then(() => {
-              // 如果在超时清理后才成功，这里直接忽略，避免状态错乱
-              if (this.isCleaningUp || timedOut) {
-                return
-              }
-
-              // 清除超时
+              // 先清理连接超时句柄，避免悬挂计时器
               if (this.connectionTimeout) {
                 clearTimeout(this.connectionTimeout)
                 this.connectionTimeout = null
+              }
+
+              // 如果在超时清理后才成功，这里直接忽略，避免状态错乱
+              if (this.isCleaningUp || timedOut) {
+                return
               }
 
               this.isConnected = true
@@ -260,11 +263,24 @@ export class McpClient {
       this.connectionTimeout = null
     }
 
-    // —— 下面这段清理逻辑应始终执行（不要放进上面的 if 里）——
+    // 下面这段清理逻辑应始终执行（不要放进上面的 if 里）
     try {
-      ;(this.transport as any)?.stderr?.removeListener?.('data', this.stderrListener)
+      if (this.stderrListener) {
+        ;(this.transport as any)?.stderr?.removeListener?.('data', this.stderrListener)
+      }
     } catch {}
     this.stderrListener = null
+
+    // 移除并清空 stdio 进程生命周期监听器
+    try {
+      if (this.stdioProcess && this.stdioProcessListeners) {
+        for (const [evt, fn] of Object.entries(this.stdioProcessListeners)) {
+          this.stdioProcess.removeListener?.(evt, fn)
+        }
+      }
+    } catch {}
+    this.stdioProcess = null
+    this.stdioProcessListeners = null
 
     try {
       await (this.client as any)?.close?.()
@@ -283,6 +299,9 @@ export class McpClient {
     this.cachedTools = null
     this.cachedPrompts = null
     this.cachedResources = null
+
+    // 标记清理结束，避免后续流程被永久挡住
+    this.isCleaningUp = false
   }
 
   // Register notification handlers
@@ -828,7 +847,13 @@ export class McpClient {
         }
       }
 
+      /*
       // Conservative: if final command is bun, strip proxy vars to avoid known bun proxy issues
+      // 说明：bun与proxy环境变量存在一致性/兼容性BUG，可删除环境变量规避，但会影响其网络请求，暂时注释掉。需使用者自行慎重处理
+      // 如一定要为bun启用proxy：
+      //   1. 脚本中显式用 fetch(url, { proxy: 'http(s)://...' })，不能只依赖环境变量
+      //   2. 确保NO_PROXY 写成纯逗号分隔、无空格
+      //   3. 包安装问题优先用 bunfig.toml 配镜像/私有源
       const base = this.stripExeCmdExt(processed.command)
       if (base === 'bun') {
         const proxyKeys = [
@@ -852,6 +877,7 @@ export class McpClient {
           console.debug(`[MCP][Stdio] removed ${removed} proxy env(s) for bun`)
         }
       }
+      */
 
       console.debug(
         `[MCP][Stdio] final profile: cmd=${processed.command} cwd=${cwd || ''} env.keys=${Object.keys(env).length}`
@@ -1045,6 +1071,7 @@ export class McpClient {
       return fs.existsSync(candidate) ? candidate : name
     }
 
+    // 遗留问题：一次性获取，永久缓存。缺乏对环境变化的响应能力（用户更改了 shell 配置后无法反映）
     private async getLoginShellEnv(): Promise<Record<string, string>> {
       if (StdioCommandBuilder.loginShellEnvPromise) return StdioCommandBuilder.loginShellEnvPromise
 
@@ -1244,6 +1271,42 @@ export class McpClient {
       console.warn('MCP StdioClientTransport stderr: ', this.serverName, '-', data.toString())
     }
     transport.stderr?.on('data', this.stderrListener)
+
+    // 监听 stdio 子进程生命周期事件，确保异常退出时能正确下线与广播状态
+    const child: any = (transport as any).process ?? null
+    this.stdioProcess = child
+    if (child) {
+      const handleTerminate = async (reason: string) => {
+        // 避免重复清理/竞态
+        if (this.isCleaningUp) return
+        try {
+          await this.internalDisconnect(reason)
+        } catch (e) {
+          console.error(`[MCP][Stdio] error during terminate handling (${reason}):`, e)
+        }
+      }
+      const onExit = (code?: number, signal?: string) => {
+        console.warn(
+          `[MCP][Stdio] process exit for ${this.serverName}: code=${code} signal=${signal}`
+        )
+        void handleTerminate('stdio process exited')
+      }
+      const onClose = (code?: number, signal?: string) => {
+        console.warn(
+          `[MCP][Stdio] process close for ${this.serverName}: code=${code} signal=${signal}`
+        )
+        void handleTerminate('stdio process closed')
+      }
+      const onError = (err: unknown) => {
+        console.error(`[MCP][Stdio] process error for ${this.serverName}:`, err)
+        void handleTerminate('stdio process error')
+      }
+
+      child.on?.('exit', onExit)
+      child.on?.('close', onClose)
+      child.on?.('error', onError)
+      this.stdioProcessListeners = { exit: onExit, close: onClose, error: onError }
+    }
     return transport
   }
 }
