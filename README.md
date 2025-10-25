@@ -108,7 +108,22 @@ Compared to other AI tools, DeepChat offers the following unique advantages:
 - 💰 **Business-Friendly**:
   - Embraces open source, based on the Apache License 2.0 protocol, enterprise use without worry
   - Enterprise integration requires only minimal configuration code changes to use reserved encrypted obfuscation security capabilities
-  - Clear code structure, both model providers and MCP services are highly decoupled, can be freely customized with minimal cost
+- Clear code structure, both model providers and MCP services are highly decoupled, can be freely customized with minimal cost
+
+### MCP Transports and WSL Usage
+
+- Supported MCP transports: `stdio`, `sse`, `http`, `inmemory`.
+- WSL is not a transport type. To run an MCP server inside WSL, use `type: "stdio"` with `command: "wsl"` and pass the WSL-side command in `args`, e.g.:
+
+```json
+{
+  "type": "stdio",
+  "command": "wsl",
+  "args": ["bash", "-lc", "uvx osm-mcp-server"]
+}
+```
+
+See `docs/mcp-architecture.md` for more details.
   - Reasonable architecture, data interaction and UI behavior separation, fully utilizing Electron's capabilities, rejecting simple web wrappers, excellent performance
 
 For more details on how to use these features, see the [User Guide](./docs/user-guide.md).
@@ -360,4 +375,3 @@ pnpm exec electron --version
 pnpm run installRuntime
 pnpm dev
 ```
-

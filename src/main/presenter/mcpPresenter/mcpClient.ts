@@ -16,6 +16,7 @@ import path from 'path'
 import { presenter } from '@/presenter'
 import { app } from 'electron'
 import fs from 'fs'
+import { spawn } from 'child_process'
 // import { NO_PROXY, proxyConfig } from '@/presenter/proxyConfig'
 import { getInMemoryServer } from './inMemoryServers/builder'
 import { StreamableHTTPClientTransport } from '@modelcontextprotocol/sdk/client/streamableHttp.js'
@@ -47,10 +48,7 @@ class SimpleOAuthProvider {
   }
 }
 
-// Ensure TypeScript can recognize SERVER_STATUS_CHANGED property
-type MCPEventsType = typeof MCP_EVENTS & {
-  SERVER_STATUS_CHANGED: string
-}
+// No additional typing shim needed; use MCP_EVENTS.SERVER_STATUS_CHANGED directly
 
 // Session management related types
 interface SessionError extends Error {
@@ -102,11 +100,9 @@ export class McpClient {
   public serverConfig: Record<string, unknown>
   private isConnected: boolean = false
   private connectionTimeout: NodeJS.Timeout | null = null
-  private bunRuntimePath: string | null = null
-  private nodeRuntimePath: string | null = null
-  private uvRuntimePath: string | null = null
   private npmRegistry: string | null = null
   private uvRegistry: string | null = null
+  private connectingPromise: Promise<void> | null = null
 
   // Session management
   private isRecovering: boolean = false
@@ -117,183 +113,10 @@ export class McpClient {
   private cachedPrompts: PromptListEntry[] | null = null
   private cachedResources: ResourceListEntry[] | null = null
 
-  // Function to handle PATH environment variables
-  private normalizePathEnv(paths: string[]): { key: string; value: string } {
-    const isWindows = process.platform === 'win32'
-    const separator = isWindows ? ';' : ':'
-    const pathKey = isWindows ? 'Path' : 'PATH'
-
-    // Merge all paths
-    const pathValue = paths.filter(Boolean).join(separator)
-
-    return { key: pathKey, value: pathValue }
-  }
-
-  // Expand various symbols and variables in paths
-  private expandPath(inputPath: string): string {
-    let expandedPath = inputPath
-
-    // Handle ~ symbol (user home directory)
-    if (expandedPath.startsWith('~/') || expandedPath === '~') {
-      const homeDir = app.getPath('home')
-      expandedPath = expandedPath.replace('~', homeDir)
-    }
-
-    // Handle environment variable expansion
-    expandedPath = expandedPath.replace(/\$\{([^}]+)\}/g, (match, varName) => {
-      return process.env[varName] || match
-    })
-
-    // Handle simple $VAR format (without braces)
-    expandedPath = expandedPath.replace(/\$([A-Z_][A-Z0-9_]*)/g, (match, varName) => {
-      return process.env[varName] || match
-    })
-
-    return expandedPath
-  }
-
-  // Replace command with runtime version
-  private replaceWithRuntimeCommand(command: string): string {
-    // Get command basename (remove path)
-    const basename = path.basename(command)
-
-    // Choose corresponding runtime path based on command type
-    if (process.platform === 'win32') {
-      // Windows platform only replaces Node.js related commands, let system handle bun commands automatically
-      if (this.nodeRuntimePath) {
-        if (basename === 'node') {
-          return path.join(this.nodeRuntimePath, 'node.exe')
-        } else if (basename === 'npm') {
-          // Windows usually has npm as .cmd file
-          const npmCmd = path.join(this.nodeRuntimePath, 'npm.cmd')
-          if (fs.existsSync(npmCmd)) {
-            return npmCmd
-          }
-          // If doesn't exist, return default path
-          return path.join(this.nodeRuntimePath, 'npm')
-        } else if (basename === 'npx') {
-          // On Windows, npx is typically a .cmd file
-          const npxCmd = path.join(this.nodeRuntimePath, 'npx.cmd')
-          if (fs.existsSync(npxCmd)) {
-            return npxCmd
-          }
-          // If doesn't exist, return default path
-          return path.join(this.nodeRuntimePath, 'npx')
-        }
-      }
-    } else {
-      // Non-Windows platforms handle all commands
-      if (['node', 'npm', 'npx', 'bun'].includes(basename)) {
-        // Prefer Bun if available, otherwise use Node.js
-        if (this.bunRuntimePath) {
-          // For node/npm/npx, uniformly replace with bun
-          const targetCommand = 'bun'
-          return path.join(this.bunRuntimePath, targetCommand)
-        } else if (this.nodeRuntimePath) {
-          // Use Node.js runtime
-          let targetCommand: string
-          if (basename === 'node') {
-            targetCommand = 'node'
-          } else if (basename === 'npm') {
-            targetCommand = 'npm'
-          } else if (basename === 'npx') {
-            targetCommand = 'npx'
-          } else if (basename === 'bun') {
-            targetCommand = 'node' // Map bun command to node
-          } else {
-            targetCommand = basename
-          }
-          return path.join(this.nodeRuntimePath, 'bin', targetCommand)
-        }
-      }
-    }
-
-    // UV command handling (all platforms)
-    if (['uv', 'uvx'].includes(basename)) {
-      if (!this.uvRuntimePath) {
-        return command
-      }
-
-      // Both uv and uvx use their corresponding commands
-      const targetCommand = basename === 'uvx' ? 'uvx' : 'uv'
-
-      if (process.platform === 'win32') {
-        return path.join(this.uvRuntimePath, `${targetCommand}.exe`)
-      } else {
-        return path.join(this.uvRuntimePath, targetCommand)
-      }
-    }
-
-    return command
-  }
-
-  // Handle special parameter replacement (e.g., npx -> bun x)
-  private processCommandWithArgs(
-    command: string,
-    args: string[]
-  ): { command: string; args: string[] } {
-    const basename = path.basename(command)
-
-    // Handle WSL command: do not modify its arguments as they are meant for the WSL environment
-    if (basename.toLowerCase() === 'wsl') {
-      return {
-        command: this.replaceWithRuntimeCommand(command), // This usually returns 'wsl' unchanged
-        args: args // Return original args
-      }
-    }
-
-    // Handle npx command
-    if (basename === 'npx' || command.includes('npx')) {
-      if (process.platform === 'win32') {
-        // Windows platform uses Node.js npx, keep original arguments
-        return {
-          command: this.replaceWithRuntimeCommand(command),
-          args: args.map((arg) => this.replaceWithRuntimeCommand(arg))
-        }
-      } else {
-        // Non-Windows platforms prefer Bun, need to add 'x' before arguments
-        if (this.bunRuntimePath) {
-          return {
-            command: this.replaceWithRuntimeCommand(command),
-            args: ['x', ...args]
-          }
-        } else if (this.nodeRuntimePath) {
-          // If no Bun available, use Node.js with original arguments
-          return {
-            command: this.replaceWithRuntimeCommand(command),
-            args: args.map((arg) => this.replaceWithRuntimeCommand(arg))
-          }
-        }
-      }
-    }
-
-    return {
-      command: this.replaceWithRuntimeCommand(command),
-      args: args.map((arg) => this.replaceWithRuntimeCommand(arg))
-    }
-  }
-
-  // Get system-specific default paths
-  private getDefaultPaths(homeDir: string): string[] {
-    if (process.platform === 'darwin') {
-      return [
-        '/bin',
-        '/usr/bin',
-        '/usr/local/bin',
-        '/usr/local/sbin',
-        '/opt/homebrew/bin',
-        '/opt/homebrew/sbin',
-        '/usr/local/opt/node/bin',
-        '/opt/local/bin',
-        `${homeDir}/.cargo/bin`
-      ]
-    } else if (process.platform === 'linux') {
-      return ['/bin', '/usr/bin', '/usr/local/bin', `${homeDir}/.cargo/bin`]
-    } else {
-      // Windows
-      return [`${homeDir}\\.cargo\\bin`, `${homeDir}\\.local\\bin`]
-    }
-  }
+  // Track cleanup state to avoid race when connect() times out but underlying promise resolves later
+  private isCleaningUp: boolean = false
+  // Keep a reference to stderr listener to remove it on cleanup
+  private stderrListener: ((data: Buffer) => void) | null = null
 
   constructor(
     serverName: string,
@@ -310,62 +133,6 @@ export class McpClient {
       .join(app.getAppPath(), 'runtime')
       .replace('app.asar', 'app.asar.unpacked')
     console.info('runtimeBasePath', runtimeBasePath)
-
-    // Check if bun runtime file exists
-    const bunRuntimePath = path.join(runtimeBasePath, 'bun')
-    if (process.platform === 'win32') {
-      const bunExe = path.join(bunRuntimePath, 'bun.exe')
-      if (fs.existsSync(bunExe)) {
-        this.bunRuntimePath = bunRuntimePath
-      } else {
-        this.bunRuntimePath = null
-      }
-    } else {
-      const bunBin = path.join(bunRuntimePath, 'bun')
-      if (fs.existsSync(bunBin)) {
-        this.bunRuntimePath = bunRuntimePath
-      } else {
-        this.bunRuntimePath = null
-      }
-    }
-
-    // Check if node runtime file exists
-    const nodeRuntimePath = path.join(runtimeBasePath, 'node')
-    if (process.platform === 'win32') {
-      const nodeExe = path.join(nodeRuntimePath, 'node.exe')
-      if (fs.existsSync(nodeExe)) {
-        this.nodeRuntimePath = nodeRuntimePath
-      } else {
-        this.nodeRuntimePath = null
-      }
-    } else {
-      const nodeBin = path.join(nodeRuntimePath, 'bin', 'node')
-      if (fs.existsSync(nodeBin)) {
-        this.nodeRuntimePath = nodeRuntimePath
-      } else {
-        this.nodeRuntimePath = null
-      }
-    }
-
-    // Check if uv runtime file exists
-    const uvRuntimePath = path.join(runtimeBasePath, 'uv')
-    if (process.platform === 'win32') {
-      const uvExe = path.join(uvRuntimePath, 'uv.exe')
-      const uvxExe = path.join(uvRuntimePath, 'uvx.exe')
-      if (fs.existsSync(uvExe) && fs.existsSync(uvxExe)) {
-        this.uvRuntimePath = uvRuntimePath
-      } else {
-        this.uvRuntimePath = null
-      }
-    } else {
-      const uvBin = path.join(uvRuntimePath, 'uv')
-      const uvxBin = path.join(uvRuntimePath, 'uvx')
-      if (fs.existsSync(uvBin) && fs.existsSync(uvxBin)) {
-        this.uvRuntimePath = uvRuntimePath
-      } else {
-        this.uvRuntimePath = null
-      }
-    }
   }
 
   // Connect to MCP server
@@ -375,129 +142,144 @@ export class McpClient {
       return
     }
 
-    try {
-      console.info(`Starting MCP server ${this.serverName}...`, this.serverConfig)
+    if (this.connectingPromise) {
+      return this.connectingPromise
+    }
 
-      // Create transport using the new private helper method
-      this.transport = this._createTransport()
+    this.connectingPromise = (async (): Promise<void> => {
+      try {
+        // reset cleanup race flag before starting a new connection attempt
+        this.isCleaningUp = false
 
-      // 创建 MCP 客户端
-      this.client = new Client(
-        { name: 'DeepChat', version: app.getVersion() },
-        {
-          capabilities: {
-            resources: {},
-            tools: {},
-            prompts: {}
-          }
-        }
-      )
+        try {
+          console.info(`Starting MCP server ${this.serverName}...`, this.serverConfig)
 
-      // 设置通知处理器
-      this.registerNotificationHandlers()
+          // Create transport using the new private helper method
+          this.transport = await this._createTransport()
 
-      // 设置连接超时
-      const timeoutPromise = new Promise<void>((_, reject) => {
-        this.connectionTimeout = setTimeout(
-          () => {
-            console.error(`Connection to MCP server ${this.serverName} timed out`)
-            reject(new Error(`Connection to MCP server ${this.serverName} timed out`))
-          },
-          5 * 60 * 1000
-        ) // 5分钟
-      })
+          // 创建 MCP 客户端
+          this.client = new Client(
+            { name: 'DeepChat', version: app.getVersion() },
+            {
+              capabilities: {
+                resources: {},
+                tools: {},
+                prompts: {}
+              }
+            }
+          )
 
-      // 连接到服务器
-      const connectPromise = this.client
-        .connect(this.transport)
-        .then(() => {
+          // 设置通知处理器
+          this.registerNotificationHandlers()
+
+          // 设置连接超时
+          let timedOut = false
+          const timeoutPromise = new Promise<void>((_, reject) => {
+            this.connectionTimeout = setTimeout(
+              () => {
+                console.error(`Connection to MCP server ${this.serverName} timed out`)
+                timedOut = true
+                reject(new Error(`Connection to MCP server ${this.serverName} timed out`))
+              },
+              5 * 60 * 1000
+            ) // 5分钟
+          })
+
+          // 连接到服务器
+          const connectPromise = this.client
+            .connect(this.transport)
+            .then(() => {
+              // 如果在超时清理后才成功，这里直接忽略，避免状态错乱
+              if (this.isCleaningUp || timedOut) {
+                return
+              }
+
+              // 清除超时
+              if (this.connectionTimeout) {
+                clearTimeout(this.connectionTimeout)
+                this.connectionTimeout = null
+              }
+
+              this.isConnected = true
+              this.hasRestarted = false // FIX: Reset restart flag on successful connection
+              console.info(`MCP server ${this.serverName} connected successfully`)
+
+              // 触发服务器状态变更事件
+              eventBus.send(MCP_EVENTS.SERVER_STATUS_CHANGED, SendTarget.ALL_WINDOWS, {
+                name: this.serverName,
+                status: 'running'
+              })
+            })
+            .catch((error) => {
+              console.error(`Failed to connect to MCP server ${this.serverName}:`, error)
+              throw error
+            })
+
+          // 等待连接完成或超时
+          await Promise.race([connectPromise, timeoutPromise])
+        } catch (error) {
           // 清除超时
           if (this.connectionTimeout) {
             clearTimeout(this.connectionTimeout)
             this.connectionTimeout = null
           }
 
-          this.isConnected = true
-          console.info(`MCP server ${this.serverName} connected successfully`)
+          // 清理资源
+          await this.cleanupResources()
+
+          console.error(`Failed to connect to MCP server ${this.serverName}:`, error)
 
           // 触发服务器状态变更事件
-          eventBus.send(
-            (MCP_EVENTS as MCPEventsType).SERVER_STATUS_CHANGED,
-            SendTarget.ALL_WINDOWS,
-            {
-              name: this.serverName,
-              status: 'running'
-            }
-          )
-        })
-        .catch((error) => {
-          console.error(`Failed to connect to MCP server ${this.serverName}:`, error)
+          eventBus.send(MCP_EVENTS.SERVER_STATUS_CHANGED, SendTarget.ALL_WINDOWS, {
+            name: this.serverName,
+            status: 'stopped'
+          })
+
           throw error
-        })
-
-      // 等待连接完成或超时
-      await Promise.race([connectPromise, timeoutPromise])
-    } catch (error) {
-      // 清除超时
-      if (this.connectionTimeout) {
-        clearTimeout(this.connectionTimeout)
-        this.connectionTimeout = null
+        }
+      } finally {
+        this.connectingPromise = null
       }
+    })()
 
-      // 清理资源
-      this.cleanupResources()
-
-      console.error(`Failed to connect to MCP server ${this.serverName}:`, error)
-
-      // 触发服务器状态变更事件
-      eventBus.send((MCP_EVENTS as MCPEventsType).SERVER_STATUS_CHANGED, SendTarget.ALL_WINDOWS, {
-        name: this.serverName,
-        status: 'stopped'
-      })
-
-      throw error
-    }
+    return this.connectingPromise
   }
 
   // 断开与 MCP 服务器的连接
   async disconnect(): Promise<void> {
-    if (!this.isConnected || !this.client) {
-      return
-    }
-
-    try {
-      // Use internal disconnect method for normal disconnection
-      await this.internalDisconnect()
-    } catch (error) {
-      console.error(`Failed to disconnect from MCP server ${this.serverName}:`, error)
-      throw error
-    }
+    await this.internalDisconnect('manual disconnect')
   }
 
   // 清理资源
-  private cleanupResources(): void {
-    // 清除超时定时器
+  private async cleanupResources(): Promise<void> {
+    this.isCleaningUp = true
+
+    // 清理超时定时器
     if (this.connectionTimeout) {
       clearTimeout(this.connectionTimeout)
       this.connectionTimeout = null
     }
 
-    // 关闭transport
-    if (this.transport) {
-      try {
-        // TODO: Remove stderr listener if StdioClientTransport to prevent memory leaks
-        this.transport.close()
-      } catch (error) {
-        console.error(`Failed to close MCP transport:`, error)
-      }
+    // —— 下面这段清理逻辑应始终执行（不要放进上面的 if 里）——
+    try {
+      ;(this.transport as any)?.stderr?.removeListener?.('data', this.stderrListener)
+    } catch {}
+    this.stderrListener = null
+
+    try {
+      await (this.client as any)?.close?.()
+    } catch (e) {
+      console.warn('close client failed', e)
+    }
+    try {
+      this.transport?.close?.()
+    } catch (e) {
+      console.error('close transport failed', e)
     }
 
-    // 重置状态
     this.client = null
     this.transport = null
     this.isConnected = false
-
-    // 清空缓存
     this.cachedTools = null
     this.cachedPrompts = null
     this.cachedResources = null
@@ -592,7 +374,7 @@ export class McpClient {
 
       try {
         // Clean up current connection
-        this.cleanupResources()
+        await this.cleanupResources()
 
         // Clear all caches to ensure fresh data after reconnection
         this.cachedTools = null
@@ -602,7 +384,7 @@ export class McpClient {
         // Mark as restarted
         this.hasRestarted = true
 
-        console.info(`Service ${this.serverName} restarted due to session error`)
+        console.info(`Service ${this.serverName} cleaned up due to session error`)
       } catch (restartError) {
         console.error(`Failed to restart service ${this.serverName}:`, restartError)
       } finally {
@@ -624,7 +406,7 @@ export class McpClient {
   // Internal disconnect with custom reason
   private async internalDisconnect(reason?: string): Promise<void> {
     // Clean up all resources
-    this.cleanupResources()
+    await this.cleanupResources()
 
     const logMessage = reason
       ? `MCP service ${this.serverName} has been stopped due to ${reason}`
@@ -633,7 +415,7 @@ export class McpClient {
     console.log(logMessage)
 
     // Trigger server status changed event to notify the system
-    eventBus.send((MCP_EVENTS as MCPEventsType).SERVER_STATUS_CHANGED, SendTarget.ALL_WINDOWS, {
+    eventBus.send(MCP_EVENTS.SERVER_STATUS_CHANGED, SendTarget.ALL_WINDOWS, {
       name: this.serverName,
       status: 'stopped'
     })
@@ -938,18 +720,474 @@ export class McpClient {
   // =================================================================
 
   /**
+   * Helper class to build stdio command, args and env in a cross-platform, cautious way.
+   * Embedded here to avoid new files while keeping concerns separated from McpClient.
+   */
+  private StdioCommandBuilder = class StdioCommandBuilder {
+    private readonly serverConfig: Record<string, unknown>
+    private readonly npmRegistry: string | null
+    private readonly uvRegistry: string | null
+    private static loginShellEnvPromise: Promise<Record<string, string>> | null = null
+    private readonly runtimeBasePath: string
+
+    constructor(
+      serverConfig: Record<string, unknown>,
+      npmRegistry: string | null,
+      uvRegistry: string | null
+    ) {
+      this.serverConfig = serverConfig
+      this.npmRegistry = npmRegistry
+      this.uvRegistry = uvRegistry
+      this.runtimeBasePath = path
+        .join(app.getAppPath(), 'runtime')
+        .replace('app.asar', 'app.asar.unpacked')
+    }
+
+    async build(): Promise<{
+      command: string
+      args: string[]
+      env: Record<string, string>
+      category: StdioCommandCategory
+      cwd?: string
+    }> {
+      const rawCommand = String(this.serverConfig.command || '')
+      const rawArgs = Array.isArray(this.serverConfig.args)
+        ? (this.serverConfig.args as string[])
+        : []
+      const cwd = (this.serverConfig as any).cwd as string | undefined
+
+      const category = this.categorize(rawCommand)
+      console.debug(`[MCP][Stdio] category=${category} command=${rawCommand}`)
+
+      const expandedCommand = this.expandPath(rawCommand)
+      const expandedArgs = category === 'WSL' ? rawArgs : rawArgs.map((a) => this.expandPath(a))
+
+      const processed = await this.processCommandWithArgs(expandedCommand, expandedArgs, category)
+      console.debug(
+        `[MCP][Stdio] processed command=${processed.command} args=${JSON.stringify(processed.args)}`
+      )
+
+      let env: Record<string, string>
+      if (category === 'WSL') {
+        // Use host environment as base to avoid losing essential vars
+        env = {}
+        Object.entries(process.env).forEach(([k, v]) => {
+          if (typeof v === 'string') env[k] = v
+        })
+
+        // Pass through only necessary registry variables to WSL using WSLENV
+        const wslNames: string[] = []
+        if (this.npmRegistry) {
+          env['NPM_CONFIG_REGISTRY'] = this.npmRegistry
+          wslNames.push('NPM_CONFIG_REGISTRY')
+        }
+        if (this.uvRegistry) {
+          env['UV_DEFAULT_INDEX'] = this.uvRegistry
+          env['PIP_INDEX_URL'] = this.uvRegistry
+          wslNames.push('UV_DEFAULT_INDEX', 'PIP_INDEX_URL')
+        }
+        if (wslNames.length > 0) {
+          const existing = env['WSLENV'] || ''
+          const merged = existing ? `${existing}:${wslNames.join(':')}` : wslNames.join(':')
+          env['WSLENV'] = merged
+        }
+        // Merge user-provided env last (explicit override)
+        if (this.serverConfig.env) {
+          Object.entries(this.serverConfig.env as Record<string, string>).forEach(([k, v]) => {
+            if (v !== undefined) env[k] = v
+          })
+        }
+      } else {
+        env = await this.getLoginShellEnv()
+        // Merge server-provided env, expanding PATH with prepend semantics for runtime dirs
+        if (this.serverConfig.env) {
+          Object.entries(this.serverConfig.env as Record<string, string>).forEach(([k, v]) => {
+            if (v === undefined) return
+            if (['PATH', 'Path', 'path'].includes(k)) {
+              const isWin = process.platform === 'win32'
+              const sep = isWin ? ';' : ':'
+              // find the real path key present in env (case-insensitive)
+              const realPathKey =
+                Object.keys(env).find((p) => p.toLowerCase() === 'path') ||
+                (isWin ? 'Path' : 'PATH')
+              const prev = env[realPathKey] || ''
+              env[realPathKey] = v ? `${v}${prev ? sep : ''}${prev}` : prev
+              if (!isWin) env.PATH = env[realPathKey]
+            } else {
+              env[k] = v
+            }
+          })
+        }
+        // Conditionally inject registries only for bundled runtimes
+        if (category === 'AppBundledRuntime') {
+          if (this.npmRegistry) env['npm_config_registry'] = this.npmRegistry
+          if (this.uvRegistry) {
+            env['UV_DEFAULT_INDEX'] = this.uvRegistry
+            env['PIP_INDEX_URL'] = this.uvRegistry
+          }
+        }
+      }
+
+      // Conservative: if final command is bun, strip proxy vars to avoid known bun proxy issues
+      const base = this.stripExeCmdExt(processed.command)
+      if (base === 'bun') {
+        const proxyKeys = [
+          'HTTP_PROXY',
+          'HTTPS_PROXY',
+          'ALL_PROXY',
+          'NO_PROXY',
+          'http_proxy',
+          'https_proxy',
+          'all_proxy',
+          'no_proxy'
+        ]
+        let removed = 0
+        for (const k of proxyKeys) {
+          if (k in env) {
+            delete env[k]
+            removed++
+          }
+        }
+        if (removed > 0) {
+          console.debug(`[MCP][Stdio] removed ${removed} proxy env(s) for bun`)
+        }
+      }
+
+      console.debug(
+        `[MCP][Stdio] final profile: cmd=${processed.command} cwd=${cwd || ''} env.keys=${Object.keys(env).length}`
+      )
+
+      return {
+        command: processed.command,
+        args: processed.args,
+        env,
+        category,
+        cwd
+      }
+    }
+
+    private stripExeCmdExt(name: string): string {
+      const b = path.basename(name).toLowerCase()
+      return b.replace(/\.(exe|cmd|bat)$/, '')
+    }
+
+    private expandPath(inputPath: string): string {
+      let expandedPath = inputPath
+
+      if (expandedPath.startsWith('~/') || expandedPath === '~') {
+        const homeDir = app.getPath('home')
+        expandedPath = expandedPath.replace('~', homeDir)
+      }
+
+      const getEnvVar = (name: string): string | undefined => {
+        const direct = process.env[name]
+        if (direct !== undefined) return direct
+        if (process.platform === 'win32') {
+          const upper = process.env[name.toUpperCase()]
+          if (upper !== undefined) return upper
+          const lower = process.env[name.toLowerCase()]
+          if (lower !== undefined) return lower
+        }
+        return undefined
+      }
+
+      expandedPath = expandedPath.replace(/\$\{([^}]+)\}/g, (match, varName) => {
+        const v = getEnvVar(varName)
+        return v !== undefined ? v : match
+      })
+
+      expandedPath = expandedPath.replace(/\$([A-Za-z_][A-Za-z0-9_]*)/g, (match, varName) => {
+        const v = getEnvVar(varName)
+        return v !== undefined ? v : match
+      })
+
+      if (process.platform === 'win32') {
+        expandedPath = expandedPath.replace(/%([^%]+)%/g, (match, varName) => {
+          const v = getEnvVar(varName)
+          return v !== undefined ? v : match
+        })
+      }
+
+      return expandedPath
+    }
+
+    private categorize(command: string): StdioCommandCategory {
+      const base = this.stripExeCmdExt(command)
+      if (base === 'wsl') return 'WSL'
+      if (['node', 'npm', 'npx', 'bun', 'uv', 'uvx'].includes(base)) return 'AppBundledRuntime'
+      return 'GenericSystem'
+    }
+
+    private async processCommandWithArgs(
+      command: string,
+      args: string[],
+      category: StdioCommandCategory
+    ): Promise<{ command: string; args: string[] }> {
+      const base = this.stripExeCmdExt(command)
+
+      if (category === 'WSL') {
+        return { command, args }
+      }
+
+      // npx handling
+      if (base === 'npx') {
+        if (process.platform === 'win32') {
+          const npxCmd = await this.getBinaryPath('npx')
+          if (fs.existsSync(npxCmd)) {
+            console.debug('[MCP][Stdio] resolve npx -> npx.cmd')
+            return { command: npxCmd, args }
+          }
+          // fallback: node.exe + npx-cli.js
+          const nodeExe = await this.getBinaryPath('node')
+          const npxCli = path.join(
+            this.runtimeBasePath,
+            'node',
+            'node_modules',
+            'npm',
+            'bin',
+            'npx-cli.js'
+          )
+          if (fs.existsSync(nodeExe) && fs.existsSync(npxCli)) {
+            console.debug('[MCP][Stdio] resolve npx -> node + npx-cli.js')
+            return { command: nodeExe, args: [npxCli, ...args] }
+          }
+          return { command, args }
+        } else {
+          const bunBin = await this.getBinaryPath('bun')
+          if (fs.existsSync(bunBin)) {
+            console.debug('[MCP][Stdio] map npx -> bun x')
+            return { command: bunBin, args: ['x', ...args] }
+          }
+          const npxBin = await this.getBinaryPath('npx')
+          return { command: npxBin, args }
+        }
+      }
+
+      // npm cautious mapping
+      if (base === 'npm') {
+        if (process.platform !== 'win32') {
+          const bunBin = await this.getBinaryPath('bun')
+          const npmFirst = args[0] && !args[0].startsWith('-') ? String(args[0]) : ''
+          const bunEquivalents = new Set(['install', 'i', 'ci', 'run', 'update', 'rebuild'])
+          if (fs.existsSync(bunBin) && npmFirst) {
+            if (bunEquivalents.has(npmFirst)) {
+              console.debug(`[MCP][Stdio] map npm ${npmFirst} -> bun ${npmFirst}`)
+              return { command: bunBin, args }
+            }
+            // If it's a script name (not known builtin), npm <script> -> bun run <script>
+            const npmBuiltins = new Set(['install', 'i', 'ci', 'run', 'update', 'rebuild'])
+            if (!npmBuiltins.has(npmFirst)) {
+              console.debug('[MCP][Stdio] map npm <script> -> bun run <script>')
+              return { command: bunBin, args: ['run', ...args] }
+            }
+          }
+          const npmBin = await this.getBinaryPath('npm')
+          return { command: npmBin, args }
+        } else {
+          const npmCmd = await this.getBinaryPath('npm')
+          if (fs.existsSync(npmCmd)) {
+            console.debug('[MCP][Stdio] resolve npm -> npm.cmd')
+            return { command: npmCmd, args }
+          }
+          const nodeExe = await this.getBinaryPath('node')
+          const npmCli = path.join(
+            this.runtimeBasePath,
+            'node',
+            'node_modules',
+            'npm',
+            'bin',
+            'npm-cli.js'
+          )
+          if (fs.existsSync(nodeExe) && fs.existsSync(npmCli)) {
+            console.debug('[MCP][Stdio] resolve npm -> node + npm-cli.js')
+            return { command: nodeExe, args: [npmCli, ...args] }
+          }
+          return { command, args }
+        }
+      }
+
+      // node/bun/uv/uvx direct resolution (no semantic change)
+      if (['node', 'bun', 'uv', 'uvx'].includes(base)) {
+        const bin = await this.getBinaryPath(base)
+        return { command: bin, args }
+      }
+
+      // default: do not modify (generic system command)
+      return { command, args }
+    }
+
+    private async getBinaryPath(name: string): Promise<string> {
+      const isWin = process.platform === 'win32'
+      const sub = (n: string) => {
+        switch (n) {
+          case 'bun':
+            return isWin ? path.join('bun', 'bun.exe') : path.join('bun', 'bun')
+          case 'node':
+            return isWin ? path.join('node', 'node.exe') : path.join('node', 'bin', 'node')
+          case 'npm':
+            return isWin ? path.join('node', 'npm.cmd') : path.join('node', 'bin', 'npm')
+          case 'npx':
+            return isWin ? path.join('node', 'npx.cmd') : path.join('node', 'bin', 'npx')
+          case 'uv':
+            return isWin ? path.join('uv', 'uv.exe') : path.join('uv', 'uv')
+          case 'uvx':
+            return isWin ? path.join('uv', 'uvx.exe') : path.join('uv', 'uvx')
+          default:
+            return n
+        }
+      }
+      const candidate = path.join(this.runtimeBasePath, sub(name))
+      if (name === 'npx') {
+        // npx.cmd may not exist in some bundles; caller will fallback if needed
+        if (fs.existsSync(candidate)) return candidate
+        return name
+      }
+      return fs.existsSync(candidate) ? candidate : name
+    }
+
+    private async getLoginShellEnv(): Promise<Record<string, string>> {
+      if (StdioCommandBuilder.loginShellEnvPromise) return StdioCommandBuilder.loginShellEnvPromise
+
+      StdioCommandBuilder.loginShellEnvPromise = new Promise<Record<string, string>>((resolve) => {
+        // Choose shell and args based on platform
+        let shellPath = process.env.SHELL
+        let args: string[]
+        const home = app.getPath('home')
+
+        if (process.platform === 'win32') {
+          shellPath = process.env.COMSPEC || 'cmd.exe'
+          args = ['/c', 'set']
+        } else {
+          if (!shellPath) {
+            shellPath = process.platform === 'darwin' ? '/bin/zsh' : '/bin/bash'
+          }
+          args = ['-ilc', 'env']
+        }
+
+        const child = spawn(shellPath, args, {
+          cwd: home,
+          detached: false,
+          stdio: ['ignore', 'pipe', 'pipe'],
+          shell: false
+        })
+
+        let output = ''
+        let errorOutput = ''
+        const timeout = setTimeout(() => {
+          child.kill()
+        }, 15000)
+
+        child.stdout.on('data', (d) => (output += d.toString()))
+        child.stderr.on('data', (d) => (errorOutput += d.toString()))
+        child.on('error', () => {
+          clearTimeout(timeout)
+          // Fallback to process.env on error
+          const env: Record<string, string> = {}
+          Object.entries(process.env).forEach(([k, v]) => {
+            if (v !== undefined) env[k] = v
+          })
+          this.appendRuntimeDirsToPath(env)
+          resolve(env)
+        })
+        child.on('close', () => {
+          clearTimeout(timeout)
+          const env: Record<string, string> = {}
+          // Parse KEY=VALUE lines
+          output.split(/\r?\n/).forEach((line) => {
+            const idx = line.indexOf('=')
+            if (idx > 0) {
+              const k = line.substring(0, idx)
+              const v = line.substring(idx + 1)
+              env[k] = v
+            }
+          })
+          if (Object.keys(env).length === 0) {
+            // Fallback if parsing failed
+            Object.entries(process.env).forEach(([k, v]) => {
+              if (v !== undefined) env[k] = v
+            })
+          }
+          this.appendRuntimeDirsToPath(env)
+          resolve(env)
+        })
+      })
+
+      return StdioCommandBuilder.loginShellEnvPromise
+    }
+
+    private appendRuntimeDirsToPath(env: Record<string, string>): void {
+      const isWin = process.platform === 'win32'
+      const sep = isWin ? ';' : ':'
+      const pathKeys = Object.keys(env).filter((k) => k.toLowerCase() === 'path')
+      const canonicalPathKey = pathKeys[0] || (isWin ? 'Path' : 'PATH')
+      const existing = env[canonicalPathKey] || env.PATH || ''
+
+      const normalize = (p: string) => {
+        let s = path.normalize(p).trim()
+        if (isWin) s = s.replace(/[\\\/]+$/, '').toLowerCase()
+        else s = s.replace(/[\\\/]+$/, '')
+        return s
+      }
+
+      const seen = new Set<string>()
+      const parts = existing
+        .split(sep)
+        .map((s) => s.trim())
+        .filter(Boolean)
+      const unique: string[] = []
+      for (const p of parts) {
+        const n = normalize(p)
+        if (!n) continue
+        if (!seen.has(n)) {
+          seen.add(n)
+          unique.push(p)
+        }
+      }
+
+      // Determine runtime dirs to prepend
+      const dirs: string[] = []
+      const bunDir = path.join(this.runtimeBasePath, 'bun')
+      const nodeDir = isWin
+        ? path.join(this.runtimeBasePath, 'node')
+        : path.join(this.runtimeBasePath, 'node', 'bin')
+      const uvDir = path.join(this.runtimeBasePath, 'uv')
+
+      // Prepend by priority
+      if (fs.existsSync(bunDir)) dirs.push(bunDir)
+      if (fs.existsSync(nodeDir)) dirs.push(nodeDir)
+      if (fs.existsSync(uvDir)) dirs.push(uvDir)
+
+      // Prepend runtime dirs (keeping original values)
+      const finalParts = [...dirs, ...unique]
+      const updated = finalParts.join(sep)
+
+      if (pathKeys.length > 0) {
+        pathKeys.forEach((k) => (env[k] = updated))
+      } else {
+        env[canonicalPathKey] = updated
+      }
+      if (!isWin) {
+        env.PATH = updated
+      }
+    }
+  }
+
+  /**
    * Main dispatcher for creating the correct transport based on server config.
    */
-  private _createTransport(): Transport {
+  private async _createTransport(): Promise<Transport> {
     // Handle customHeaders and AuthProvider (common for HTTP-based transports)
     let authProvider: SimpleOAuthProvider | null = null
     const customHeaders = this.serverConfig.customHeaders
       ? { ...(this.serverConfig.customHeaders as Record<string, string>) }
       : {}
-
-    if (customHeaders.Authorization) {
-      authProvider = new SimpleOAuthProvider(customHeaders.Authorization)
-      delete customHeaders.Authorization
+    const __authKey = Object.keys(customHeaders).find((k) => k.toLowerCase() === 'authorization')
+    if (__authKey) {
+      const __authVal = customHeaders[__authKey]
+      authProvider = new SimpleOAuthProvider(
+        typeof __authVal === 'string' ? __authVal : String(__authVal)
+      )
+      delete customHeaders[__authKey]
     }
 
     const type = this.serverConfig.type
@@ -963,7 +1201,7 @@ export class McpClient {
         return clientTransport
       }
       case 'stdio':
-        return this._createStdioTransport()
+        return await this._createStdioTransport()
       case 'sse':
         if (!this.serverConfig.baseUrl) throw new Error('SSE transport requires a baseUrl')
         return new SSEClientTransport(new URL(this.serverConfig.baseUrl as string), {
@@ -986,245 +1224,27 @@ export class McpClient {
   /**
    * Creates a StdioClientTransport after determining the correct command, args, and environment.
    */
-  private _createStdioTransport(): StdioClientTransport {
-    // 1. Expand paths in command and args
-    const command = this.expandPath(this.serverConfig.command as string)
-    const args = (this.serverConfig.args as string[]).map((arg) => this.expandPath(arg))
+  private async _createStdioTransport(): Promise<StdioClientTransport> {
+    const builder = new this.StdioCommandBuilder(
+      this.serverConfig,
+      this.npmRegistry,
+      this.uvRegistry
+    )
+    const profile = await builder.build()
 
-    // 2. Categorize the command to determine environment preparation strategy
-    const category = this._categorizeStdioCommand(command, args)
-
-    // 3. Prepare the final command, args, and environment based on the category
-    let finalCommand: string
-    let finalArgs: string[]
-    let finalEnv: Record<string, string>
-
-    switch (category) {
-      case 'WSL':
-        ;({
-          command: finalCommand,
-          args: finalArgs,
-          env: finalEnv
-        } = this._prepareWslEnvironment(command, args))
-        break
-      case 'AppBundledRuntime':
-        ;({
-          command: finalCommand,
-          args: finalArgs,
-          env: finalEnv
-        } = this._prepareAppBundledRuntimeEnvironment(command, args))
-        break
-      case 'GenericSystem':
-        ;({
-          command: finalCommand,
-          args: finalArgs,
-          env: finalEnv
-        } = this._prepareGenericSystemEnvironment(command, args))
-        break
-    }
-
-    // 4. Create and return the transport instance
     const transport = new StdioClientTransport({
-      command: finalCommand,
-      args: finalArgs,
-      env: finalEnv,
+      command: profile.command,
+      args: profile.args,
+      env: profile.env,
+      cwd: profile.cwd,
       stderr: 'pipe'
     })
-    transport.stderr?.on('data', (data) => {
-      console.info('mcp StdioClientTransport error', this.serverName, data.toString())
-    })
+
+    this.stderrListener = (data: Buffer) => {
+      console.warn('MCP StdioClientTransport stderr: ', this.serverName, '-', data.toString())
+    }
+    transport.stderr?.on('data', this.stderrListener)
     return transport
-  }
-
-  /**
-   * Categorizes the stdio command to apply the correct environment setup.
-   */
-  private _categorizeStdioCommand(command: string, args: string[]): StdioCommandCategory {
-    const basename = path.basename(command)
-    if (basename.toLowerCase() === 'wsl') {
-      return 'WSL'
-    }
-
-    // This logic exactly mirrors the original `isNodeCommand` check
-    const isAppRuntimeCommand = ['node', 'npm', 'npx', 'bun', 'uv', 'uvx'].some(
-      (cmd) => command.includes(cmd) || args.some((arg) => arg.includes(cmd))
-    )
-
-    if (isAppRuntimeCommand) {
-      return 'AppBundledRuntime'
-    }
-
-    return 'GenericSystem'
-  }
-
-  /**
-   * Prepares the environment for WSL commands.
-   * Inherits the full process environment and does not inject Windows-specific paths.
-   */
-  private _prepareWslEnvironment(
-    command: string,
-    args: string[]
-  ): { command: string; args: string[]; env: Record<string, string> } {
-    const processed = this.processCommandWithArgs(command, args)
-    const env: Record<string, string> = {}
-
-    // Inherit the full environment, as WSL might need it. Avoid aggressive whitelisting.
-    Object.entries(process.env).forEach(([key, value]) => {
-      if (value !== undefined) {
-        env[key] = value
-      }
-    })
-
-    // Add custom environment variables from config
-    if (this.serverConfig.env) {
-      Object.assign(env, this.serverConfig.env)
-    }
-
-    // Do NOT inject Windows-based runtime paths or npm/uv registry env vars,
-    // as they are not applicable inside the WSL environment.
-
-    return { command: processed.command, args: processed.args, env }
-  }
-
-  /**
-   * Prepares the environment for commands that use the app's bundled runtimes (Node, Bun, UV).
-   * This contains the logic from the original `if (isNodeCommand)` block.
-   */
-  private _prepareAppBundledRuntimeEnvironment(
-    command: string,
-    args: string[]
-  ): { command: string; args: string[]; env: Record<string, string> } {
-    const processed = this.processCommandWithArgs(command, args)
-    const env: Record<string, string> = {}
-
-    // This is the moved logic from the original `if (isNodeCommand)` block
-    const allowedEnvVars = [
-      'PATH',
-      'path',
-      'Path',
-      'npm_config_registry',
-      'npm_config_cache',
-      'npm_config_prefix',
-      'npm_config_tmp',
-      'NPM_CONFIG_REGISTRY',
-      'NPM_CONFIG_CACHE',
-      'NPM_CONFIG_PREFIX',
-      'NPM_CONFIG_TMP'
-    ]
-
-    if (process.env) {
-      const existingPaths: string[] = []
-      Object.entries(process.env).forEach(([key, value]) => {
-        if (value !== undefined) {
-          if (['PATH', 'Path', 'path'].includes(key)) {
-            existingPaths.push(value)
-          } else if (allowedEnvVars.includes(key) && !['PATH', 'Path', 'path'].includes(key)) {
-            env[key] = value
-          }
-        }
-      })
-
-      const defaultPaths = this.getDefaultPaths(app.getPath('home'))
-      const allPaths = [...existingPaths, ...defaultPaths]
-
-      if (process.platform === 'win32') {
-        if (this.uvRuntimePath) allPaths.unshift(this.uvRuntimePath)
-        if (this.nodeRuntimePath) allPaths.unshift(this.nodeRuntimePath)
-      } else {
-        if (this.uvRuntimePath) allPaths.unshift(this.uvRuntimePath)
-        if (this.nodeRuntimePath) allPaths.unshift(path.join(this.nodeRuntimePath, 'bin'))
-        if (this.bunRuntimePath) allPaths.unshift(this.bunRuntimePath)
-      }
-
-      const { key, value } = this.normalizePathEnv(allPaths)
-      env[key] = value
-    }
-
-    if (this.serverConfig.env) {
-      Object.entries(this.serverConfig.env as Record<string, string>).forEach(([key, value]) => {
-        if (value !== undefined) {
-          if (['PATH', 'Path', 'path'].includes(key)) {
-            const currentPathKey = process.platform === 'win32' ? 'Path' : 'PATH'
-            const separator = process.platform === 'win32' ? ';' : ':'
-            env[currentPathKey] = env[currentPathKey]
-              ? `${value}${separator}${env[currentPathKey]}`
-              : value
-          } else {
-            env[key] = value
-          }
-        }
-      })
-    }
-
-    if (this.npmRegistry) env.npm_config_registry = this.npmRegistry
-    if (this.uvRegistry) {
-      env.UV_DEFAULT_INDEX = this.uvRegistry
-      env.PIP_INDEX_URL = this.uvRegistry
-    }
-
-    return { command: processed.command, args: processed.args, env }
-  }
-
-  /**
-   * Prepares the environment for generic system commands.
-   * This contains the logic from the original `else` block for non-node commands.
-   */
-  private _prepareGenericSystemEnvironment(
-    command: string,
-    args: string[]
-  ): { command: string; args: string[]; env: Record<string, string> } {
-    const processed = this.processCommandWithArgs(command, args)
-    const env: Record<string, string> = {}
-
-    // This is the moved logic from the original `else` block
-    Object.entries(process.env).forEach(([key, value]) => {
-      if (value !== undefined) {
-        env[key] = value
-      }
-    })
-
-    const existingPaths: string[] = []
-    if (env.PATH) existingPaths.push(env.PATH)
-    if (env.Path) existingPaths.push(env.Path)
-
-    const defaultPaths = this.getDefaultPaths(app.getPath('home'))
-    const allPaths = [...existingPaths, ...defaultPaths]
-
-    if (process.platform === 'win32') {
-      if (this.uvRuntimePath) allPaths.unshift(this.uvRuntimePath)
-      if (this.nodeRuntimePath) allPaths.unshift(this.nodeRuntimePath)
-    } else {
-      if (this.uvRuntimePath) allPaths.unshift(this.uvRuntimePath)
-      if (this.nodeRuntimePath) allPaths.unshift(path.join(this.nodeRuntimePath, 'bin'))
-      if (this.bunRuntimePath) allPaths.unshift(this.bunRuntimePath)
-    }
-
-    const { key, value } = this.normalizePathEnv(allPaths)
-    env[key] = value
-
-    if (this.serverConfig.env) {
-      Object.entries(this.serverConfig.env as Record<string, string>).forEach(([key, value]) => {
-        if (value !== undefined) {
-          if (['PATH', 'Path', 'path'].includes(key)) {
-            const currentPathKey = process.platform === 'win32' ? 'Path' : 'PATH'
-            const separator = process.platform === 'win32' ? ';' : ':'
-            env[currentPathKey] = env[currentPathKey]
-              ? `${value}${separator}${env[currentPathKey]}`
-              : value
-          } else {
-            env[key] = value
-          }
-        }
-      })
-    }
-
-    if (this.npmRegistry) env.npm_config_registry = this.npmRegistry
-    if (this.uvRegistry) {
-      env.UV_DEFAULT_INDEX = this.uvRegistry
-      env.PIP_INDEX_URL = this.uvRegistry
-    }
-
-    return { command: processed.command, args: processed.args, env }
   }
 }
 

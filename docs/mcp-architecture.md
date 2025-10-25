@@ -386,6 +386,29 @@ interface MCPServerConfig {
 }
 ```
 
+### 传输类型与 WSL 使用说明
+
+- DeepChat 当前仅支持以下 MCP 传输类型：`stdio`、`sse`、`http`、`inmemory`。
+- Windows Subsystem for Linux (WSL) 不是独立的传输类型，不应设置为 `type: 'wsl'`。若要通过 WSL 启动 MCP 服务，请使用 `type: 'stdio'`，并将 `command` 设为 `wsl`，在 `args` 中传递 WSL 侧要执行的命令。
+
+示例（通过 WSL 启动 uvx 服务器）：
+
+```json
+{
+  "type": "stdio",
+  "command": "wsl",
+  "args": ["bash", "-lc", "uvx osm-mcp-server"],
+  "env": {
+    // 根据需要传入的环境变量（可选）
+  }
+}
+```
+
+实现细节与注意事项：
+- Stdio 模式下，命令分类会识别到 `wsl` 并保持“透传”，不会对内层命令做 bun/uv 等替换，避免破坏 WSL 内解析环境。
+- 登录 Shell 环境会被获取并适度合并；对于 npm/uv 等 registry 的参数，Windows 下通过 `WSLENV` 传递（如 `NPM_CONFIG_REGISTRY`、`UV_DEFAULT_INDEX`、`PIP_INDEX_URL`），确保在 WSL 侧可见。
+- 请勿配置 `type: 'wsl'`，这不是合法的传输类型；通过上面的 stdio + `wsl` 命令即可在 WSL 环境中运行 MCP 服务。
+
 ## 安全考虑
 
 1. **默认拒绝**: 所有工具调用默认需要明确权限

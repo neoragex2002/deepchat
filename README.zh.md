@@ -106,7 +106,22 @@ DeepChat是一个功能强大的开源AI聊天平台，为用户提供与多种�
 - 💰 **商业友好**：
   - 拥抱开源，基于 Apache License 2.0 协议，企业使用安心无忧
   - 企业集成只需要修改极少配置代码即可使用预留的加密混淆的安全能力
-  - 代码结构清晰，无论是模型供应商还是 MCP 服务都高度解耦，可以随意进行增删定制，成本极低
+- 代码结构清晰，无论是模型供应商还是 MCP 服务都高度解耦，可以随意进行增删定制，成本极低
+
+### MCP 传输类型与 WSL 使用提示
+
+- 支持的 MCP 传输类型：`stdio`、`sse`、`http`、`inmemory`。
+- WSL 不是传输类型。如需在 WSL 中运行 MCP 服务，请将 `type` 设为 `stdio`，`command` 设为 `wsl`，并在 `args` 中传入要在 WSL 执行的命令，例如：
+
+```json
+{
+  "type": "stdio",
+  "command": "wsl",
+  "args": ["bash", "-lc", "uvx osm-mcp-server"]
+}
+```
+
+更多架构与配置细节参见 `docs/mcp-architecture.md`。
   - 架构合理，数据交互和UI行为分离，充分利用 Electron 的能力，拒绝简单的网页套壳，性能优异
 
 ## 🤖 支持的模型提供商
