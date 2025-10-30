@@ -202,6 +202,10 @@
       "name": "Multi-Agent Meetings",
       "desc": "DeepChat built-in meetings to host multi-agent discussions."
     },
+    "deepchat-inmemory/shell-server": {
+      "name": "Shell",
+      "desc": "Execute local commands via argv with UTF-8 safe truncation and optional streaming. For shell features use [''/bin/bash'',''-lc'', ...]. On Windows use 'wsl bash -lc' or PowerShell."
+    },
     "deepchat/apple-server": {
       "desc": "Let models operate macOS apps like Calendar, Contacts, Mail, Maps, Notes, and Reminders.",
       "name": "macOS System Assistant"

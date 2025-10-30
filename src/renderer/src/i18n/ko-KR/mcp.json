@@ -198,6 +198,10 @@
       "name": "멀티 에이전트 회의",
       "desc": "DeepChat의 내장 회의 서비스는 다중 에이전트 토론의 주최와 진행을 지원합니다."
     },
+    "deepchat-inmemory/shell-server": {
+      "name": "Shell",
+      "desc": "argv로 로컬 명령을 실행합니다. UTF-8 안전 절단 및 선택적 스트리밍을 지원합니다. 셸 문법이 필요하면 [''/bin/bash'',''-lc'', ...]를 사용하세요. Windows에서는 'wsl bash -lc' 또는 PowerShell을 사용할 수 있습니다."
+    },
     "builtinKnowledge": {
       "desc": "Deepchat 내장 지식 기반 검색 서비스, Deepchat 내장 지식 기반의 내용을 검색 할 수있는 Deepchat 내장 지식 기반 검색 서비스",
       "name": "내장 된 지식 기반 검색"

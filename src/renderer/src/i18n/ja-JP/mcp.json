@@ -198,6 +198,10 @@
       "name": "マルチエージェント会議",
       "desc": "DeepChatの内蔵会議サービスは、マルチエージェントによる討論の開催と進行を可能にします。"
     },
+    "deepchat-inmemory/shell-server": {
+      "name": "Shell",
+      "desc": "argv でローカルコマンドを実行。UTF-8 安全な切り詰めとストリーミング（任意）に対応。シェル構文が必要な場合は [''/bin/bash'',''-lc'', ...]。Windows では 'wsl bash -lc' または PowerShell を使用してください。"
+    },
     "builtinKnowledge": {
       "desc": "deepchatビルトインナレッジベース検索サービス。これは、deepchatビルトインナレッジベースのコンテンツを検索できる",
       "name": "組み込みのナレッジベース検索"

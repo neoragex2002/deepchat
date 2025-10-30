@@ -285,6 +285,23 @@ const DEFAULT_INMEMORY_SERVERS: Record<string, MCPServerConfig> = {
     env: {},
     disable: false
   },
+  'deepchat-inmemory/shell-server': {
+    args: [],
+    descriptions: 'DeepChat内置Shell命令执行工具（安全、可配置、支持流式输出和UTF-8安全截断）',
+    icons: '💻',
+    autoApprove: ['read'],
+    type: 'inmemory' as MCPServerType,
+    command: 'deepchat-inmemory/shell-server',
+    env: {
+      // Budgets (can be customized in settings later via env editor)
+      SHELL_MAX_BYTES: '10240',
+      SHELL_MAX_LINES: '256',
+      SHELL_HEAD_LINES: '128',
+      // Approval policy: 'never' | 'on-request'
+      APPROVAL_POLICY: 'never'
+    },
+    disable: false
+  },
   // Merge platform-specific services
   ...PLATFORM_SPECIFIC_SERVERS
 }
@@ -307,6 +324,7 @@ const DEFAULT_MCP_SERVERS = {
   },
   defaultServers: [
     'Artifacts',
+    'deepchat-inmemory/shell-server',
     // Add platform-specific services enabled by default based on platform
     ...(isMacOS() ? ['deepchat/apple-server'] : [])
   ],

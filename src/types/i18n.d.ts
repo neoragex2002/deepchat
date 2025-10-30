@@ -422,6 +422,10 @@ declare module 'vue-i18n' {
         name: string
         desc: string
       }
+      'deepchat-inmemory/shell-server': {
+        name: string
+        desc: string
+      }
       'deepchat/apple-server': {
         name: string
         desc: string

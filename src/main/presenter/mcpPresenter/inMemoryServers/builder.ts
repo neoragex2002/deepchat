@@ -14,6 +14,7 @@ import { MeetingServer } from './meetingServer'
 import { BuiltinKnowledgeServer } from './builtinKnowledgeServer'
 import { BuiltinKnowledgeConfig } from '@shared/presenter'
 import { AppleServer } from './appleServer'
+import { ShellServer } from './shellServer'
 
 export function getInMemoryServer(
   serverName: string,
@@ -85,6 +86,8 @@ export function getInMemoryServer(
       return new ConversationSearchServer()
     case 'deepchat-inmemory/meeting-server':
       return new MeetingServer()
+    case 'deepchat-inmemory/shell-server':
+      return new ShellServer(env)
     case 'deepchat/apple-server':
       // 只在 macOS 上创建 AppleServer
       if (process.platform !== 'darwin') {

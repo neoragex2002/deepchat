@@ -221,8 +221,142 @@ export class ToolManager {
   }
 
   // 确定权限类型的新方法
-  private determinePermissionType(toolName: string): 'read' | 'write' | 'all' {
+  private determinePermissionType(
+    toolName: string,
+    parsedArgs?: Record<string, unknown> | null
+  ): 'read' | 'write' | 'all' {
     const lowerToolName = toolName.toLowerCase()
+
+    // Special-case: shell tool — inspect argv to infer read vs write
+    if (lowerToolName === 'shell' && parsedArgs && parsedArgs['command']) {
+      try {
+        const cmd = parsedArgs['command'] as unknown
+        const argv = Array.isArray(cmd) ? (cmd as unknown[]).map(String) : []
+        const joined = argv.join(' ')
+        const lowerJoined = joined.toLowerCase()
+        // Common write indicators: redirection, in-place edits, piping to tee
+        const hasRedirect = />|>>|2>|1>|\s>\s|\s>>\s|\|\s*tee\b|sed\s+-i\b|perl\s+-pi?\b/.test(
+          lowerJoined
+        )
+        // Broad, conservative write verbs across POSIX and Windows ecosystems
+        const writeVerbs = [
+          // POSIX coreutils and editors
+          'rm',
+          'mv',
+          'cp',
+          'install',
+          'chmod',
+          'chown',
+          'mkdir',
+          'rmdir',
+          'truncate',
+          'dd',
+          'ln',
+          'touch',
+          'vi',
+          'vim',
+          'nvim',
+          'nano',
+          'emacs',
+          'ed',
+          'ex',
+          // Networking / downloaders (write to FS)
+          'curl',
+          'wget',
+          'aria2c',
+          // Archives / extractors
+          'tar',
+          'bsdtar',
+          'unzip',
+          'gunzip',
+          'bunzip2',
+          'xz',
+          '7z',
+          '7za',
+          'unrar',
+          // Sync/transfer
+          'rsync',
+          'scp',
+          'sftp',
+          // VCS / build
+          'git',
+          'hg',
+          'svn',
+          'make',
+          'cmake',
+          'ninja',
+          // Package managers
+          'apt',
+          'apt-get',
+          'yum',
+          'dnf',
+          'pacman',
+          'apk',
+          'brew',
+          'pip',
+          'pip3',
+          'pipx',
+          'conda',
+          'gem',
+          'cargo',
+          'go',
+          'rustup',
+          'npm',
+          'pnpm',
+          'yarn',
+          // Containers / orchestration (conservative)
+          'docker',
+          'podman',
+          'kubectl',
+          'helm',
+          'compose',
+          'docker-compose',
+          // Windows CMD built-ins and tools
+          'del',
+          'erase',
+          'ren',
+          'rename',
+          'copy',
+          'move',
+          'md',
+          'rd',
+          'mkdir',
+          'rmdir',
+          'xcopy',
+          'robocopy',
+          'mklink',
+          'attrib',
+          'icacls',
+          'takeown',
+          'ftype',
+          'assoc',
+          'reg',
+          // PowerShell host (we pattern-match specific verbs below)
+          'powershell',
+          'pwsh'
+        ]
+        const first = argv[0]?.toLowerCase?.() || ''
+        const isWriteVerb = writeVerbs.some((w) => first === w || lowerJoined.startsWith(w + ' '))
+        // PowerShell specific verbs inside the command string
+        const psWritePattern =
+          /\b(Set-Content|Add-Content|Out-File|New-Item|Remove-Item|Move-Item|Copy-Item|Rename-Item|Set-Item|Clear-Content|Set-Acl|New-ItemProperty|Set-ItemProperty|Remove-ItemProperty)\b/i
+        const cmdWritePattern =
+          /\b(del|erase|ren|rename|copy|move|md|rd|mkdir|rmdir|xcopy|robocopy|mklink|attrib|icacls|takeown|ftype|assoc)\b/i
+        const tarExtractPattern = /\btar\b.*\b(-x|--extract)\b/
+        const unzipPattern = /\b(unzip|7z|7za|unrar|gunzip|bunzip2|xz)\b/
+        const hasPsWrite =
+          (first === 'powershell' || first === 'pwsh') && psWritePattern.test(joined)
+        const hasCmdWrite =
+          (first === 'cmd' || first === 'cmd.exe') && cmdWritePattern.test(lowerJoined)
+        const hasExtract = tarExtractPattern.test(lowerJoined) || unzipPattern.test(lowerJoined)
+        if (hasRedirect || isWriteVerb) return 'write'
+        if (hasPsWrite || hasCmdWrite || hasExtract) return 'write'
+        return 'read'
+      } catch {
+        // On parsing issues, fall back to safe default
+        return 'write'
+      }
+    }
 
     // Read operations
     if (
@@ -271,7 +405,8 @@ export class ToolManager {
   private checkToolPermission(
     originalToolName: string,
     serverName: string,
-    autoApprove: string[]
+    autoApprove: string[],
+    parsedArgs?: Record<string, unknown> | null
   ): boolean {
     console.log(
       `[ToolManager] Checking permissions for tool '${originalToolName}' on server '${serverName}' with autoApprove:`,
@@ -284,7 +419,7 @@ export class ToolManager {
       return true
     }
 
-    const permissionType = this.determinePermissionType(originalToolName)
+    const permissionType = this.determinePermissionType(originalToolName, parsedArgs)
     console.log(`[ToolManager] Tool '${originalToolName}' requires '${permissionType}' permission`)
 
     // Check if the specific permission type is approved
@@ -383,7 +518,12 @@ export class ToolManager {
         autoApprove
       )
       // Use originalName and toolServerName for permission check
-      const hasPermission = this.checkToolPermission(originalName, toolServerName, autoApprove)
+      const hasPermission = this.checkToolPermission(
+        originalName,
+        toolServerName,
+        autoApprove,
+        args
+      )
 
       if (!hasPermission) {
         console.warn(

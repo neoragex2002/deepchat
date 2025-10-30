@@ -198,6 +198,10 @@
       "name": "Réunion Multi-Agent",
       "desc": "Le service de réunion intégré de DeepChat permet d’organiser et d’animer des discussions multi-agents."
     },
+    "deepchat-inmemory/shell-server": {
+      "name": "Shell",
+      "desc": "Exécuter des commandes locales via argv, troncature UTF‑8 sûre et diffusion en continu optionnelle. Pour les fonctions du shell utilisez [''/bin/bash'',''-lc'', ...]. Sous Windows utilisez 'wsl bash -lc' ou PowerShell."
+    },
     "builtinKnowledge": {
       "desc": "Recherche dans la base de connaissances intégrée de DeepChat (docs, contenus intégrés).",
       "name": "Base de connaissances intégrée"

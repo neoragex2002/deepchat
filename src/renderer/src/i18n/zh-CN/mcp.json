@@ -222,6 +222,10 @@
       "name": "多智能体会议",
       "desc": "DeepChat 内置会议服务，支持发起和主持多智能体讨论"
     },
+    "deepchat-inmemory/shell-server": {
+      "name": "Shell 工具",
+      "desc": "通过 argv 执行本地命令，支持 UTF-8 安全截断与可选流式输出。需要 shell 语法时显式 [''/bin/bash'',''-lc'', ...]；Windows 可用 'wsl bash -lc' 或 PowerShell。"
+    },
     "deepchat/apple-server": {
       "name": "macOS系统助手",
       "desc": "让模型能操作macOS的日历、联系人、邮件、地图、备忘录、提醒事项等系统功能"
