@@ -47,7 +47,14 @@ function buildMinimalEnv(source: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
     'PATHEXT',
     'SYSTEMROOT',
     'WINDIR',
-    'COMSPEC'
+    'COMSPEC',
+    // Localization/terminal/timezone essentials
+    'LANG',
+    'LC_ALL',
+    'LC_CTYPE',
+    'TZ',
+    'TERM',
+    'COLORTERM'
   ])
   const out: NodeJS.ProcessEnv = {}
   for (const [k, v] of Object.entries(source)) {
@@ -55,7 +62,8 @@ function buildMinimalEnv(source: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
     const upper = k.toUpperCase()
     // Default excludes: *KEY*, *SECRET*, *TOKEN*
     if (upper.includes('KEY') || upper.includes('SECRET') || upper.includes('TOKEN')) continue
-    if (allowUpper.has(upper)) out[k] = v
+    // Allow list or LC_* prefix (locale family)
+    if (allowUpper.has(upper) || upper.startsWith('LC_')) out[k] = v
   }
   return out
 }
@@ -84,7 +92,11 @@ function formatAggregatedOutput(
   budgets: Budgets
 ): { text: string; truncated: boolean; lineCount: number } {
   const { maxBytes, maxLines, headLines } = budgets
-  const lines = body.split('\n')
+  // Treat trailing newline as not adding a visible line. This aligns with
+  // the intuitive expectation that exactly N newline-terminated lines count as N.
+  const endsWithNewline = body.endsWith('\n')
+  const segments = body.split('\n')
+  const lines = endsWithNewline ? segments.slice(0, -1) : segments
   const totalLines = lines.length
   let truncated = false
 
@@ -94,7 +106,7 @@ function formatAggregatedOutput(
     const head = lines.slice(0, headTake).join('\n')
     const tail = lines.slice(totalLines - tailTake).join('\n')
     const omitted = totalLines - headTake - tailTake
-    const marker = `\n[... omitted ${omitted} of ${totalLines} lines ...]\n\n`
+    const marker = `\n\n[... omitted ${omitted} of ${totalLines} lines ...]\n\n`
 
     // 保证 marker 一定完整输出：为 marker 预留字节，再在剩余字节中平均分配给 head/tail
     const markerBytes = Buffer.byteLength(marker, 'utf8')
@@ -115,7 +127,7 @@ function formatAggregatedOutput(
   // Within line budget, enforce byte cap
   if (Buffer.byteLength(body, 'utf8') > maxBytes) {
     // 同样保证 marker 完整：预留 marker 字节后再分配 head/tail
-    const marker = '\n[... omitted due to size ...]\n\n'
+    const marker = '\n\n[... omitted due to size ...]\n\n'
     const markerBytes = Buffer.byteLength(marker, 'utf8')
     if (markerBytes >= maxBytes) {
       return { text: takeUtf8Prefix(marker, maxBytes), truncated: true, lineCount: totalLines }
@@ -155,26 +167,28 @@ export class ShellServer {
   private approvalPolicy: 'never' | 'on-request' = 'never'
   private allowedDirs: string[] = []
   private budgets: Budgets
-  private capabilities: {
+  private _hostShells: {
     has_wsl: boolean
     has_powershell: boolean
     has_cmd: boolean
     has_bash: boolean
   } = { has_wsl: false, has_powershell: false, has_cmd: false, has_bash: false }
-  private platformMode: 'windows' | 'wsl' | 'posix' = 'posix'
+  private hostInfo: { os: 'windows' | 'linux' | 'mac'; wsl: boolean }
+  private platform: 'win' | 'wsl' | 'posix' = 'posix'
 
   constructor(env?: Record<string, unknown>) {
-    if (
-      env &&
-      (env['APPROVAL_POLICY'] === 'on-request' || env['approvalPolicy'] === 'on-request')
-    ) {
+    // Helper to read from provided env first, then fall back to process.env
+    const getEnv = (key: string): unknown =>
+      env && Object.prototype.hasOwnProperty.call(env, key) ? env[key] : process.env[key]
+
+    if (getEnv('APPROVAL_POLICY') === 'on-request' || getEnv('approvalPolicy') === 'on-request') {
       this.approvalPolicy = 'on-request'
     }
 
     // Configurable budgets via env
-    const maxBytes = parseInt(String(env?.['SHELL_MAX_BYTES'] ?? ''), 10)
-    const maxLines = parseInt(String(env?.['SHELL_MAX_LINES'] ?? ''), 10)
-    const headLines = parseInt(String(env?.['SHELL_HEAD_LINES'] ?? ''), 10)
+    const maxBytes = parseInt(String(getEnv('SHELL_MAX_BYTES') ?? ''), 10)
+    const maxLines = parseInt(String(getEnv('SHELL_MAX_LINES') ?? ''), 10)
+    const headLines = parseInt(String(getEnv('SHELL_HEAD_LINES') ?? ''), 10)
     const mb = Number.isFinite(maxBytes) && maxBytes > 0 ? maxBytes : DEFAULT_MAX_BYTES
     const ml = Number.isFinite(maxLines) && maxLines > 0 ? maxLines : DEFAULT_MAX_LINES
     const hlRaw =
@@ -184,7 +198,7 @@ export class ShellServer {
     this.budgets = { maxBytes: mb, maxLines: ml, headLines: hlRaw }
 
     // Allowed CWD roots (whitelist). Accept JSON array string or PATH-like string.
-    const allowedRaw = env?.['SHELL_ALLOWED_DIRS'] as unknown
+    const allowedRaw = getEnv('SHELL_ALLOWED_DIRS') as unknown
     let dirs: string[] = []
     if (Array.isArray(allowedRaw)) {
       dirs = allowedRaw.map((s) => String(s))
@@ -232,25 +246,27 @@ export class ShellServer {
       }
     })
 
-    // Determine platform capabilities
-    this.capabilities = detectCapabilities()
+    // Determine host info and shells
+    this._hostShells = detectHostShells()
+    this.hostInfo = detectHostInfo()
 
     // Classify allowed roots by domain; actual filtering is enforced by platform mode below
     // Classify domains if needed later (currently filtered by platform mode)
 
-    // Enforce explicit platform mode if provided via env SHELL_PLATFORM
-    const pmRaw = String(env?.['SHELL_PLATFORM'] ?? '').toLowerCase()
-    if (pmRaw === 'windows' || pmRaw === 'wsl' || pmRaw === 'posix') {
-      this.platformMode = pmRaw
+    // Enforce explicit platform if provided via env SHELL_PLATFORM (support synonyms)
+    const pmRaw = String(getEnv('SHELL_PLATFORM') ?? '').toLowerCase()
+    const pmNorm = pmRaw === 'windows' ? 'win' : pmRaw
+    if (pmNorm === 'win' || pmNorm === 'wsl' || pmNorm === 'posix') {
+      this.platform = pmNorm as typeof this.platform
     } else {
-      const host = detectPlatform()
-      this.platformMode = host.os === 'windows' ? 'windows' : 'posix'
+      const host = this.hostInfo
+      this.platform = host.os === 'windows' ? 'win' : 'posix'
     }
-    // Filter allowed roots to match platform mode domain strictly
+    // Filter allowed roots to match platform domain strictly
     {
       // Filter by domain based on execution mode
       const currentDomains = this.allowedDirs.map(classifyPathDomain)
-      if (this.platformMode === 'windows') {
+      if (this.platform === 'win') {
         this.allowedDirs = this.allowedDirs.filter((_, i) => currentDomains[i] === 'windows')
       } else {
         // posix or wsl
@@ -280,39 +296,56 @@ export class ShellServer {
         default_timeout_ms: 10_000,
         allowed_roots_count: this.allowedDirs.length
       }
-      const plat = detectPlatform()
       const sampleRoots = this.allowedDirs.slice(0, 5)
       const rootsLine = sampleRoots.length
-        ? `Allowed roots (sample ${sampleRoots.length}/${this.allowedDirs.length}): ${sampleRoots.join(' | ')}`
-        : `Allowed roots: (default) app cwd only`
-      const shells = this.capabilities
-      const reqStyle = this.platformMode === 'windows' ? 'windows' : 'posix'
-      const guidance =
-        `Output limits: max_bytes=${caps.max_bytes}, max_lines=${caps.max_lines}, head_lines=${caps.head_lines}. ` +
-        `For large output, split into chunks (e.g. sed -n start,endp file, or tail -n +N | head -n K).` +
-        ` Use stream=true for realtime output if needed. ` +
-        `Host: os=${plat.os}, wsl_available=${shells.has_wsl}. Run mode=${this.platformMode}. Required path style=${reqStyle}. ` +
-        `Runtimes: powershell=${shells.has_powershell}, cmd=${shells.has_cmd}, wsl=${shells.has_wsl}. ${rootsLine}. ` +
-        `workdir is REQUIRED on every call and must be inside an allowed root with the required path style. Do not mix POSIX and Windows path styles. ` +
-        (process.platform === 'win32'
-          ? this.platformMode === 'wsl'
-            ? `On Windows run mode 'wsl': use ['wsl','bash','-lc', ...] for Linux commands and POSIX paths (e.g. /mnt/c/...). `
-            : `On Windows run mode 'windows': WSL commands are only available if the server is started with SHELL_PLATFORM=wsl. In the current 'windows' mode, only Windows-native commands are allowed (PowerShell/CMD). For CMD built-ins (dir/del/ren/etc) use ['cmd','/c','<command> ...']. `
-          : `On Linux/macOS: prefer ['/bin/bash','-lc', ...] for shell features.`) +
-        ` Call 'shell_info' and cache its immutable result for precise planning.`
+        ? `允许的根目录 (示例 ${sampleRoots.length}/${this.allowedDirs.length}): ${sampleRoots.join(' | ')}`
+        : `允许的根目录: (默认) 仅应用当前目录`
+      const required_path_style = this.platform === 'win' ? 'windows' : 'posix'
+      const wslWarning =
+        this.platform === 'wsl' && this.allowedDirs.length === 0
+          ? `警告：platform=wsl 模式下未配置任何 POSIX 允许的根目录。请设置 SHELL_ALLOWED_DIRS 为 POSIX 路径 (例如 /mnt/c/dev)，不要使用 Windows 风格路径。`
+          : ''
+
+      const shell_type = this.platform === 'win' ? 'powershell' : 'bash'
+      const platform_specific_usage_hint =
+        process.platform === 'win32'
+          ? this.platform === 'wsl'
+            ? `在 'wsl' 平台上：请使用 ['wsl','bash','-lc', ...] 和 POSIX 路径 (例如 /mnt/c/...)。`
+            : `在 'win' 平台上：只允许使用 Windows 原生 shell (PowerShell/CMD) 和 Windows 路径 (例如 C:\\...)。`
+          : `在 'posix' 平台 (Linux/macOS) 上：请优先使用 ['/bin/bash','-lc', ...] 和 POSIX 路径。`
+
+      // (修改) 使用新的模板列表重构 guidance, 并移除 markdown
+      const descriptionLines = [
+        '通过 argv 列表执行本地命令。',
+        '执行模式：此工具仅执行argv数组（无隐式 shell），因此管道 |、重定向 > 或通配符 * 等 shell 特性默认不可用。',
+        '工作目录 (CWD)：每次调用都必须提供 workdir 参数。强烈不推荐在命令中使用 cd，必须始终通过 workdir 参数指定执行目录。',
+        `平台模式：当前运行在 ${this.platform} 模式下。workdir 和所有路径必须严格使用 ${required_path_style} 路径风格。`,
+        `工作区限制：workdir 必须位于以下允许的根目录之一内：${rootsLine}`,
+        wslWarning, // (如果为空字符串，filter(Boolean) 会移除)
+        `Shell 用法：如需使用管道 | 等 shell 特性，必须使用平台推荐的包装器，例如 ['${shell_type}', '-flag', '...']。`,
+        `平台特定格式（必须遵守）：${platform_specific_usage_hint}`,
+        `输出限制：总输出行数上限 ${caps.max_lines} 行，不超过该上限时，将显示全部内容，不进行行数截断；如超过该上限，将做行数截断处理，只保留头部 ${caps.head_lines} 行和尾部 ${caps.max_lines - caps.head_lines} 行；总输出大小上限为 ${caps.max_bytes} 字节。`,
+        "大输出处理：对于可能超限的大输出，请在命令内部分块（例如 sed -n 'start,end p' 或 tail -n +N | head -n K）。",
+        '文件/内容搜索建议：优先使用高效的 rg (ripgrep) 或 rg --files 进行文件内容或路径搜索；如 rg 不可用，再回退使用 grep 或 find。',
+        '流式输出：如需实时日志，请设置 stream=true。',
+        '路径风格警告：严禁混用 POSIX (/) 和 Windows (\\) 路径风格。',
+        '任务规划：在执行复杂任务前，请调用 shell_info 并缓存其返回配置，以便精确规划；同时尽可能合并指令，提升执行效率。',
+        '权限提升：仅当 APPROVAL_POLICY=on-request 时才允许请求权限提升（with_escalated_permissions: true），且必须同时提供一句简短的 justification（理由）。'
+      ]
+
+      const guidance = descriptionLines.filter(Boolean).join(' ')
+
       return {
         tools: [
           {
             name: 'shell',
-            description:
-              'Execute local commands via argv. workdir is REQUIRED and must be inside an allowed root. Use ["/bin/bash","-lc",...] for shell features. ' +
-              guidance,
+            description: guidance,
             inputSchema: zodToJsonSchema(ShellArgsSchema)
           },
           {
             name: 'shell_info',
             description:
-              'Return configuration for planning: execution_mode, host, available_runtimes, required_path_style, limits, allowed_roots, current_workdir_host.',
+              '返回不可变的、可缓冲的配置信息，用于规划：platform (平台), shell (推荐Shell), required_path_style (路径风格要求), limits (限制), allowed_roots (允许的根目录)。',
             inputSchema: { type: 'object', properties: {} }
           }
         ]
@@ -323,16 +356,10 @@ export class ShellServer {
     this.server.setRequestHandler(CallToolRequestSchema, async (request) => {
       const { name, arguments: rawArgs } = request.params
       if (name === 'shell_info') {
-        const plat = detectPlatform()
-        const required_path_style = this.platformMode === 'windows' ? 'windows' : 'posix'
+        const required_path_style = this.platform === 'win' ? 'windows' : 'posix'
         const info = {
-          execution_mode: this.platformMode, // windows | wsl | posix
-          host: { os: plat.os, has_wsl: this.capabilities.has_wsl },
-          available_runtimes: {
-            powershell: this.capabilities.has_powershell,
-            cmd: this.capabilities.has_cmd,
-            wsl: this.capabilities.has_wsl
-          },
+          platform: this.platform, // win | wsl | posix
+          shell: this.platform === 'win' ? 'powershell/cmd' : 'bash',
           required_path_style, // windows | posix
           limits: {
             max_bytes: this.budgets.maxBytes,
@@ -340,8 +367,7 @@ export class ShellServer {
             head_lines: this.budgets.headLines,
             default_timeout_ms: 10_000
           },
-          allowed_roots: this.allowedDirs,
-          current_workdir_host: process.cwd()
+          allowed_roots: this.allowedDirs
         }
         const text = JSON.stringify(info)
         return {
@@ -392,7 +418,7 @@ export class ShellServer {
       const requestedCwd = args.workdir
       let cwd = path.resolve(requestedCwd)
       try {
-        if (this.platformMode !== 'wsl') {
+        if (this.platform !== 'wsl') {
           cwd = fs.realpathSync.native ? fs.realpathSync.native(cwd) : fs.realpathSync(cwd)
         } else {
           // In wsl mode, do not attempt to realpath() POSIX workdir on Windows host.
@@ -425,6 +451,8 @@ export class ShellServer {
               is_error: true
             }
           }
+          // Parent directory is allowed; fall back cwd to the existing parent
+          cwd = realParent
         } catch {
           return {
             content: [
@@ -441,8 +469,8 @@ export class ShellServer {
           }
         }
       }
-      // Validate workdir based on execution_mode rules.
-      if (this.platformMode === 'wsl') {
+      // Validate workdir based on platform rules.
+      if (this.platform === 'wsl') {
         // Require POSIX style and enforce allowed roots.
         if (args.workdir) {
           const wd = args.workdir
@@ -452,7 +480,7 @@ export class ShellServer {
               content: [
                 {
                   type: 'text',
-                  text: `Access denied: workdir must be POSIX path in execution_mode=wsl (e.g. /mnt/c/...)`
+                  text: `Access denied: workdir must be POSIX path in platform=wsl (e.g. /mnt/c/...)`
                 }
               ],
               structured_content: {
@@ -471,7 +499,7 @@ export class ShellServer {
               content: [
                 {
                   type: 'text',
-                  text: `Access denied: workdir outside allowed roots (execution_mode=wsl). workdir=${wd}`
+                  text: `Access denied: workdir outside allowed roots (platform=wsl). workdir=${wd}`
                 }
               ],
               structured_content: {
@@ -487,15 +515,15 @@ export class ShellServer {
         }
         // Do not enforce host cwd domain/containment for WSL mode.
       } else {
-        // For windows/posix modes, enforce host cwd domain and allowed roots containment.
+        // For win/posix modes, enforce host cwd domain and allowed roots containment.
         const cwdDomain = classifyPathDomain(cwd)
-        const mustDomain = this.platformMode === 'windows' ? 'windows' : 'posix'
+        const mustDomain = this.platform === 'win' ? 'windows' : 'posix'
         if (cwdDomain !== mustDomain) {
           return {
             content: [
               {
                 type: 'text',
-                text: `Access denied: host working directory must be ${mustDomain} style in execution_mode=${this.platformMode}`
+                text: `Access denied: host working directory must be ${mustDomain} style in platform=${this.platform}`
               }
             ],
             structured_content: {
@@ -532,15 +560,16 @@ export class ShellServer {
       let exitCode: number | null = null
       let spawnError: Error | null = null
 
-      // Enforce platform mode on command wrapper
+      // Enforce platform on command wrapper
       const firstArg = (args.command[0] || '').toLowerCase()
-      if (this.platformMode === 'windows') {
-        if (firstArg === 'wsl' || firstArg === 'bash' || firstArg === '/bin/bash') {
+      const isWslInvoker = firstArg === 'wsl' || firstArg === 'wsl.exe'
+      if (this.platform === 'win') {
+        if (isWslInvoker || firstArg === 'bash' || firstArg === '/bin/bash') {
           return {
             content: [
               {
                 type: 'text',
-                text: `Command not allowed in platform mode ${this.platformMode}. Use PowerShell or CMD wrappers instead.`
+                text: `Command not allowed in platform ${this.platform}. Use PowerShell or CMD wrappers instead.`
               }
             ],
             structured_content: {
@@ -553,13 +582,13 @@ export class ShellServer {
             is_error: true
           }
         }
-      } else if (this.platformMode === 'wsl') {
-        if (firstArg !== 'wsl') {
+      } else if (this.platform === 'wsl') {
+        if (!isWslInvoker) {
           return {
             content: [
               {
                 type: 'text',
-                text: `Command must start with 'wsl' in platform mode ${this.platformMode}.`
+                text: `Command must start with 'wsl' in platform ${this.platform}.`
               }
             ],
             structured_content: {
@@ -587,7 +616,7 @@ export class ShellServer {
               content: [
                 {
                   type: 'text',
-                  text: `Invalid command: 'wsl' requires a subcommand. In execution_mode=wsl, prefer ['wsl','bash','-lc', '<script>'].`
+                  text: `Invalid command: 'wsl' requires a subcommand. In platform=wsl, prefer ['wsl','bash','-lc', '<script>'].`
                 }
               ],
               structured_content: {
@@ -600,13 +629,26 @@ export class ShellServer {
               is_error: true
             }
           }
-          const hasWslFlags = rest.some((t) => t.startsWith('-'))
+          // Only treat known WSL options in the prefix (before the first non-option token or '--') as WSL flags.
+          const knownWslFlags = new Set([
+            '-d',
+            '--distribution',
+            '-u',
+            '--user',
+            '--cd',
+            '--exec',
+            '-e'
+          ])
+          let boundary = rest.findIndex((t) => t === '--' || !t.startsWith('-'))
+          if (boundary === -1) boundary = rest.length
+          const prefix = rest.slice(0, boundary)
+          const hasWslFlags = prefix.some((t) => knownWslFlags.has(t) || t === '--')
           if (hasWslFlags) {
             return {
               content: [
                 {
                   type: 'text',
-                  text: `In execution_mode=wsl, when using WSL options (e.g. -d/-u/--cd), please format as ['wsl','bash','-lc', '<script>'] so workdir can be enforced.`
+                  text: `In platform=wsl, when using WSL options (e.g. -d/-u/--cd), please format as ['wsl','bash','-lc', '<script>'] so workdir can be enforced.`
                 }
               ],
               structured_content: {
@@ -625,13 +667,13 @@ export class ShellServer {
           const script = `cd -- '${wdEsc}' || { echo 'ERROR: workdir not found or not accessible: ${wd}'; exit 2; }; ${cmdStr}`
           args.command = ['wsl', 'bash', '-lc', script]
         }
-      } else if (this.platformMode === 'posix') {
-        if (firstArg === 'wsl') {
+      } else if (this.platform === 'posix') {
+        if (isWslInvoker) {
           return {
             content: [
               {
                 type: 'text',
-                text: `Command 'wsl' is not allowed in platform mode ${this.platformMode}.`
+                text: `Command 'wsl' is not allowed in platform ${this.platform}.`
               }
             ],
             structured_content: {
@@ -646,8 +688,8 @@ export class ShellServer {
         }
       }
 
-      // Choose spawn CWD based on execution mode
-      const spawnCwd = this.platformMode === 'wsl' ? process.cwd() : cwd
+      // Choose spawn CWD based on platform
+      const spawnCwd = this.platform === 'wsl' ? process.cwd() : cwd
       const child = spawn(args.command[0], args.command.slice(1), {
         cwd: spawnCwd,
         env,
@@ -728,7 +770,7 @@ export class ShellServer {
       let textRaw = Buffer.concat(aggregated).toString('utf8')
       // If spawn failed due to command not found and platform suggests a more suitable wrapper, append guidance.
       if (spawnError && /ENOENT|not found/i.test((spawnError as Error).message || '')) {
-        const plat = detectPlatform()
+        const plat = this.hostInfo
         if (plat.os === 'windows' && !plat.wsl) {
           const first = args.command[0].toLowerCase()
           if (first === 'bash' || first === '/bin/bash') {
@@ -802,7 +844,6 @@ export class ShellServer {
         truncatedFinal = truncated || adjusted.truncated
       }
 
-      const plat = detectPlatform()
       return {
         content: [{ type: 'text', text }],
         structured_content: {
@@ -812,7 +853,6 @@ export class ShellServer {
           line_count: lineCount,
           truncated: truncatedFinal,
           budgets: this.budgets,
-          platform: { os: plat.os, wsl: plat.wsl },
           effective_arguments: {
             command: args.command,
             workdir: args.workdir,
@@ -829,7 +869,7 @@ export class ShellServer {
   }
 }
 
-function detectPlatform(): { os: 'windows' | 'linux' | 'mac'; wsl: boolean } {
+function detectHostInfo(): { os: 'windows' | 'linux' | 'mac'; wsl: boolean } {
   const isWin = process.platform === 'win32'
   const isMac = process.platform === 'darwin'
   const isLinux = process.platform === 'linux'
@@ -840,13 +880,13 @@ function detectPlatform(): { os: 'windows' | 'linux' | 'mac'; wsl: boolean } {
   return { os: isWin ? 'windows' : isMac ? 'mac' : 'linux', wsl: isWSL }
 }
 
-function detectCapabilities(): {
+function detectHostShells(): {
   has_wsl: boolean
   has_powershell: boolean
   has_cmd: boolean
   has_bash: boolean
 } {
-  const plat = detectPlatform()
+  const plat = detectHostInfo()
   const isWin = plat.os === 'windows'
   const hasOnPath = (candidates: string[]): boolean => {
     const pathVar = Object.keys(process.env).find((k) => k.toLowerCase() === 'path')
@@ -860,14 +900,16 @@ function detectCapabilities(): {
     }
     return false
   }
-  const has_cmd =
-    isWin && (hasOnPath(['cmd.exe', 'cmd']) || fs.existsSync('C\\\\Windows\\\\System32\\\\cmd.exe'))
+  const sysRoot = (process.env.SystemRoot || process.env.WINDIR) as string | undefined
+  const system32 = sysRoot ? path.join(sysRoot, 'System32') : undefined
+  const existsInSystem32 = (name: string) =>
+    system32 ? fs.existsSync(path.join(system32, name)) : false
+  const has_cmd = isWin && (hasOnPath(['cmd.exe', 'cmd']) || existsInSystem32('cmd.exe'))
   const has_powershell = isWin
     ? hasOnPath(['pwsh.exe', 'powershell.exe', 'pwsh', 'powershell']) ||
-      fs.existsSync('C\\\\Windows\\\\System32\\\\WindowsPowerShell\\\\v1.0\\\\powershell.exe')
+      existsInSystem32(path.join('WindowsPowerShell', 'v1.0', 'powershell.exe'))
     : hasOnPath(['pwsh', 'powershell'])
-  const has_wsl =
-    isWin && (hasOnPath(['wsl.exe', 'wsl']) || fs.existsSync('C\\\\Windows\\\\System32\\\\wsl.exe'))
+  const has_wsl = isWin && (hasOnPath(['wsl.exe', 'wsl']) || existsInSystem32('wsl.exe'))
   const has_bash = plat.os !== 'windows' ? hasOnPath(['bash']) : false
   return { has_wsl, has_powershell, has_cmd, has_bash }
 }
