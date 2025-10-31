@@ -167,12 +167,6 @@ export class ShellServer {
   private approvalPolicy: 'never' | 'on-request' = 'never'
   private allowedDirs: string[] = []
   private budgets: Budgets
-  private _hostShells: {
-    has_wsl: boolean
-    has_powershell: boolean
-    has_cmd: boolean
-    has_bash: boolean
-  } = { has_wsl: false, has_powershell: false, has_cmd: false, has_bash: false }
   private hostInfo: { os: 'windows' | 'linux' | 'mac'; wsl: boolean }
   private platform: 'win' | 'wsl' | 'posix' = 'posix'
 
@@ -246,8 +240,7 @@ export class ShellServer {
       }
     })
 
-    // Determine host info and shells
-    this._hostShells = detectHostShells()
+    // Determine host info
     this.hostInfo = detectHostInfo()
 
     // Classify allowed roots by domain; actual filtering is enforced by platform mode below
@@ -878,40 +871,6 @@ function detectHostInfo(): { os: 'windows' | 'linux' | 'mac'; wsl: boolean } {
   const isWSL =
     isLinux && (rel.includes('microsoft') || 'WSL_INTEROP' in env || 'WSL_DISTRO_NAME' in env)
   return { os: isWin ? 'windows' : isMac ? 'mac' : 'linux', wsl: isWSL }
-}
-
-function detectHostShells(): {
-  has_wsl: boolean
-  has_powershell: boolean
-  has_cmd: boolean
-  has_bash: boolean
-} {
-  const plat = detectHostInfo()
-  const isWin = plat.os === 'windows'
-  const hasOnPath = (candidates: string[]): boolean => {
-    const pathVar = Object.keys(process.env).find((k) => k.toLowerCase() === 'path')
-    const PATH = pathVar ? String(process.env[pathVar]) : ''
-    const parts = PATH.split(path.delimiter).filter(Boolean)
-    for (const dir of parts) {
-      for (const name of candidates) {
-        const full = path.join(dir, name)
-        if (fs.existsSync(full)) return true
-      }
-    }
-    return false
-  }
-  const sysRoot = (process.env.SystemRoot || process.env.WINDIR) as string | undefined
-  const system32 = sysRoot ? path.join(sysRoot, 'System32') : undefined
-  const existsInSystem32 = (name: string) =>
-    system32 ? fs.existsSync(path.join(system32, name)) : false
-  const has_cmd = isWin && (hasOnPath(['cmd.exe', 'cmd']) || existsInSystem32('cmd.exe'))
-  const has_powershell = isWin
-    ? hasOnPath(['pwsh.exe', 'powershell.exe', 'pwsh', 'powershell']) ||
-      existsInSystem32(path.join('WindowsPowerShell', 'v1.0', 'powershell.exe'))
-    : hasOnPath(['pwsh', 'powershell'])
-  const has_wsl = isWin && (hasOnPath(['wsl.exe', 'wsl']) || existsInSystem32('wsl.exe'))
-  const has_bash = plat.os !== 'windows' ? hasOnPath(['bash']) : false
-  return { has_wsl, has_powershell, has_cmd, has_bash }
 }
 
 function classifyPathDomain(p: string): 'windows' | 'posix' | 'unknown' {
