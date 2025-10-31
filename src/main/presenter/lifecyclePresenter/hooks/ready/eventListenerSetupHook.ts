@@ -88,7 +88,6 @@ export const eventListenerSetupHook: LifecycleHook = {
     app.on('browser-window-focus', () => {
       // When any window gains focus, register shortcuts
       presenter.shortcutPresenter.registerShortcuts()
-      eventBus.sendToMain(WINDOW_EVENTS.APP_FOCUS)
     })
 
     // Listen for browser window blur events

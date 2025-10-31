@@ -80,7 +80,7 @@
 <script setup lang="ts">
 import { Icon } from '@iconify/vue'
 import { Button } from '@/components/ui/button'
-import { onMounted, watch } from 'vue'
+import { watch } from 'vue'
 import { useUpgradeStore } from '@/stores/upgrade'
 import { useThemeStore } from '@/stores/theme'
 defineProps<{
@@ -117,7 +117,5 @@ watch(
   }
 )
 
-onMounted(() => {
-  upgrade.checkUpdate(true)
-})
+// 移除自动检查更新，仅保留手动触发路径
 </script>

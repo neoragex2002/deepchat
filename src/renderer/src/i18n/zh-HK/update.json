@@ -7,9 +7,9 @@
   "githubDownload": "Github下載",
   "netdiskDownload": "網盤下載",
   "checkUpdate": "檢查更新",
-  "autoUpdate": "自動更新",
   "downloading": "正在下載",
   "installNow": "立即安裝",
+  "downloadAndInstall": "下載並安裝",
   "restarting": "正在重啟",
   "alreadyUpToDate": "已經是最新版本了",
   "alreadyUpToDateDesc": "您的 DeepChat 目前已經是最新版本，無需更新。"

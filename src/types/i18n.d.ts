@@ -1168,7 +1168,7 @@ declare module 'vue-i18n' {
     checkUpdate: string
     downloading: string
     installNow: string
-    autoUpdate: string
+    downloadAndInstall: string
     restarting: string
     alreadyUpToDate: string
     alreadyUpToDateDesc: string

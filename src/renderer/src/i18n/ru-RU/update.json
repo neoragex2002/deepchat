@@ -7,9 +7,9 @@
   "githubDownload": "Скачать с GitHub",
   "netdiskDownload": "Скачать с облака",
   "checkUpdate": "Проверить обновления",
-  "autoUpdate": "Автоматическое обновление",
   "downloading": "Загрузка",
   "installNow": "Установить",
+  "downloadAndInstall": "Скачать и установить",
   "restarting": "Перезапуск",
   "alreadyUpToDate": "Уже обновлено",
   "alreadyUpToDateDesc": "Ваш DeepChat уже обновлен до последней версии, обновление не требуется."

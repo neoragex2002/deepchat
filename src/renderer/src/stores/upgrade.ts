@@ -27,9 +27,10 @@ export const useUpgradeStore = defineStore('upgrade', () => {
   const isReadyToInstall = ref(false)
   const isRestarting = ref(false)
   const updateError = ref<string | null>(null)
-  const isSilent = ref(true) // 默认不弹出检查没有最新更新
+  const isSilent = ref(false) // 默认认为手动检查（托盘/设置）需提示
   // 检查更新
   const checkUpdate = async (silent = true) => {
+    const prevSilent = isSilent.value
     isSilent.value = silent
     if (isChecking.value) return
     isChecking.value = true
@@ -56,6 +57,8 @@ export const useUpgradeStore = defineStore('upgrade', () => {
       console.error('Failed to check update:', error)
     } finally {
       isChecking.value = false
+      // 恢复之前的静默状态，避免“粘滞”影响后续（如托盘触发）
+      isSilent.value = prevSilent
     }
   }
 
@@ -74,7 +77,7 @@ export const useUpgradeStore = defineStore('upgrade', () => {
     console.log('setupUpdateListener')
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     window.electron.ipcRenderer.on(UPDATE_EVENTS.STATUS_CHANGED, (_, event: any) => {
-      const { status, type, info, error } = event
+      const { status, info, error } = event
       console.log(UPDATE_EVENTS.STATUS_CHANGED, status, info, error)
       // 根据不同状态更新UI
       switch (status) {
@@ -89,17 +92,18 @@ export const useUpgradeStore = defineStore('upgrade', () => {
                 downloadUrl: info.downloadUrl
               }
             : null
-          // 不自动弹出对话框，由主进程自动开始下载
+          // 手动流程：非静默检查（如托盘/设置）弹窗；静默检查（侧边栏）不打扰
+          if (!isSilent.value) {
+            openUpdateDialog()
+          }
           break
         case 'not-available':
           hasUpdate.value = false
           updateInfo.value = null
           isDownloading.value = false
           isUpdating.value = false
-          // 当检查到没有更新时，如果是自动检测模式，则不弹出对话框
-          if (type !== 'autoCheck') {
-            openUpdateDialog()
-          }
+          // 当检查到没有更新时，根据静默标志决定是否弹出对话框
+          openUpdateDialog()
           break
         case 'downloading':
           hasUpdate.value = true
@@ -127,7 +131,7 @@ export const useUpgradeStore = defineStore('upgrade', () => {
           isDownloading.value = false
           isUpdating.value = false
 
-          // 如果有错误，但仍然有更新信息，说明自动更新失败，需要手动下载
+          // 如果有错误，但仍然有更新信息，说明内置下载流程失败，需要手动下载
           if (info) {
             hasUpdate.value = true
             updateInfo.value = {
@@ -137,7 +141,7 @@ export const useUpgradeStore = defineStore('upgrade', () => {
               githubUrl: info.githubUrl,
               downloadUrl: info.downloadUrl
             }
-            // 自动更新失败，打开手动下载对话框
+            // 内置下载流程失败，打开手动下载对话框
             openUpdateDialog()
           } else {
             hasUpdate.value = false
@@ -211,11 +215,11 @@ export const useUpgradeStore = defineStore('upgrade', () => {
         return
       }
 
-      // 如果是自动更新模式，启动下载
+      // 触发内置下载流程
       if (type === 'auto') {
         const success = await upgradeP.startDownloadUpdate()
         if (!success) {
-          // 如果自动更新失败，则使用手动链接
+          // 如果内置下载流程失败，则使用手动链接
           openUpdateDialog()
         }
         return

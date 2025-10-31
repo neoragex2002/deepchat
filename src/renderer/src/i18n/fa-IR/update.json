@@ -9,7 +9,7 @@
   "checkUpdate": "بررسی به‌روزرسانی‌ها",
   "downloading": "در حال بارگیری",
   "installNow": "اکنون نصب کن",
-  "autoUpdate": "به‌روزرسانی خودکار",
+  "downloadAndInstall": "بارگیری و نصب",
   "restarting": "در حال راه‌اندازی دوباره",
   "alreadyUpToDate": "قبلاً به‌روز شده است",
   "alreadyUpToDateDesc": "برنامه DeepChat شما در حال حاضر به آخرین نسخه به‌روز شده است و نیازی به به‌روزرسانی نیست."

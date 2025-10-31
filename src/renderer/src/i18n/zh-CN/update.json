@@ -9,7 +9,7 @@
   "checkUpdate": "检查更新",
   "downloading": "正在下载",
   "installNow": "立即安装",
-  "autoUpdate": "自动更新",
+  "downloadAndInstall": "下载并安装",
   "restarting": "正在重启",
   "alreadyUpToDate": "已经是最新版本了",
   "alreadyUpToDateDesc": "您的 DeepChat 目前已经是最新版本，无需更新。"

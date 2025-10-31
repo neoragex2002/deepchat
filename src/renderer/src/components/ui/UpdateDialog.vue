@@ -34,9 +34,18 @@
           {{ t(upgrade.hasUpdate ? 'update.later' : 'common.close') }}
         </Button>
 
-        <!-- 如果已下载完成，只显示"立即安装"按钮 -->
+        <!-- 如果已下载完成，显示"立即安装"按钮 -->
         <Button v-if="upgrade.isReadyToInstall" @click="handleUpdate('auto')" :disabled="upgrade.isRestarting">
           {{ upgrade.isRestarting ? t('update.restarting') : t('update.installNow') }}
+        </Button>
+
+        <!-- 有可用更新但尚未下载时，显示"下载并安装"按钮（手动触发下载） -->
+        <Button
+          v-else-if="upgrade.hasUpdate && !upgrade.isDownloading && !upgrade.isReadyToInstall"
+          :disabled="upgrade.isUpdating"
+          @click="handleUpdate('auto')"
+        >
+          {{ t('update.downloadAndInstall') || '下载并安装' }}
         </Button>
 
         <!-- 如果自动更新失败，显示手动下载按钮 -->

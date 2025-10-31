@@ -7,9 +7,9 @@
   "githubDownload": "Téléchargement GitHub",
   "netdiskDownload": "Téléchargement Cloud",
   "checkUpdate": "Vérifier les mises à jour",
-  "autoUpdate": "Mise à jour automatique",
   "downloading": "Téléchargement",
   "installNow": "Installer maintenant",
+  "downloadAndInstall": "Télécharger et installer",
   "restarting": "Redémarrage",
   "alreadyUpToDate": "Déjà à jour",
   "alreadyUpToDateDesc": "Votre DeepChat est déjà à jour avec la dernière version, aucune mise à jour n'est nécessaire."

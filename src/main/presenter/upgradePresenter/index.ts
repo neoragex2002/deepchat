@@ -46,7 +46,7 @@ const getVersionCheckBaseUrl = () => {
   return 'https://cdn.deepchatai.cn'
 }
 
-// 获取自动更新状态文件路径
+// 获取更新状态文件路径（用于记录下载完成以便安装）
 const getUpdateMarkerFilePath = () => {
   return path.join(app.getPath('userData'), 'auto_update_marker.json')
 }
@@ -58,7 +58,6 @@ export class UpgradePresenter implements IUpgradePresenter {
   private _error: string | null = null
   private _versionInfo: VersionInfo | null = null
   private _baseUrl: string
-  private _lastCheckTime: number = 0 // 上次检查更新的时间戳
   private _updateMarkerPath: string
   private _previousUpdateFailed: boolean = false // 标记上次更新是否失败
   private _configPresenter: IConfigPresenter // 配置presenter
@@ -69,14 +68,14 @@ export class UpgradePresenter implements IUpgradePresenter {
     this._baseUrl = getVersionCheckBaseUrl()
     this._updateMarkerPath = getUpdateMarkerFilePath()
 
-    // 配置自动更新
-    autoUpdater.autoDownload = false // 默认不自动下载，由我们手动控制
+    // 配置更新策略：禁用一切自动行为，仅保留手动流程
+    autoUpdater.autoDownload = false // 仅手动下载
     autoUpdater.allowDowngrade = false
-    autoUpdater.autoInstallOnAppQuit = true
+    autoUpdater.autoInstallOnAppQuit = false // 不在退出时自动安装
 
     // 错误处理
     autoUpdater.on('error', (e) => {
-      console.log('自动更新失败', e.message)
+      console.log('更新失败', e.message)
       this._lock = false
       this._status = 'error'
       this._error = e.message
@@ -87,32 +86,7 @@ export class UpgradePresenter implements IUpgradePresenter {
       })
     })
 
-    // 检查更新状态
-    autoUpdater.on('checking-for-update', () => {
-      console.log('正在检查更新')
-    })
-
-    // 无可用更新
-    autoUpdater.on('update-not-available', () => {
-      console.log('无可用更新')
-      this._lock = false
-      this._status = 'not-available'
-      eventBus.sendToRenderer(UPDATE_EVENTS.STATUS_CHANGED, SendTarget.ALL_WINDOWS, {
-        status: this._status
-      })
-    })
-
-    // 有可用更新
-    autoUpdater.on('update-available', (info) => {
-      console.log('检测到新版本', info)
-      this._status = 'available'
-
-      // 重要：这里不再使用info中的信息更新this._versionInfo
-      // 而是确保使用之前从versionUrl获取的原始信息
-      console.log('使用已保存的版本信息:', this._versionInfo)
-      // 检测到更新后自动开始下载
-      this.startDownloadUpdate()
-    })
+    // 不再监听 electron-updater 的自动检查事件（仅保留下载/安装相关事件）
 
     // 下载进度
     autoUpdater.on('download-progress', (progressObj) => {
@@ -149,14 +123,11 @@ export class UpgradePresenter implements IUpgradePresenter {
       })
     })
 
-    // 监听应用获得焦点事件
-    eventBus.on(WINDOW_EVENTS.APP_FOCUS, this.handleAppFocus.bind(this))
-
     // 应用启动时检查是否有未完成的更新
     this.checkPendingUpdate()
   }
 
-  // 检查是否有未完成的自动更新
+  // 检查是否有未完成的更新
   private checkPendingUpdate(): void {
     try {
       if (fs.existsSync(this._updateMarkerPath)) {
@@ -175,7 +146,7 @@ export class UpgradePresenter implements IUpgradePresenter {
         // 否则说明上次更新失败，标记为错误状态
         console.log('检测到未完成的更新', updateInfo.version)
         this._status = 'error'
-        this._error = '上次自动更新未完成'
+        this._error = '上次更新未完成'
         this._versionInfo = updateInfo
         this._previousUpdateFailed = true // 标记上次更新失败
 
@@ -227,23 +198,12 @@ export class UpgradePresenter implements IUpgradePresenter {
     }
   }
 
-  // 处理应用获得焦点事件
-  private handleAppFocus(): void {
-    const now = Date.now()
-    const twelveHoursInMs = 12 * 60 * 60 * 1000 // 12小时的毫秒数
-    // 如果距离上次检查更新超过12小时，则重新检查
-    if (now - this._lastCheckTime > twelveHoursInMs) {
-      this.checkUpdate('autoCheck')
-    }
-  }
+  // 已移除自动焦点检查逻辑
 
   /**
-   *
-   * @param type 检查更新的类型，'autoCheck'表示自动检查
-   *            如果不传则默认为手动检查
-   * @returns
+   * 手动检查更新
    */
-  async checkUpdate(type?: string): Promise<void> {
+  async checkUpdate(): Promise<void> {
     if (this._lock) {
       return
     }
@@ -277,19 +237,15 @@ export class UpgradePresenter implements IUpgradePresenter {
 
       console.log('cache versionInfo：', this._versionInfo)
 
-      // 更新上次检查时间
-      this._lastCheckTime = Date.now()
+      // 保留手动检查模式，不记录上次检查时间
 
       // 比较版本号
       if (compare(remoteVersion.version, currentVersion, '>')) {
-        // 有新版本
-
-        // 如果上次更新失败，这次不再尝试自动更新，直接进入错误状态让用户手动更新
+        // 有新版本：不再触发自动检查/下载，直接通知前端由用户手动处理
         if (this._previousUpdateFailed) {
           console.log('上次更新失败，本次不进行自动更新，改为手动更新')
           this._status = 'error'
-          this._error = '自动更新可能不稳定，请手动下载更新'
-
+          this._error = '更新可能不稳定，请手动下载更新'
           eventBus.sendToRenderer(UPDATE_EVENTS.STATUS_CHANGED, SendTarget.ALL_WINDOWS, {
             status: this._status,
             error: this._error,
@@ -298,33 +254,16 @@ export class UpgradePresenter implements IUpgradePresenter {
           return
         }
 
-        // 设置自动更新的URL
-        const autoUpdateUrl =
-          updateChannel === 'canary'
-            ? `${this._baseUrl}/canary/${platformString}`
-            : `${this._baseUrl}/upgrade/v${remoteVersion.version}/${platformString}`
-        console.log('设置自动更新URL:', autoUpdateUrl)
-        autoUpdater.setFeedURL(autoUpdateUrl)
-
-        try {
-          // 使用electron-updater检查更新，但不自动下载
-          await autoUpdater.checkForUpdates()
-        } catch (err) {
-          console.error('自动更新检查失败，回退到手动更新', err)
-          // 如果自动更新失败，回退到手动更新
-          this._status = 'available'
-
-          eventBus.sendToRenderer(UPDATE_EVENTS.STATUS_CHANGED, SendTarget.ALL_WINDOWS, {
-            status: this._status,
-            info: this._versionInfo // 使用已保存的版本信息
-          })
-        }
+        this._status = 'available'
+        eventBus.sendToRenderer(UPDATE_EVENTS.STATUS_CHANGED, SendTarget.ALL_WINDOWS, {
+          status: this._status,
+          info: this._versionInfo
+        })
       } else {
         // 没有新版本
         this._status = 'not-available'
         eventBus.sendToRenderer(UPDATE_EVENTS.STATUS_CHANGED, SendTarget.ALL_WINDOWS, {
-          status: this._status,
-          type
+          status: this._status
         })
       }
     } catch (error: Error | unknown) {
@@ -374,12 +313,38 @@ export class UpgradePresenter implements IUpgradePresenter {
       return false
     }
     try {
-      this._status = 'downloading'
-      eventBus.sendToRenderer(UPDATE_EVENTS.STATUS_CHANGED, SendTarget.ALL_WINDOWS, {
-        status: this._status,
-        info: this._versionInfo // 使用已保存的版本信息
-      })
-      autoUpdater.downloadUpdate()
+      // 根据当前渠道和平台设置 feed URL（在开始下载前设置）
+      const platformString = getPlatformInfo()
+      const rawChannel = this._configPresenter.getUpdateChannel()
+      const updateChannel = rawChannel === 'canary' ? 'canary' : 'upgrade'
+      const targetVersion = this._versionInfo?.version
+      const feedUrl =
+        updateChannel === 'canary'
+          ? `${this._baseUrl}/canary/${platformString}`
+          : `${this._baseUrl}/upgrade/v${targetVersion}/${platformString}`
+      console.log('设置下载 feed URL:', feedUrl)
+      autoUpdater.setFeedURL(feedUrl)
+
+      // 先获取更新信息，再开始下载
+      autoUpdater
+        .checkForUpdates()
+        .then(() => {
+          this._status = 'downloading'
+          eventBus.sendToRenderer(UPDATE_EVENTS.STATUS_CHANGED, SendTarget.ALL_WINDOWS, {
+            status: this._status,
+            info: this._versionInfo
+          })
+          return autoUpdater.downloadUpdate()
+        })
+        .catch((err: unknown) => {
+          this._status = 'error'
+          this._error = err instanceof Error ? err.message : String(err)
+          eventBus.sendToRenderer(UPDATE_EVENTS.STATUS_CHANGED, SendTarget.ALL_WINDOWS, {
+            status: this._status,
+            error: this._error,
+            info: this._versionInfo
+          })
+        })
       return true
     } catch (error: Error | unknown) {
       this._status = 'error'
