@@ -224,7 +224,7 @@
     },
     "deepchat-inmemory/shell-server": {
       "name": "Shell 工具",
-      "desc": "通过 argv 执行本地命令，支持 UTF-8 安全截断与可选流式输出。需要 shell 语法时显式 [''/bin/bash'',''-lc'', ...]；Windows 可用 'wsl bash -lc' 或 PowerShell。"
+      "desc": "通过 argv 执行本地命令，支持 UTF-8 安全截断与可选流式输出。需要 shell 语法时显式 [''/bin/bash'',''-lc'', ...]；Windows 可用 'wsl bash -lc' 或 PowerShell。建议显式设置 required_permission=read|write（默认 read）以进行权限判定，仅对本次调用生效。"
     },
     "deepchat/apple-server": {
       "name": "macOS系统助手",

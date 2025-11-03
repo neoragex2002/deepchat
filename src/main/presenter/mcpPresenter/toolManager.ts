@@ -20,6 +20,10 @@ export class ToolManager {
   private cachedToolDefinitions: MCPToolDefinition[] | null = null
   private toolNameToTargetMap: Map<string, { client: McpClient; originalName: string }> | null =
     null
+  // 一次性授权：仅针对某个 toolCallId + 权限，在本次调用中放行
+  private tempApprovals: Map<string, 'read' | 'write'> = new Map()
+  // 一次性授权（补充）：针对 server + 权限 的单次放行，用于权限授予后重新发起导致 toolCallId 变化的场景
+  private tempApprovalsByServer: Map<string, 'read' | 'write'> = new Map()
 
   constructor(configPresenter: IConfigPresenter, serverManager: ServerManager) {
     this.configPresenter = configPresenter
@@ -226,21 +230,29 @@ export class ToolManager {
     parsedArgs?: Record<string, unknown> | null
   ): 'read' | 'write' | 'all' {
     const lowerToolName = toolName.toLowerCase()
+    // 1) If explicit required_permission is provided, honor it directly (no max)
+    const v = parsedArgs?.['required_permission']
+    if (v === 'write') return 'write'
+    if (v === 'read') return 'read'
 
-    // Special-case: shell tool — inspect argv to infer read vs write
+    // 2) Otherwise, use heuristic H(toolName,args)
     if (lowerToolName === 'shell' && parsedArgs && parsedArgs['command']) {
       try {
         const cmd = parsedArgs['command'] as unknown
         const argv = Array.isArray(cmd) ? (cmd as unknown[]).map(String) : []
         const joined = argv.join(' ')
         const lowerJoined = joined.toLowerCase()
-        // Common write indicators: redirection, in-place edits, piping to tee
         const hasRedirect = />|>>|2>|1>|\s>\s|\s>>\s|\|\s*tee\b|sed\s+-i\b|perl\s+-pi?\b/.test(
           lowerJoined
         )
-        // Broad, conservative write verbs across POSIX and Windows ecosystems
+        const psWritePattern =
+          /\b(Set-Content|Add-Content|Out-File|New-Item|Remove-Item|Move-Item|Copy-Item|Rename-Item|Set-Item|Clear-Content|Set-Acl|New-ItemProperty|Set-ItemProperty|Remove-ItemProperty)\b/i
+        const cmdWritePattern =
+          /\b(del|erase|ren|rename|copy|move|md|rd|mkdir|rmdir|xcopy|robocopy|mklink|attrib|icacls|takeown|ftype|assoc)\b/i
+        const tarExtractPattern = /\btar\b.*\b(-x|--extract)\b/
+        const unzipPattern = /\b(unzip|7z|7za|unrar|gunzip|bunzip2|xz)\b/
+        const first = argv[0]?.toLowerCase?.() || ''
         const writeVerbs = [
-          // POSIX coreutils and editors
           'rm',
           'mv',
           'cp',
@@ -260,11 +272,9 @@ export class ToolManager {
           'emacs',
           'ed',
           'ex',
-          // Networking / downloaders (write to FS)
           'curl',
           'wget',
           'aria2c',
-          // Archives / extractors
           'tar',
           'bsdtar',
           'unzip',
@@ -274,18 +284,15 @@ export class ToolManager {
           '7z',
           '7za',
           'unrar',
-          // Sync/transfer
           'rsync',
           'scp',
           'sftp',
-          // VCS / build
           'git',
           'hg',
           'svn',
           'make',
           'cmake',
           'ninja',
-          // Package managers
           'apt',
           'apt-get',
           'yum',
@@ -304,14 +311,12 @@ export class ToolManager {
           'npm',
           'pnpm',
           'yarn',
-          // Containers / orchestration (conservative)
           'docker',
           'podman',
           'kubectl',
           'helm',
           'compose',
           'docker-compose',
-          // Windows CMD built-ins and tools
           'del',
           'erase',
           'ren',
@@ -320,8 +325,6 @@ export class ToolManager {
           'move',
           'md',
           'rd',
-          'mkdir',
-          'rmdir',
           'xcopy',
           'robocopy',
           'mklink',
@@ -331,34 +334,24 @@ export class ToolManager {
           'ftype',
           'assoc',
           'reg',
-          // PowerShell host (we pattern-match specific verbs below)
           'powershell',
           'pwsh'
         ]
-        const first = argv[0]?.toLowerCase?.() || ''
         const isWriteVerb = writeVerbs.some((w) => first === w || lowerJoined.startsWith(w + ' '))
-        // PowerShell specific verbs inside the command string
-        const psWritePattern =
-          /\b(Set-Content|Add-Content|Out-File|New-Item|Remove-Item|Move-Item|Copy-Item|Rename-Item|Set-Item|Clear-Content|Set-Acl|New-ItemProperty|Set-ItemProperty|Remove-ItemProperty)\b/i
-        const cmdWritePattern =
-          /\b(del|erase|ren|rename|copy|move|md|rd|mkdir|rmdir|xcopy|robocopy|mklink|attrib|icacls|takeown|ftype|assoc)\b/i
-        const tarExtractPattern = /\btar\b.*\b(-x|--extract)\b/
-        const unzipPattern = /\b(unzip|7z|7za|unrar|gunzip|bunzip2|xz)\b/
         const hasPsWrite =
           (first === 'powershell' || first === 'pwsh') && psWritePattern.test(joined)
         const hasCmdWrite =
           (first === 'cmd' || first === 'cmd.exe') && cmdWritePattern.test(lowerJoined)
         const hasExtract = tarExtractPattern.test(lowerJoined) || unzipPattern.test(lowerJoined)
-        if (hasRedirect || isWriteVerb) return 'write'
-        if (hasPsWrite || hasCmdWrite || hasExtract) return 'write'
-        return 'read'
+        return hasRedirect || isWriteVerb || hasPsWrite || hasCmdWrite || hasExtract
+          ? 'write'
+          : 'read'
       } catch {
-        // On parsing issues, fall back to safe default
         return 'write'
       }
     }
 
-    // Read operations
+    // Name-based heuristic for all other tools
     if (
       lowerToolName.includes('read') ||
       lowerToolName.includes('list') ||
@@ -369,12 +362,11 @@ export class ToolManager {
       lowerToolName.includes('search') ||
       lowerToolName.includes('find') ||
       lowerToolName.includes('query') ||
-      lowerToolName.includes('tree')
+      lowerToolName.includes('tree') ||
+      lowerToolName.includes('info') // treat *_info and similar as read-only
     ) {
       return 'read'
     }
-
-    // Write operations
     if (
       lowerToolName.includes('write') ||
       lowerToolName.includes('create') ||
@@ -396,8 +388,6 @@ export class ToolManager {
     ) {
       return 'write'
     }
-
-    // Default to write for safety (unknown operations require higher permissions)
     return 'write'
   }
 
@@ -517,20 +507,42 @@ export class ToolManager {
         `Checking permissions for tool '${originalName}' on server '${toolServerName}' with autoApprove:`,
         autoApprove
       )
-      // Use originalName and toolServerName for permission check
-      const hasPermission = this.checkToolPermission(
-        originalName,
-        toolServerName,
-        autoApprove,
-        args
-      )
+      // 先计算本次调用的 Required（结合显式 required_permission 与启发式）
+      const requiredPermission = this.determinePermissionType(originalName, args)
+      // 一次性授权：若命中 tempApprovals 且权限匹配，则消费并放行
+      let hasPermission = false
+      const tempKey = toolCall.id
+      if (this.tempApprovals.has(tempKey)) {
+        const granted = this.tempApprovals.get(tempKey)
+        if (granted === 'write' || granted === requiredPermission) {
+          hasPermission = true
+          this.tempApprovals.delete(tempKey)
+          console.log(`[ToolManager] One-time permission consumed for ${tempKey}: ${granted}`)
+        }
+      }
+      // 补充：如果 toolCallId 已变更，则使用 server+permission 的一次性授权键
+      if (!hasPermission) {
+        const serverKey = `${toolServerName}:${requiredPermission}`
+        if (this.tempApprovalsByServer.has(serverKey)) {
+          const granted = this.tempApprovalsByServer.get(serverKey)
+          if (granted === 'write' || granted === requiredPermission) {
+            hasPermission = true
+            this.tempApprovalsByServer.delete(serverKey)
+            console.log(`[ToolManager] One-time permission consumed for ${serverKey}: ${granted}`)
+          }
+        }
+      }
+      if (!hasPermission) {
+        // Use originalName and toolServerName for permission check
+        hasPermission = this.checkToolPermission(originalName, toolServerName, autoApprove, args)
+      }
 
       if (!hasPermission) {
         console.warn(
           `Permission required for tool '${originalName}' on server '${toolServerName}'.`
         )
 
-        const permissionType = this.determinePermissionType(originalName)
+        const permissionType = requiredPermission
 
         // Return permission request instead of error
         return {
@@ -646,7 +658,8 @@ export class ToolManager {
   async grantPermission(
     serverName: string,
     permissionType: 'read' | 'write' | 'all',
-    remember: boolean = true
+    remember: boolean = true,
+    toolCallId?: string
   ): Promise<void> {
     console.log(
       `[ToolManager] Granting permission: ${permissionType} for server: ${serverName}, remember: ${remember}`
@@ -656,9 +669,15 @@ export class ToolManager {
       // Persist to configuration
       await this.updateServerPermissions(serverName, permissionType)
     } else {
-      // Store in temporary session storage
-      // TODO: Implement temporary permission storage
-      console.log(`[ToolManager] Temporary permission granted (session-scoped)`)
+      // One-time permission: toolCallId-scoped（若存在）与 server-scoped（兜底）
+      const effective: 'read' | 'write' = permissionType === 'all' ? 'write' : permissionType
+      if (toolCallId) {
+        this.tempApprovals.set(toolCallId, effective)
+        console.log(`[ToolManager] Temporary permission granted for ${toolCallId}`)
+      }
+      const serverKey = `${serverName}:${effective}`
+      this.tempApprovalsByServer.set(serverKey, effective)
+      console.log(`[ToolManager] Temporary server-level permission granted for ${serverKey}`)
     }
   }
 

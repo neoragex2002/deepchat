@@ -296,9 +296,7 @@ const DEFAULT_INMEMORY_SERVERS: Record<string, MCPServerConfig> = {
       // Budgets (can be customized in settings later via env editor)
       SHELL_MAX_BYTES: '10240',
       SHELL_MAX_LINES: '256',
-      SHELL_HEAD_LINES: '128',
-      // Approval policy: 'never' | 'on-request'
-      APPROVAL_POLICY: 'never'
+      SHELL_HEAD_LINES: '128'
     },
     disable: false
   },

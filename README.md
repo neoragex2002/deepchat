@@ -100,6 +100,7 @@ Compared to other AI tools, DeepChat offers the following unique advantages:
   - Supports StreamableHTTP/SSE/Stdio protocol Transports
   - Supports inMemory services with built-in utilities like code execution, web information retrieval, and file operations; ready for most common use cases out-of-the-box without secondary installation
   - Converts visual model capabilities into universally usable functions for any model via the built-in MCP service
+  - Shell tool: supports a `required_permission=read|write` input to declare intent for permission checks (default `read`), applied per-call only
 - 💻 **Multi-Platform Support**: Windows, macOS, Linux
 - 🎨 **Beautiful and User-Friendly Interface**, user-oriented design, meticulously themed light and dark modes
 - 🔗 **Rich DeepLink Support**: Initiate conversations via links for seamless integration with other applications. Also supports one-click installation of MCP services for simplicity and speed

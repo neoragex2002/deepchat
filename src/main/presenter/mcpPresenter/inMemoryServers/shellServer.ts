@@ -8,13 +8,13 @@ import fs from 'fs'
 import path from 'path'
 import os from 'os'
 
-// Schema for the shell tool, aligned with shell_v3 design
+// Schema for the shell tool
 const ShellArgsSchema = z.object({
   command: z.array(z.string()).min(1, 'command argv is required'),
   workdir: z.string().min(1, 'workdir is required and must not be empty'),
   timeout_ms: z.number().int().positive().optional().default(10_000),
-  with_escalated_permissions: z.boolean().optional().default(false),
-  justification: z.string().optional(),
+  // Explicit permission intent for this call only
+  required_permission: z.enum(['read', 'write']).optional().default('read'),
   stream: z.boolean().optional().default(false)
 })
 
@@ -163,8 +163,6 @@ function isPathInside(root: string, target: string): boolean {
 
 export class ShellServer {
   private server: Server
-  // Simple approval policy toggle; v1: deny escalations unless on-request is explicitly enabled via env
-  private approvalPolicy: 'never' | 'on-request' = 'never'
   private allowedDirs: string[] = []
   private budgets: Budgets
   private hostInfo: { os: 'windows' | 'linux' | 'mac'; wsl: boolean }
@@ -174,10 +172,6 @@ export class ShellServer {
     // Helper to read from provided env first, then fall back to process.env
     const getEnv = (key: string): unknown =>
       env && Object.prototype.hasOwnProperty.call(env, key) ? env[key] : process.env[key]
-
-    if (getEnv('APPROVAL_POLICY') === 'on-request' || getEnv('approvalPolicy') === 'on-request') {
-      this.approvalPolicy = 'on-request'
-    }
 
     // Configurable budgets via env
     const maxBytes = parseInt(String(getEnv('SHELL_MAX_BYTES') ?? ''), 10)
@@ -323,7 +317,7 @@ export class ShellServer {
         '流式输出：如需实时日志，请设置 stream=true。',
         '路径风格警告：严禁混用 POSIX (/) 和 Windows (\\) 路径风格。',
         '任务规划：在执行复杂任务前，请调用 shell_info 并缓存其返回配置，以便精确规划；同时尽可能合并指令，提升执行效率。',
-        '权限提升：仅当 APPROVAL_POLICY=on-request 时才允许请求权限提升（with_escalated_permissions: true），且必须同时提供一句简短的 justification（理由）。'
+        '权限意图：建议显式设置 required_permission=read|write（默认 read），用于权限判定与审计（一次性，仅对本次调用生效）。'
       ]
 
       const guidance = descriptionLines.filter(Boolean).join(' ')
@@ -338,8 +332,12 @@ export class ShellServer {
           {
             name: 'shell_info',
             description:
-              '返回不可变的、可缓冲的配置信息，用于规划：platform (平台), shell (推荐Shell), required_path_style (路径风格要求), limits (限制), allowed_roots (允许的根目录)。',
-            inputSchema: { type: 'object', properties: {} }
+              '返回不可变的、可缓冲的配置信息，用于规划：platform (平台), shell (推荐Shell), required_path_style (路径风格要求), limits (限制), allowed_roots (允许的根目录)。权限固定为只读，请传入 required_permission=read。',
+            inputSchema: zodToJsonSchema(
+              z.object({
+                required_permission: z.literal('read')
+              })
+            )
           }
         ]
       }
@@ -349,6 +347,28 @@ export class ShellServer {
     this.server.setRequestHandler(CallToolRequestSchema, async (request) => {
       const { name, arguments: rawArgs } = request.params
       if (name === 'shell_info') {
+        // Runtime validation: require required_permission='read'
+        const ShellInfoArgs = z.object({ required_permission: z.literal('read') })
+        const parsedInfo = ShellInfoArgs.safeParse(rawArgs || {})
+        if (!parsedInfo.success) {
+          return {
+            content: [
+              {
+                type: 'text',
+                text: "Invalid arguments: shell_info requires required_permission='read'"
+              }
+            ],
+            structured_content: {
+              exit_code: 1,
+              duration_seconds: 0,
+              timed_out: false,
+              line_count: 0,
+              truncated: false
+            },
+            is_error: true,
+            isError: true
+          }
+        }
         const required_path_style = this.platform === 'win' ? 'windows' : 'posix'
         const info = {
           platform: this.platform, // win | wsl | posix
@@ -381,19 +401,8 @@ export class ShellServer {
       }
       const parsed = ShellArgsSchema.safeParse(rawArgs)
       if (!parsed.success) {
-        throw new Error(`Invalid arguments: ${parsed.error}`)
-      }
-      const args = parsed.data
-
-      // Approval logic: deny escalations unless policy is on-request (v1: immediate deny; future: pop UI)
-      if (args.with_escalated_permissions && this.approvalPolicy !== 'on-request') {
         return {
-          content: [
-            {
-              type: 'text',
-              text: `approval policy is ${this.approvalPolicy}; reject command — do not request escalated permissions under this policy.`
-            }
-          ],
+          content: [{ type: 'text', text: `Invalid arguments: ${parsed.error}` }],
           structured_content: {
             exit_code: 1,
             duration_seconds: 0,
@@ -401,9 +410,13 @@ export class ShellServer {
             line_count: 0,
             truncated: false
           },
-          is_error: true
+          is_error: true,
+          isError: true
         }
       }
+      const args = parsed.data
+
+      // 已移除提权相关逻辑（with_escalated_permissions/justification）
 
       // workdir 由 Zod Schema 强制必填，无需手动重复校验
 
@@ -850,8 +863,8 @@ export class ShellServer {
             command: args.command,
             workdir: args.workdir,
             timeout_ms: args.timeout_ms,
-            with_escalated_permissions: args.with_escalated_permissions,
-            stream: args.stream
+            stream: args.stream,
+            required_permission: args.required_permission
           }
         },
         is_error: isError,

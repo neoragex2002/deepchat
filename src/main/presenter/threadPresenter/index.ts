@@ -3980,19 +3980,26 @@ export class ThreadPresenter implements IThreadPresenter {
         )
 
         try {
-          // 等待权限配置完成
-          await presenter.mcpPresenter.grantPermission(serverName, permissionType, remember)
+          // 传入 toolCallId，用于一次性授权
+          const toolCallId = permissionBlock.tool_call?.id as string | undefined
+          await presenter.mcpPresenter.grantPermission(
+            serverName,
+            permissionType,
+            remember,
+            toolCallId
+          )
           console.log(`[ThreadPresenter] Permission granted successfully`)
 
-          // 等待MCP服务重启完成
-          console.log(
-            `[ThreadPresenter] Permission configuration completed, waiting for MCP service restart...`
-          )
-          await this.waitForMcpServiceReady(serverName)
-
-          console.log(
-            `[ThreadPresenter] MCP service ready, now restarting agent loop for message: ${messageId}`
-          )
+          if (remember) {
+            // 仅在记住时等待服务重启
+            console.log(
+              `[ThreadPresenter] Permission configuration completed, waiting for MCP service restart...`
+            )
+            await this.waitForMcpServiceReady(serverName)
+            console.log(
+              `[ThreadPresenter] MCP service ready, now restarting agent loop for message: ${messageId}`
+            )
+          }
         } catch (permissionError) {
           console.error(`[ThreadPresenter] Failed to grant permission:`, permissionError)
           // 权限授予失败，将状态更新为错误

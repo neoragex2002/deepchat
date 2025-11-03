@@ -200,7 +200,7 @@
     },
     "deepchat-inmemory/shell-server": {
       "name": "Shell",
-      "desc": "argv로 로컬 명령을 실행합니다. UTF-8 안전 절단 및 선택적 스트리밍을 지원합니다. 셸 문법이 필요하면 [''/bin/bash'',''-lc'', ...]를 사용하세요. Windows에서는 'wsl bash -lc' 또는 PowerShell을 사용할 수 있습니다."
+      "desc": "argv로 로컬 명령을 실행합니다. UTF-8 안전 절단 및 선택적 스트리밍을 지원합니다. 셸 문법이 필요하면 [''/bin/bash'',''-lc'', ...]를 사용하세요. Windows에서는 'wsl bash -lc' 또는 PowerShell을 사용할 수 있습니다. 권한 확인을 위해 required_permission=read|write(기본값 read) 설정을 권장합니다. 이 설정은 호출 1회에만 적용됩니다."
     },
     "builtinKnowledge": {
       "desc": "Deepchat 내장 지식 기반 검색 서비스, Deepchat 내장 지식 기반의 내용을 검색 할 수있는 Deepchat 내장 지식 기반 검색 서비스",

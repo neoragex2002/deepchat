@@ -200,7 +200,7 @@
     },
     "deepchat-inmemory/shell-server": {
       "name": "Shell",
-      "desc": "Exécuter des commandes locales via argv, troncature UTF‑8 sûre et diffusion en continu optionnelle. Pour les fonctions du shell utilisez [''/bin/bash'',''-lc'', ...]. Sous Windows utilisez 'wsl bash -lc' ou PowerShell."
+      "desc": "Exécuter des commandes locales via argv, troncature UTF‑8 sûre et diffusion en continu optionnelle. Pour les fonctions du shell utilisez [''/bin/bash'',''-lc'', ...]. Sous Windows utilisez 'wsl bash -lc' ou PowerShell. Il est recommandé de définir required_permission=read|write (read par défaut) pour la vérification des autorisations ; s’applique uniquement à cet appel."
     },
     "builtinKnowledge": {
       "desc": "Recherche dans la base de connaissances intégrée de DeepChat (docs, contenus intégrés).",

@@ -204,7 +204,7 @@
     },
     "deepchat-inmemory/shell-server": {
       "name": "Shell",
-      "desc": "Execute local commands via argv with UTF-8 safe truncation and optional streaming. For shell features use [''/bin/bash'',''-lc'', ...]. On Windows use 'wsl bash -lc' or PowerShell."
+      "desc": "Execute local commands via argv with UTF-8 safe truncation and optional streaming. For shell features use [''/bin/bash'',''-lc'', ...]. On Windows use 'wsl bash -lc' or PowerShell. It's recommended to set required_permission=read|write (default read) to declare intent for permission checks; applies to this call only."
     },
     "deepchat/apple-server": {
       "desc": "Let models operate macOS apps like Calendar, Contacts, Mail, Maps, Notes, and Reminders.",

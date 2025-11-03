@@ -200,7 +200,7 @@
     },
     "deepchat-inmemory/shell-server": {
       "name": "Shell",
-      "desc": "argv でローカルコマンドを実行。UTF-8 安全な切り詰めとストリーミング（任意）に対応。シェル構文が必要な場合は [''/bin/bash'',''-lc'', ...]。Windows では 'wsl bash -lc' または PowerShell を使用してください。"
+      "desc": "argv でローカルコマンドを実行。UTF-8 安全な切り詰めとストリーミング（任意）に対応。シェル構文が必要な場合は [''/bin/bash'',''-lc'', ...]。Windows では 'wsl bash -lc' または PowerShell を使用してください。権限チェックのため required_permission=read|write（既定は read）を明示設定することを推奨します。これはこの呼び出しにのみ適用されます。"
     },
     "builtinKnowledge": {
       "desc": "deepchatビルトインナレッジベース検索サービス。これは、deepchatビルトインナレッジベースのコンテンツを検索できる",

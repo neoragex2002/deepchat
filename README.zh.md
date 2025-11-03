@@ -98,6 +98,7 @@ DeepChat是一个功能强大的开源AI聊天平台，为用户提供与多种�
   - 支持 StreamableHTTP/SSE/Stdio 协议 Transports
   - 支持 inMemory 服务，内置代码执行、网络信息获取、文件操作等实用工具；开箱即用，无需二次安装即可满足大多数常见用例
   - 通过内置 MCP 服务，将视觉模型能力转换为任何模型都可通用的函数
+  - Shell 工具：支持 `required_permission=read|write` 入参声明权限意图（默认 `read`，仅对本次调用生效）
 - 💻 **多平台支持**：Windows、macOS、Linux
 - 🎨 **美观友好的界面**，以用户为中心的设计，精心设计的明暗主题
 - 🔗 **丰富的DeepLink支持**：通过链接发起对话，与其他应用无缝集成。还支持一键安装MCP服务，简单快速

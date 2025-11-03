@@ -1239,7 +1239,8 @@ export interface IMCPPresenter {
   grantPermission(
     serverName: string,
     permissionType: 'read' | 'write' | 'all',
-    remember?: boolean
+    remember?: boolean,
+    toolCallId?: string
   ): Promise<void>
   // NPM Registry management methods
   getNpmRegistryStatus?(): Promise<{
