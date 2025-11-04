@@ -22,6 +22,8 @@
     "rememberChoice": "Se souvenir de ce choix",
     "granted": "Autorisation accordée",
     "denied": "Autorisation refusée",
+    "pending": "En attente",
+    "error": "Erreur",
     "type": {
       "read": "Accès en lecture",
       "write": "Accès en écriture",

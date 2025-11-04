@@ -22,6 +22,8 @@
     "rememberChoice": "この選択を記憶する",
     "granted": "権限が許可されました",
     "denied": "権限が拒否されました",
+    "pending": "保留中",
+    "error": "エラー",
     "type": {
       "read": "読み取りアクセス",
       "write": "書き込みアクセス",

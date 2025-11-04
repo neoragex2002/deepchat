@@ -53,6 +53,14 @@
       <!-- Description -->
       <p class="text-xs text-muted-foreground mb-3">{{ getFormattedDescription() }}</p>
 
+      <!-- Remember choice toggle -->
+      <div class="flex items-center gap-2 mb-3">
+        <input id="remember-choice" type="checkbox" v-model="rememberChoice" class="h-3 w-3" />
+        <label for="remember-choice" class="text-xs text-muted-foreground">
+          {{ t('components.messageBlockPermissionRequest.rememberChoice') }}
+        </label>
+      </div>
+
       <!-- Action buttons -->
       <div class="flex gap-2">
         <Button
@@ -98,6 +106,7 @@ const props = defineProps<{
 }>()
 
 const isProcessing = ref(false)
+const rememberChoice = ref(false)
 
 const getPermissionIcon = () => {
   const permissionType = props.block.extra?.permissionType as string
@@ -212,9 +221,9 @@ const getStatusText = () => {
     case 'denied':
       return t('components.messageBlockPermissionRequest.denied')
     case 'error':
-      return 'Error'
+      return t('components.messageBlockPermissionRequest.error')
     default:
-      return 'Pending'
+      return t('components.messageBlockPermissionRequest.pending')
   }
 }
 
@@ -228,7 +237,7 @@ const grantPermission = async () => {
       props.block.tool_call.id,
       true,
       (props.block.extra?.permissionType as 'read' | 'write' | 'all') || 'write',
-      true
+      rememberChoice.value
     )
   } catch (error) {
     console.error('Failed to grant permission:', error)

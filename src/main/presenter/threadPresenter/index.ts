@@ -37,6 +37,7 @@ import { getFileContext } from './fileContext'
 import { ContentEnricher } from './contentEnricher'
 import { CONVERSATION_EVENTS, STREAM_EVENTS, TAB_EVENTS } from '@/events'
 import { DEFAULT_SETTINGS } from './const'
+import { randomBytes } from 'crypto'
 
 interface GeneratingMessageState {
   message: AssistantMessage
@@ -71,6 +72,8 @@ interface GeneratingMessageState {
   flushTimeout?: NodeJS.Timeout
   throttleTimeout?: NodeJS.Timeout
   lastRendererUpdateTime?: number
+  // 最近一次被用户授予权限的 tool_call.id（用于在多权限块场景下精准续写）
+  lastGrantedToolCallId?: string
 }
 
 export class ThreadPresenter implements IThreadPresenter {
@@ -3961,7 +3964,19 @@ export class ThreadPresenter implements IThreadPresenter {
 
       // 3. 保存消息更新
       await this.messageManager.editMessage(messageId, JSON.stringify(content))
+      // 同步内存态：确保 resumeStreamCompletion 使用到最新的权限块与工具信息
+      try {
+        const st = this.generatingMessages.get(messageId)
+        if (st) st.message.content = content
+      } catch {}
       console.log(`[ThreadPresenter] Updated permission block status to: ${permissionBlock.status}`)
+      try {
+        // 记录最近一次被授予的工具调用 id，避免后续误匹配到旧授权块
+        const st = this.generatingMessages.get(messageId)
+        if (st && granted && permissionBlock.tool_call?.id) {
+          st.lastGrantedToolCallId = permissionBlock.tool_call.id
+        }
+      } catch {}
 
       if (granted) {
         // 4. 权限授予流程
@@ -3980,13 +3995,38 @@ export class ThreadPresenter implements IThreadPresenter {
         )
 
         try {
-          // 传入 toolCallId，用于一次性授权
-          const toolCallId = permissionBlock.tool_call?.id as string | undefined
+          // 传入一次性审批口令（approval_nonce），用于复述握手
+          // 优先使用 permissionRequest 中的原始工具名（originalName），避免冲突重命名导致指纹不一致
+          let toolCallName = permissionBlock.tool_call?.name as string | undefined
+          try {
+            const prStr = permissionBlock.extra?.permissionRequest as string | undefined
+            if (prStr && typeof prStr === 'string') {
+              const pr = JSON.parse(prStr) as { toolName?: string }
+              if (pr.toolName && typeof pr.toolName === 'string') {
+                toolCallName = pr.toolName
+              }
+            }
+          } catch {}
+          let approvalNonce: string | undefined
+          if (!remember) {
+            approvalNonce = randomBytes(16).toString('base64url')
+            if (permissionBlock.extra) {
+              ;(permissionBlock.extra as Record<string, unknown>)['approvalNonce'] = approvalNonce
+            }
+            // 立即保存到消息中，供后续复述上下文使用
+            await this.messageManager.editMessage(messageId, JSON.stringify(content))
+            // 同步内存态，避免后续查找 pending tool call 读到旧内容
+            try {
+              const st2 = this.generatingMessages.get(messageId)
+              if (st2) st2.message.content = content
+            } catch {}
+          }
           await presenter.mcpPresenter.grantPermission(
             serverName,
             permissionType,
             remember,
-            toolCallId
+            toolCallName,
+            approvalNonce
           )
           console.log(`[ThreadPresenter] Permission granted successfully`)
 
@@ -4005,6 +4045,10 @@ export class ThreadPresenter implements IThreadPresenter {
           // 权限授予失败，将状态更新为错误
           permissionBlock.status = 'error'
           await this.messageManager.editMessage(messageId, JSON.stringify(content))
+          try {
+            const st3 = this.generatingMessages.get(messageId)
+            if (st3) st3.message.content = content
+          } catch {}
           throw permissionError
         }
 
@@ -4227,9 +4271,58 @@ export class ThreadPresenter implements IThreadPresenter {
       }
 
       // 查找被权限中断的工具调用
-      const pendingToolCall = this.findPendingToolCallAfterPermission(state.message.content)
+      let pendingToolCall = null as { id: string; name: string; params: string } | null
+      // 优先根据最近一次被授予的 tool_call.id 精准匹配
+      const lastGrantedId = state.lastGrantedToolCallId
+      if (lastGrantedId) {
+        const block = state.message.content.find(
+          (b) =>
+            b.type === 'action' &&
+            b.action_type === 'tool_call_permission' &&
+            b.status === 'granted' &&
+            b.tool_call?.id === lastGrantedId
+        )
+        if (block?.tool_call?.id && block.tool_call.name && block.tool_call.params) {
+          pendingToolCall = {
+            id: block.tool_call.id,
+            name: block.tool_call.name,
+            params: block.tool_call.params
+          }
+          console.log(
+            `[ThreadPresenter] Using lastGrantedToolCallId to resume: ${pendingToolCall.name} (${pendingToolCall.id})`
+          )
+        }
+      }
+      // 若没有 lastGrantedId 或未命中，回退到“最近 granted 块”策略
+      if (!pendingToolCall) {
+        pendingToolCall = this.findPendingToolCallAfterPermission(state.message.content)
+      }
 
       if (!pendingToolCall) {
+        try {
+          // 精简诊断：统计权限块与字段完备性，便于快速定位问题
+          const actionBlocks = state.message.content
+            .map((b, i) => ({ i, b }))
+            .filter(({ b }) => b.type === 'action' && b.action_type === 'tool_call_permission')
+          const diag = actionBlocks.map(({ i, b }) => ({
+            idx: i,
+            status: (b as any).status,
+            has: {
+              id: Boolean((b as any).tool_call?.id),
+              name: Boolean((b as any).tool_call?.name),
+              params: Boolean((b as any).tool_call?.params)
+            },
+            server: (b as any).extra?.serverName,
+            tool: (b as any).extra?.toolName
+          }))
+          console.info(
+            '[ThreadPresenter] No pending tool call after grant. Summary of permission blocks:',
+            {
+              count: actionBlocks.length,
+              blocks: diag
+            }
+          )
+        } catch {}
         console.warn(
           `[ThreadPresenter] No pending tool call found after permission grant, using normal context`
         )
@@ -4253,12 +4346,41 @@ export class ThreadPresenter implements IThreadPresenter {
       )
 
       // 构建专门的继续执行上下文
+      // 精确匹配：优先从与 pendingToolCall.id 相同的授权块中取出一次性审批口令
+      let approvalNonce: string | undefined
+      try {
+        const grantedMatching = state.message.content.find(
+          (block) =>
+            block.type === 'action' &&
+            block.action_type === 'tool_call_permission' &&
+            block.status === 'granted' &&
+            block.tool_call?.id === pendingToolCall.id
+        ) as AssistantMessageBlock | undefined
+        approvalNonce = (grantedMatching?.extra as any)?.approvalNonce as string | undefined
+        // 兜底：若未匹配到同 id 的授权块，则寻找最近带有 approvalNonce 的授权块
+        if (!approvalNonce) {
+          for (let i = state.message.content.length - 1; i >= 0; i--) {
+            const b = state.message.content[i]
+            if (
+              b.type === 'action' &&
+              b.action_type === 'tool_call_permission' &&
+              b.status === 'granted' &&
+              (b as any).extra?.approvalNonce
+            ) {
+              approvalNonce = ((b as any).extra?.approvalNonce as string) || undefined
+              break
+            }
+          }
+        }
+      } catch {}
+
       const finalContent = await this.buildContinueToolCallContext(
         conversation,
         contextMessages,
         userMessage,
         pendingToolCall,
-        modelConfig
+        modelConfig,
+        approvalNonce
       )
 
       console.log(`[ThreadPresenter] Built continue context for tool: ${pendingToolCall.name}`)
@@ -4356,28 +4478,24 @@ export class ThreadPresenter implements IThreadPresenter {
   private findPendingToolCallAfterPermission(
     content: AssistantMessageBlock[]
   ): { id: string; name: string; params: string } | null {
-    // 查找已授权的权限块
-    const grantedPermissionBlock = content.find(
-      (block) =>
+    // 从后向前查找“最近授予”的权限块，避免命中早前的授权块
+    for (let i = content.length - 1; i >= 0; i--) {
+      const block = content[i]
+      if (
         block.type === 'action' &&
         block.action_type === 'tool_call_permission' &&
-        block.status === 'granted'
-    )
-
-    if (!grantedPermissionBlock?.tool_call) {
-      return null
+        block.status === 'granted' &&
+        block.tool_call
+      ) {
+        const { id, name, params } = block.tool_call
+        if (id && name && params) {
+          return { id, name, params }
+        }
+        console.warn('[ThreadPresenter] Incomplete tool call info in granted block at index', i)
+        return null
+      }
     }
-
-    const { id, name, params } = grantedPermissionBlock.tool_call
-    if (!id || !name || !params) {
-      console.warn(
-        `[ThreadPresenter] Incomplete tool call info in permission block:`,
-        grantedPermissionBlock.tool_call
-      )
-      return null
-    }
-
-    return { id, name, params }
+    return null
   }
 
   // 构建继续工具调用执行的上下文
@@ -4386,7 +4504,8 @@ export class ThreadPresenter implements IThreadPresenter {
     contextMessages: any[],
     userMessage: any,
     pendingToolCall: { id: string; name: string; params: string },
-    modelConfig: any
+    modelConfig: any,
+    approvalNonce?: string
   ): Promise<ChatMessage[]> {
     const { systemPrompt } = conversation.settings
     const formattedMessages: ChatMessage[] = []
@@ -4423,6 +4542,19 @@ export class ThreadPresenter implements IThreadPresenter {
     // 4. 添加助手消息，说明需要执行工具调用
     if (modelConfig.functionCall) {
       // 对于原生支持函数调用的模型，添加tool_calls
+      let patchedArgs = pendingToolCall.params
+      if (approvalNonce) {
+        try {
+          const obj = JSON.parse(patchedArgs)
+          // 仅在不存在时添加，避免重复
+          if (!Object.prototype.hasOwnProperty.call(obj, 'approval_nonce')) {
+            obj['approval_nonce'] = approvalNonce
+            patchedArgs = JSON.stringify(obj)
+          }
+        } catch (e) {
+          // 若解析失败，保留原样；模型仍可从下方提示中得到指引
+        }
+      }
       formattedMessages.push({
         role: 'assistant',
         tool_calls: [
@@ -4431,18 +4563,37 @@ export class ThreadPresenter implements IThreadPresenter {
             type: 'function',
             function: {
               name: pendingToolCall.name,
-              arguments: pendingToolCall.params
+              arguments: patchedArgs
             }
           }
         ]
       })
 
-      // 添加一个虚拟的工具响应，说明权限已经授予
-      formattedMessages.push({
-        role: 'tool',
-        tool_call_id: pendingToolCall.id,
-        content: `Permission granted. Please proceed with executing the ${pendingToolCall.name} function.`
-      })
+      // 添加一个虚拟的工具响应，说明权限已经授予；如有一次性审批口令，要求在 JSON 中加入 approval_nonce
+      if (approvalNonce) {
+        formattedMessages.push({
+          role: 'tool',
+          tool_call_id: pendingToolCall.id,
+          content: `Permission granted. In your next function call, include an extra field approval_nonce with the exact value '${approvalNonce}' in function.arguments JSON. Do not change it. This approval_nonce is SINGLE-USE and scoped ONLY to resuming this exact function call; it is not a long-term token and must NOT be reused or persisted. **Re-emit the SAME function.name, approval_nonce and arguments content**; if your platform supports reusing tool_call_id, reuse it; otherwise keep name and arguments identical for ${pendingToolCall.name}.`
+        })
+        // 强化要求（作为额外的用户指令，避免模型忽略上面的提示）
+        formattedMessages.push({
+          role: 'user',
+          content:
+            `STRICT RULES:\n` +
+            `1) You MUST include \"approval_nonce\": \"${approvalNonce}\" in function.arguments JSON exactly.\n` +
+            `2) Do NOT translate, alter, log, reveal, or persist approval_nonce.\n` +
+            `3) approval_nonce is SINGLE-USE and scoped ONLY to this resumed function call; do NOT reuse it for any other call.\n` +
+            `4) If you cannot include approval_nonce, reply: ABORT: MISSING_APPROVAL_NONCE.\n` +
+            `5) Do NOT change other fields (name/arguments structure).`
+        })
+      } else {
+        formattedMessages.push({
+          role: 'tool',
+          tool_call_id: pendingToolCall.id,
+          content: `Permission granted. Re-emit the EXACT same function call with the SAME function.name and function.arguments. If your platform supports reusing tool_call_id, reuse it; otherwise keep name and arguments identical for ${pendingToolCall.name}.`
+        })
+      }
     } else {
       // 对于非原生支持的模型，使用文本提示
       formattedMessages.push({
@@ -4450,10 +4601,21 @@ export class ThreadPresenter implements IThreadPresenter {
         content: `I need to call the ${pendingToolCall.name} function with the following parameters: ${pendingToolCall.params}`
       })
 
-      formattedMessages.push({
-        role: 'user',
-        content: `Permission has been granted for the ${pendingToolCall.name} function. Please proceed with the execution.`
-      })
+      if (approvalNonce) {
+        formattedMessages.push({
+          role: 'user',
+          content:
+            `Permission granted. Call the SAME function (${pendingToolCall.name}) with the SAME arguments as previously shown, and add \"approval_nonce\":\"${approvalNonce}\" into the JSON arguments you emit. This approval_nonce is SINGLE-USE and scoped ONLY to this resumed function call; do NOT reuse or persist it. Do not alter name or arguments.\n` +
+            `Use this pattern (merge with existing arguments without removing fields):\n` +
+            `{\n  \"...existing_fields\": \"...\",\n  \"approval_nonce\": \"${approvalNonce}\"\n}\n` +
+            `If you cannot include approval_nonce, reply: ABORT: MISSING_APPROVAL_NONCE.`
+        })
+      } else {
+        formattedMessages.push({
+          role: 'user',
+          content: `Permission granted. Call the SAME function (${pendingToolCall.name}) with the SAME arguments as previously shown. Do not alter name or arguments.`
+        })
+      }
     }
 
     return formattedMessages

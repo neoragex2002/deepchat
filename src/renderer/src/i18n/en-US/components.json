@@ -22,6 +22,8 @@
     "rememberChoice": "Remember this choice",
     "granted": "Permission granted",
     "denied": "Permission denied",
+    "pending": "Pending",
+    "error": "Error",
     "type": {
       "read": "Read Access",
       "write": "Write Access",

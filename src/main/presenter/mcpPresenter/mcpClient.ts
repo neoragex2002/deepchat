@@ -451,7 +451,7 @@ export class McpClient {
         throw new Error(`MCP client ${this.serverName} not initialized`)
       }
 
-      // 调用工具
+      // 调用工具（起始日志在 ToolManager 层统一输出，这里不再重复）
       const result = (await this.client.callTool({
         name: toolName,
         arguments: args
@@ -471,6 +471,7 @@ export class McpClient {
           content: [{ type: 'error', text: errorText }]
         }
       }
+      // 结果摘要由 ToolManager 层统一输出，这里不再重复
       return result
     } catch (error) {
       // 检查并处理session错误

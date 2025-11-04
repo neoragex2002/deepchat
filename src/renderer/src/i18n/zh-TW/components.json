@@ -22,6 +22,8 @@
     "rememberChoice": "記住此選擇",
     "granted": "權限已授予",
     "denied": "權限已拒絕",
+    "pending": "待處理",
+    "error": "錯誤",
     "type": {
       "read": "讀取權限",
       "write": "寫入權限",

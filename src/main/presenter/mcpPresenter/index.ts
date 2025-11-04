@@ -1173,13 +1173,20 @@ export class McpPresenter implements IMCPPresenter {
     serverName: string,
     permissionType: 'read' | 'write' | 'all',
     remember: boolean = false,
-    toolCallId?: string
+    toolName?: string,
+    approvalNonce?: string
   ): Promise<void> {
     try {
       console.log(
-        `[MCP] Granting ${permissionType} permission for server: ${serverName}, remember: ${remember}, toolCallId: ${toolCallId || 'n/a'}`
+        `[MCP] Granting ${permissionType} permission for server: ${serverName}, remember: ${remember}, toolName: ${toolName || 'n/a'}, nonce: ${approvalNonce ? 'provided' : 'none'}`
       )
-      await this.toolManager.grantPermission(serverName, permissionType, remember, toolCallId)
+      await this.toolManager.grantPermission(
+        serverName,
+        permissionType,
+        remember,
+        toolName,
+        approvalNonce
+      )
       console.log(
         `[MCP] Successfully granted ${permissionType} permission for server: ${serverName}`
       )
