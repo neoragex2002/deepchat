@@ -46,6 +46,15 @@ import { AihubmixProvider } from './providers/aihubmixProvider'
 import { _302AIProvider } from './providers/_302AIProvider'
 import { ModelscopeProvider } from './providers/modelscopeProvider'
 import { VercelAIGatewayProvider } from './providers/vercelAIGatewayProvider'
+import { LLMTraceWriter } from './llmTrace'
+
+// Feature flag: collect-only mode (Provider collects tool calls but does not execute)
+// Scope: module-internal only (not exposed via external config)
+const COLLECT_ONLY_MODE_ENABLED = true
+// IO logs: output full LLM request messages and streamed responses
+const DEBUG_LLM_IO_LOG = true
+// IO detail logs: toggle writing detailed tool definitions (toolsRaw) and SSE frames
+const DEBUG_LLM_IO_DETAIL = false
 
 // Rate limit configuration interface
 interface RateLimitConfig {
@@ -89,6 +98,9 @@ export class LLMProviderPresenter implements ILlmProviderPresenter {
   private currentProviderId: string | null = null
   // Manage all streams by eventId
   private activeStreams: Map<string, StreamState> = new Map()
+  // Track cumulative tool-call counts across phases for the same eventId (R1/R2/...)
+  // This ensures MAX_TOOL_CALLS guard still applies in collect-only mode
+  private eventToolCallCounts: Map<string, number> = new Map()
   // Configuration
   private config: ProviderConfig = {
     maxConcurrentStreams: 10
@@ -134,9 +146,7 @@ export class LLMProviderPresenter implements ILlmProviderPresenter {
         })
       }
     }
-    console.log(
-      `[LLMProviderPresenter] Initialized rate limit configs for ${providers.length} providers`
-    )
+    // rate limit configs initialized (quiet)
   }
 
   private init() {
@@ -145,7 +155,7 @@ export class LLMProviderPresenter implements ILlmProviderPresenter {
       this.providers.set(provider.id, provider)
       if (provider.enable) {
         try {
-          console.log('init provider', provider.id, provider.apiType)
+          // init provider (quiet): ${provider.id}
           const instance = this.createProviderInstance(provider)
           if (instance) {
             this.providerInstances.set(provider.id, instance)
@@ -707,6 +717,15 @@ export class LLMProviderPresenter implements ILlmProviderPresenter {
     searchStrategy?: 'turbo' | 'max'
   ): AsyncGenerator<LLMAgentEvent, void, unknown> {
     console.log(`[Agent Loop] Starting agent loop for event: ${eventId} with model: ${modelId}`)
+    // Phase index per eventId to distinguish R1/R2 when the same assistant message continues
+    ;(this as any)._llmIoPhaseCounters =
+      (this as any)._llmIoPhaseCounters || new Map<string, number>()
+    const _phaseMap: Map<string, number> = (this as any)._llmIoPhaseCounters
+    const phaseIndex = (() => {
+      const v = _phaseMap.get(eventId) || 0
+      _phaseMap.set(eventId, v + 1)
+      return v
+    })()
     if (!this.canStartNewStream()) {
       // Instead of throwing, yield an error event
       yield { type: 'error', data: { eventId, error: 'Maximum concurrent stream limit reached' } }
@@ -748,7 +767,8 @@ export class LLMProviderPresenter implements ILlmProviderPresenter {
     // Agent Loop Variables
     const conversationMessages: ChatMessage[] = [...initialMessages]
     let needContinueConversation = true
-    let toolCallCount = 0
+    // Initialize with existing cumulative count (across phases) for this eventId
+    let toolCallCount = this.eventToolCallCounts.get(eventId) || 0
     const MAX_TOOL_CALLS = BaseLLMProvider.getMaxToolCalls()
     const totalUsage: {
       prompt_tokens: number
@@ -761,6 +781,19 @@ export class LLMProviderPresenter implements ILlmProviderPresenter {
       total_tokens: 0,
       context_length: modelConfig?.contextLength || 0
     }
+
+    // Planned tool calls to be reported at END (collect-only mode)
+    let plannedToolCallsForEnd: Array<{ id: string; name: string; arguments: string }> | undefined
+
+    // Initialize IO trace writer (logs to ./logs/llm-trace)
+    const trace = new LLMTraceWriter({
+      baseDir: undefined,
+      conversationId: undefined,
+      eventId,
+      phaseIndex,
+      providerId,
+      modelId
+    })
 
     try {
       // --- Agent Loop ---
@@ -824,6 +857,36 @@ export class LLMProviderPresenter implements ILlmProviderPresenter {
           }
 
           // Call the provider's core stream method, expecting LLMCoreStreamEvent
+          if (DEBUG_LLM_IO_LOG) {
+            try {
+              console.log('[IO/LLM/Request]', {
+                eventId,
+                providerId,
+                modelId,
+                messageCount: conversationMessages.length
+              })
+            } catch {}
+          }
+          // Dump request body (normalized, provider-agnostic)
+          try {
+            trace.writeRequest({
+              model: modelId,
+              messages: conversationMessages,
+              tools: (mcpTools || []).map((t) => ({
+                type: 'function',
+                function: { name: t.function.name, parameters: (t as any).inputSchema || {} }
+              })),
+              // Only persist raw tool definitions when detailed IO logging is enabled
+              ...(DEBUG_LLM_IO_DETAIL ? { toolsRaw: mcpTools || [] } : {}),
+              stream: true,
+              temperature,
+              maxTokens,
+              providerConfig: modelConfig
+            })
+          } catch (e) {
+            console.warn('[LLMTrace] Failed to write request log:', e)
+          }
+
           const stream = provider.coreStream(
             conversationMessages,
             modelId,
@@ -839,12 +902,22 @@ export class LLMProviderPresenter implements ILlmProviderPresenter {
               break
             }
             // console.log('presenter chunk', JSON.stringify(chunk), currentContent)
+            // Add structured frame for full trace (provider-agnostic)
+            if (DEBUG_LLM_IO_DETAIL) {
+              try {
+                trace.addFrame(chunk)
+              } catch {}
+            }
 
             // --- Event Handling (using LLMCoreStreamEvent structure) ---
+            // Per-chunk response logging is intentionally muted; we log aggregated final text instead
             switch (chunk.type) {
               case 'text':
                 if (chunk.content) {
                   currentContent += chunk.content
+                  try {
+                    trace.appendTextDelta(chunk.content)
+                  } catch {}
                   yield {
                     type: 'response',
                     data: {
@@ -872,6 +945,9 @@ export class LLMProviderPresenter implements ILlmProviderPresenter {
                     name: chunk.tool_call_name,
                     arguments_chunk: ''
                   }
+                  try {
+                    trace.addToolCall(chunk.tool_call_id, chunk.tool_call_name, '')
+                  } catch {}
                   // Immediately send the start event to indicate the tool call has begun
                   yield {
                     type: 'response',
@@ -893,6 +969,13 @@ export class LLMProviderPresenter implements ILlmProviderPresenter {
                 ) {
                   currentToolChunks[chunk.tool_call_id].arguments_chunk +=
                     chunk.tool_call_arguments_chunk
+                  try {
+                    trace.addToolCall(
+                      chunk.tool_call_id,
+                      currentToolChunks[chunk.tool_call_id].name,
+                      currentToolChunks[chunk.tool_call_id].arguments_chunk
+                    )
+                  } catch {}
 
                   // Send update event to update parameter content in real-time
                   yield {
@@ -917,6 +1000,13 @@ export class LLMProviderPresenter implements ILlmProviderPresenter {
                     name: currentToolChunks[chunk.tool_call_id].name,
                     arguments: completeArgs
                   })
+                  try {
+                    trace.addToolCall(
+                      chunk.tool_call_id,
+                      currentToolChunks[chunk.tool_call_id].name,
+                      completeArgs
+                    )
+                  } catch {}
 
                   // Send final update event to ensure parameter completeness
                   yield {
@@ -947,6 +1037,9 @@ export class LLMProviderPresenter implements ILlmProviderPresenter {
                       totalUsage: { ...totalUsage } // Yield accumulated usage
                     }
                   }
+                  try {
+                    trace.setUsage({ ...totalUsage })
+                  } catch {}
                 }
                 break
               case 'image_data':
@@ -989,6 +1082,9 @@ export class LLMProviderPresenter implements ILlmProviderPresenter {
                 console.log(
                   `Provider stream stopped for event ${eventId}. Reason: ${chunk.stop_reason}`
                 )
+                try {
+                  trace.setStopReason(chunk.stop_reason)
+                } catch {}
                 if (chunk.stop_reason === 'tool_use') {
                   // Consolidate any remaining tool call chunks
                   for (const id in currentToolChunks) {
@@ -1000,7 +1096,29 @@ export class LLMProviderPresenter implements ILlmProviderPresenter {
                   }
 
                   if (currentToolCalls.length > 0) {
-                    needContinueConversation = true
+                    // In collect-only mode, still advance cumulative tool-call counter
+                    // so MAX_TOOL_CALLS remains enforced across phases.
+                    if (COLLECT_ONLY_MODE_ENABLED) {
+                      toolCallCount += currentToolCalls.length
+                      // Persist cumulative count for this eventId
+                      this.eventToolCallCounts.set(eventId, toolCallCount)
+                      if (toolCallCount >= MAX_TOOL_CALLS) {
+                        // Notify renderer/thread that maximum tool calls have been reached
+                        yield {
+                          type: 'response',
+                          data: {
+                            eventId,
+                            maximum_tool_calls_reached: true
+                          }
+                        }
+                      }
+                    }
+                    // In collect-only mode, do not auto-continue here. Let Thread handle permissions and execution.
+                    if (COLLECT_ONLY_MODE_ENABLED) {
+                      needContinueConversation = false
+                    } else {
+                      needContinueConversation = true
+                    }
                   } else {
                     console.warn(
                       `Stop reason was 'tool_use' but no tool calls were fully parsed for event ${eventId}.`
@@ -1029,8 +1147,51 @@ export class LLMProviderPresenter implements ILlmProviderPresenter {
             conversationMessages.push(assistantMessage)
           }
 
+          // IO aggregated: log final text for this iteration
+          if (DEBUG_LLM_IO_LOG) {
+            try {
+              if (typeof currentContent === 'string' && currentContent.length > 0) {
+                console.log('[IO/LLM/FinalText]', { eventId, text: currentContent })
+              }
+            } catch {}
+          }
+
+          // Finalize and write response trace
+          try {
+            if (currentToolCalls && currentToolCalls.length > 0) {
+              for (const tc of currentToolCalls) trace.addToolCall(tc.id, tc.name, tc.arguments)
+              // Include planned tool calls into this phase response for collect-only mode
+              if (COLLECT_ONLY_MODE_ENABLED) {
+                try {
+                  trace.setPlannedToolCalls(
+                    currentToolCalls.map((c) => ({
+                      id: c.id,
+                      name: c.name,
+                      arguments: c.arguments
+                    }))
+                  )
+                } catch {}
+              }
+            }
+            trace.writeResponse()
+          } catch (e) {
+            console.warn('[LLMTrace] Failed to write response log:', e)
+          }
+
           // 2. Execute Tool Calls if needed
-          if (needContinueConversation && currentToolCalls.length > 0) {
+          if (COLLECT_ONLY_MODE_ENABLED && currentToolCalls.length > 0) {
+            // Stash planned tool calls for ThreadPresenter to render permission blocks after END
+            plannedToolCallsForEnd = currentToolCalls.map((c) => ({
+              id: c.id,
+              name: c.name,
+              arguments: c.arguments
+            }))
+          }
+          if (
+            !COLLECT_ONLY_MODE_ENABLED &&
+            needContinueConversation &&
+            currentToolCalls.length > 0
+          ) {
             for (const toolCall of currentToolCalls) {
               if (abortController.signal.aborted) break // Check before each tool call
 
@@ -1210,6 +1371,14 @@ export class LLMProviderPresenter implements ILlmProviderPresenter {
                     }
                   }
                 } else {
+                  // Collect-only mode: stash the planned tool calls for END event
+                  if (COLLECT_ONLY_MODE_ENABLED && currentToolCalls.length > 0) {
+                    plannedToolCallsForEnd = currentToolCalls.map((c) => ({
+                      id: c.id,
+                      name: c.name,
+                      arguments: c.arguments
+                    }))
+                  }
                   // Non-native FC: Add tool execution record to conversation history for next LLM turn.
 
                   // 1. Format tool execution record (including the function calling request & response) into prompt-defined text.
@@ -1382,6 +1551,11 @@ export class LLMProviderPresenter implements ILlmProviderPresenter {
             break // Break outer loop if aborted here
           }
           console.error(`Agent loop inner error for event ${eventId}:`, error)
+          // Trace: record error and persist phase record for debugging
+          try {
+            trace.markError(error)
+            if (!trace.hasWritten()) trace.writeResponse()
+          } catch {}
           yield {
             type: 'error',
             data: {
@@ -1403,6 +1577,11 @@ export class LLMProviderPresenter implements ILlmProviderPresenter {
         console.log(`Agent loop aborted during outer try-catch for event ${eventId}`)
       } else {
         console.error(`Agent loop outer error for event ${eventId}:`, error)
+        // Trace: record error and persist phase record for debugging
+        try {
+          trace.markError(error)
+          if (!trace.hasWritten()) trace.writeResponse()
+        } catch {}
         yield {
           type: 'error',
           data: {
@@ -1414,6 +1593,14 @@ export class LLMProviderPresenter implements ILlmProviderPresenter {
     } finally {
       // Finalize stream regardless of how the loop ended (completion, error, abort)
       const userStop = abortController.signal.aborted
+      // Trace: mark userStop and include planned_tool_calls if any; ensure a phase record exists
+      try {
+        trace.setUserStop(userStop)
+        if (plannedToolCallsForEnd && plannedToolCallsForEnd.length > 0) {
+          trace.setPlannedToolCalls(plannedToolCallsForEnd)
+        }
+        if (!trace.hasWritten()) trace.writeResponse()
+      } catch {}
       if (!userStop) {
         // Yield final aggregated usage if not aborted
         yield {
@@ -1424,11 +1611,37 @@ export class LLMProviderPresenter implements ILlmProviderPresenter {
           }
         }
       }
-      // Yield the final END event
-      yield { type: 'end', data: { eventId, userStop } }
+      // Yield the final END event (include planned_tool_calls in collect-only mode)
+      if (plannedToolCallsForEnd && plannedToolCallsForEnd.length > 0) {
+        if (DEBUG_LLM_IO_LOG) {
+          try {
+            console.log('[IO/LLM/PlannedTools]', {
+              eventId,
+              planned: plannedToolCallsForEnd.map((t) => ({ id: t.id, name: t.name }))
+            })
+          } catch {}
+        }
+        yield {
+          type: 'end',
+          data: { eventId, userStop, planned_tool_calls: plannedToolCallsForEnd }
+        }
+      } else {
+        yield { type: 'end', data: { eventId, userStop } }
+      }
 
       this.activeStreams.delete(eventId)
-      console.log('Agent loop finished for event:', eventId, 'User stopped:', userStop)
+      // Cleanup cumulative counter if no further tool plans are expected in this phase.
+      // When there is no planned_tool_calls at END, we assume this turn for the event is finalized.
+      // This avoids leaking counts across completely finished messages.
+      try {
+        if (!plannedToolCallsForEnd || plannedToolCallsForEnd.length === 0) {
+          this.eventToolCallCounts.delete(eventId)
+        } else {
+          // Persist the latest count for the next phase
+          this.eventToolCallCounts.set(eventId, toolCallCount)
+        }
+      } catch {}
+      // agent loop finished (quiet)
     }
   }
 

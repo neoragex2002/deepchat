@@ -140,7 +140,12 @@ export interface IThreadPresenter {
     pageSize: number
   ): Promise<{ total: number; list: MESSAGE[] }>
   sendMessage(conversationId: string, content: string, role: MESSAGE_ROLE): Promise<MESSAGE | null>
-  startStreamCompletion(conversationId: string, queryMsgId?: string): Promise<void>
+  startStreamCompletion(
+    conversationId: string,
+    queryMsgId?: string,
+    selectedVariantsMap?: Record<string, string>,
+    contextMode?: 'msg_retry' | 'toolcall_continue'
+  ): Promise<void>
   editMessage(messageId: string, content: string): Promise<MESSAGE>
   deleteMessage(messageId: string): Promise<void>
   retryMessage(messageId: string, modelId?: string): Promise<MESSAGE>

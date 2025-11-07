@@ -278,16 +278,107 @@ export const useChatStore = defineStore('chat', () => {
         }
       }
 
-      // 处理所有消息的 extra 信息
-      setMessages(
-        (await Promise.all(mergedMessages.map((msg) => enrichMessageWithExtra(msg)))) as
-          | AssistantMessage[]
-          | UserMessage[]
-      )
+      // 处理所有消息的 extra 信息（并与现有消息进行合并，避免状态/结果被回退）
+      const enrichedNew = (await Promise.all(
+        mergedMessages.map((msg) => enrichMessageWithExtra(msg))
+      )) as AssistantMessage[] | UserMessage[]
+
+      const existing = getMessages()
+      const existingMap = new Map<string, AssistantMessage | UserMessage>()
+      for (const m of existing as (AssistantMessage | UserMessage)[]) existingMap.set(m.id, m)
+
+      const finalMessages = enrichedNew.map((nm) => {
+        const old = existingMap.get(nm.id)
+        if (old && old.role === 'assistant' && nm.role === 'assistant') {
+          return mergeAssistantMessage(old, nm)
+        }
+        return nm
+      }) as AssistantMessage[] | UserMessage[]
+
+      setMessages(finalMessages)
     } catch (error) {
       console.error('Failed to load messages:', error)
       throw error
     }
+  }
+
+  // 合并助手消息，避免异步顺序导致的状态/结果回退
+  const mergeAssistantMessage = (
+    currentMsg: AssistantMessage | UserMessage,
+    updatedMsg: AssistantMessage | UserMessage
+  ): AssistantMessage | UserMessage => {
+    if (currentMsg.role !== 'assistant' || updatedMsg.role !== 'assistant') return updatedMsg
+    const cur = currentMsg as AssistantMessage
+    const nxt = updatedMsg as AssistantMessage
+    if (!Array.isArray(cur.content) || !Array.isArray(nxt.content)) return updatedMsg
+
+    const keyOf = (b: AssistantMessageBlock) => {
+      if (b.type === 'tool_call' && b.tool_call) return `tool:${b.tool_call.id || b.tool_call.name}`
+      if (b.type === 'action' && (b as any).action_type === 'tool_call_permission' && b.tool_call)
+        return `perm:${b.tool_call.id || b.tool_call.name}`
+      return `other:${b.type}:${b.timestamp}`
+    }
+
+    const curMap = new Map<string, AssistantMessageBlock>()
+    for (const b of cur.content) curMap.set(keyOf(b), b)
+
+    const mergedBlocks: AssistantMessageBlock[] = []
+    for (const nb of nxt.content as AssistantMessageBlock[]) {
+      const k = keyOf(nb)
+      const ob = curMap.get(k)
+      if (!ob) {
+        mergedBlocks.push(nb)
+        continue
+      }
+      if (nb.type === 'tool_call' && nb.tool_call && ob.type === 'tool_call' && ob.tool_call) {
+        const merged: AssistantMessageBlock = JSON.parse(JSON.stringify(nb))
+        // 若旧块已完成/失败，优先采用旧状态，避免回退
+        if (ob.status === 'success' || ob.status === 'error') merged.status = ob.status
+        // 若新块缺少响应而旧块已有，保留旧响应
+        if (!nb.tool_call.response && ob.tool_call.response) {
+          merged.tool_call!.response = ob.tool_call.response
+        }
+        // 元信息补全
+        merged.tool_call!.server_name = nb.tool_call.server_name || ob.tool_call.server_name
+        merged.tool_call!.server_icons = nb.tool_call.server_icons || ob.tool_call.server_icons
+        merged.tool_call!.server_description =
+          nb.tool_call.server_description || ob.tool_call.server_description
+        mergedBlocks.push(merged)
+        continue
+      }
+      if (
+        nb.type === 'action' &&
+        (nb as any).action_type === 'tool_call_permission' &&
+        ob.type === 'action' &&
+        (ob as any).action_type === 'tool_call_permission'
+      ) {
+        const merged: AssistantMessageBlock = JSON.parse(JSON.stringify(nb))
+        const score = (s?: string) =>
+          s === 'granted' || s === 'denied' ? 2 : s === 'error' ? 1 : 0
+        if (score(ob.status) > score(nb.status)) merged.status = ob.status
+        if (merged.extra) {
+          merged.extra.needsUserAction =
+            Boolean(merged.extra.needsUserAction) && merged.status === 'pending'
+        }
+        mergedBlocks.push(merged)
+        continue
+      }
+      mergedBlocks.push(nb)
+    }
+    // 旧消息存在但新消息缺失的关键块，补入（仅 tool_call / permission），避免“闪现后消失”
+    for (const [k, ob] of curMap.entries()) {
+      if (!mergedBlocks.find((b) => keyOf(b) === k)) {
+        if (
+          ob.type === 'tool_call' ||
+          (ob.type === 'action' && (ob as any).action_type === 'tool_call_permission')
+        ) {
+          mergedBlocks.push(ob)
+        }
+      }
+    }
+    const out = JSON.parse(JSON.stringify(nxt)) as AssistantMessage
+    out.content = mergedBlocks
+    return out
   }
 
   const sendMessage = async (content: UserMessageContent | AssistantMessageBlock[]) => {
@@ -337,7 +428,8 @@ export const useChatStore = defineStore('chat', () => {
       await threadP.startStreamCompletion(
         getActiveThreadId()!,
         messageId,
-        Object.fromEntries(selectedVariantsMap.value)
+        Object.fromEntries(selectedVariantsMap.value),
+        'msg_retry'
       )
     } catch (error) {
       console.error('Failed to retry message:', error)
@@ -440,8 +532,14 @@ export const useChatStore = defineStore('chat', () => {
           const lastBlock =
             curMsg.content.length > 0 ? curMsg.content[curMsg.content.length - 1] : undefined
           if (lastBlock) {
-            // 只有当上一个块不是一个正在等待结果的工具调用时，才将其标记为成功
-            if (!(lastBlock.type === 'tool_call' && lastBlock.status === 'loading')) {
+            // 仅在不是正在进行的工具调用、且不是权限请求块时，才将其标记为成功
+            if (
+              !(lastBlock.type === 'tool_call' && lastBlock.status === 'loading') &&
+              !(
+                lastBlock.type === 'action' &&
+                (lastBlock as any).action_type === 'tool_call_permission'
+              )
+            ) {
               lastBlock.status = 'success'
             }
           }
@@ -470,26 +568,40 @@ export const useChatStore = defineStore('chat', () => {
           })
         } else if (msg.tool_call) {
           if (msg.tool_call === 'start') {
-            // 工具调用开始解析参数 - 创建新的工具调用块
-            finalizeLastBlock() // 使用保护逻辑
-
-            // 工具调用音效，与实际数据流同步
-            playToolcallSound()
-
-            curMsg.content.push({
-              type: 'tool_call',
-              content: '',
-              status: 'loading', // 使用loading状态表示正在解析参数
-              timestamp: Date.now(),
-              tool_call: {
-                id: msg.tool_call_id,
-                name: msg.tool_call_name,
-                params: msg.tool_call_params || '',
-                server_name: msg.tool_call_server_name,
-                server_icons: msg.tool_call_server_icons,
-                server_description: msg.tool_call_server_description
-              }
-            })
+            try {
+              console.log('[Renderer/ToolCallStream/START]', {
+                messageId: curMsg.id,
+                toolCallId: msg.tool_call_id,
+                name: msg.tool_call_name
+              })
+            } catch {}
+            // 若已存在同 id/name 的已完成块，则忽略重复的 START（R2/回注场景去重）
+            const existingDone = curMsg.content.find(
+              (block) =>
+                block.type === 'tool_call' &&
+                ((msg.tool_call_id && block.tool_call?.id === msg.tool_call_id) ||
+                  block.tool_call?.name === msg.tool_call_name) &&
+                (block.status === 'success' || block.status === 'error')
+            )
+            if (!existingDone) {
+              // 工具调用开始解析参数 - 创建新的工具调用块
+              finalizeLastBlock() // 使用保护逻辑
+              playToolcallSound()
+              curMsg.content.push({
+                type: 'tool_call',
+                content: '',
+                status: 'loading', // 使用loading状态表示正在解析参数
+                timestamp: Date.now(),
+                tool_call: {
+                  id: msg.tool_call_id,
+                  name: msg.tool_call_name,
+                  params: msg.tool_call_params || '',
+                  server_name: msg.tool_call_server_name,
+                  server_icons: msg.tool_call_server_icons,
+                  server_description: msg.tool_call_server_description
+                }
+              })
+            }
           } else if (msg.tool_call === 'update') {
             // 实时更新工具调用参数
             const existingToolCallBlock = curMsg.content.find(
@@ -499,6 +611,13 @@ export const useChatStore = defineStore('chat', () => {
                   block.tool_call?.name === msg.tool_call_name) &&
                 block.status === 'loading'
             )
+            try {
+              console.log('[Renderer/ToolCallStream/UPDATE]', {
+                found: Boolean(existingToolCallBlock),
+                toolCallId: msg.tool_call_id,
+                name: msg.tool_call_name
+              })
+            } catch {}
             if (
               existingToolCallBlock &&
               existingToolCallBlock.type === 'tool_call' &&
@@ -516,6 +635,13 @@ export const useChatStore = defineStore('chat', () => {
                   block.tool_call?.name === msg.tool_call_name) &&
                 block.status === 'loading'
             )
+            try {
+              console.log('[Renderer/ToolCallStream/RUNNING]', {
+                found: Boolean(existingToolCallBlock),
+                toolCallId: msg.tool_call_id,
+                name: msg.tool_call_name
+              })
+            } catch {}
             if (existingToolCallBlock && existingToolCallBlock.type === 'tool_call') {
               // 保持loading状态，但可以添加执行中的标识
               existingToolCallBlock.status = 'loading'
@@ -527,31 +653,57 @@ export const useChatStore = defineStore('chat', () => {
             } else {
               // 如果没有找到现有的工具调用块，创建一个新的（兼容旧逻辑）
               finalizeLastBlock() // 使用保护逻辑
-
-              curMsg.content.push({
-                type: 'tool_call',
-                content: '',
-                status: 'loading',
-                timestamp: Date.now(),
-                tool_call: {
-                  id: msg.tool_call_id,
-                  name: msg.tool_call_name,
-                  params: msg.tool_call_params || '',
-                  server_name: msg.tool_call_server_name,
-                  server_icons: msg.tool_call_server_icons,
-                  server_description: msg.tool_call_server_description
-                }
-              })
+              const alreadyDone = curMsg.content.find(
+                (block) =>
+                  block.type === 'tool_call' &&
+                  ((msg.tool_call_id && block.tool_call?.id === msg.tool_call_id) ||
+                    block.tool_call?.name === msg.tool_call_name) &&
+                  (block.status === 'success' || block.status === 'error')
+              )
+              if (!alreadyDone) {
+                curMsg.content.push({
+                  type: 'tool_call',
+                  content: '',
+                  status: 'loading',
+                  timestamp: Date.now(),
+                  tool_call: {
+                    id: msg.tool_call_id,
+                    name: msg.tool_call_name,
+                    params: msg.tool_call_params || '',
+                    server_name: msg.tool_call_server_name,
+                    server_icons: msg.tool_call_server_icons,
+                    server_description: msg.tool_call_server_description
+                  }
+                })
+              }
             }
           } else if (msg.tool_call === 'end' || msg.tool_call === 'error') {
             // 查找对应的工具调用块
-            const existingToolCallBlock = curMsg.content.find(
+            let existingToolCallBlock = curMsg.content.find(
               (block) =>
                 block.type === 'tool_call' &&
                 ((msg.tool_call_id && block.tool_call?.id === msg.tool_call_id) ||
                   block.tool_call?.name === msg.tool_call_name) &&
                 block.status === 'loading'
             )
+            try {
+              console.log('[Renderer/ToolCallStream/END_OR_ERROR]', {
+                foundLoading: Boolean(existingToolCallBlock),
+                toolCallId: msg.tool_call_id,
+                name: msg.tool_call_name,
+                status: msg.tool_call
+              })
+            } catch {}
+            // 如果未找到 loading 块，但存在同 id/name 的已完成块，也允许补写响应（容错）
+            if (!existingToolCallBlock) {
+              existingToolCallBlock = curMsg.content.find(
+                (block) =>
+                  block.type === 'tool_call' &&
+                  ((msg.tool_call_id && block.tool_call?.id === msg.tool_call_id) ||
+                    block.tool_call?.name === msg.tool_call_name) &&
+                  (block.status === 'success' || block.status === 'error')
+              )
+            }
             if (existingToolCallBlock && existingToolCallBlock.type === 'tool_call') {
               if (msg.tool_call === 'error') {
                 existingToolCallBlock.status = 'error'
@@ -605,19 +757,15 @@ export const useChatStore = defineStore('chat', () => {
           const lastContentBlock = curMsg.content[curMsg.content.length - 1]
           if (lastContentBlock && lastContentBlock.type === 'content') {
             lastContentBlock.content += msg.content
-            // 打字机音效，与实际数据流同步
             playTypewriterSound()
           } else {
-            if (lastContentBlock) {
-              lastContentBlock.status = 'success'
-            }
+            finalizeLastBlock() // 使用统一保护逻辑，避免错误改写权限块/工具块状态
             curMsg.content.push({
               type: 'content',
               content: msg.content,
               status: 'loading',
               timestamp: Date.now()
             })
-            // 如果是新块的第一个字符，也播放声音
             playTypewriterSound()
           }
         }
@@ -628,9 +776,7 @@ export const useChatStore = defineStore('chat', () => {
           if (lastReasoningBlock && lastReasoningBlock.type === 'reasoning_content') {
             lastReasoningBlock.content += msg.reasoning_content
           } else {
-            if (lastReasoningBlock) {
-              lastReasoningBlock.status = 'success'
-            }
+            finalizeLastBlock() // 使用统一保护逻辑
             curMsg.content.push({
               type: 'reasoning_content',
               content: msg.reasoning_content,
@@ -718,7 +864,11 @@ export const useChatStore = defineStore('chat', () => {
           if (getActiveThreadId() === getActiveThreadId()) {
             const mainMsgIndex = getMessages().findIndex((m) => m.id === mainMessage.id)
             if (mainMsgIndex !== -1) {
-              getMessages()[mainMsgIndex] = enrichedMainMessage as AssistantMessage | UserMessage
+              const merged = mergeAssistantMessage(
+                getMessages()[mainMsgIndex] as AssistantMessage | UserMessage,
+                enrichedMainMessage as AssistantMessage | UserMessage
+              )
+              getMessages()[mainMsgIndex] = merged
             }
           }
         }
@@ -727,7 +877,11 @@ export const useChatStore = defineStore('chat', () => {
         if (getActiveThreadId() === getActiveThreadId()) {
           const msgIndex = getMessages().findIndex((m) => m.id === msg.eventId)
           if (msgIndex !== -1) {
-            getMessages()[msgIndex] = enrichedMessage as AssistantMessage | UserMessage
+            const merged = mergeAssistantMessage(
+              getMessages()[msgIndex] as AssistantMessage | UserMessage,
+              enrichedMessage as AssistantMessage | UserMessage
+            )
+            getMessages()[msgIndex] = merged
           }
         }
       }
@@ -1035,14 +1189,21 @@ export const useChatStore = defineStore('chat', () => {
       // 处理 extra 信息
       const enrichedMessage = await enrichMessageWithExtra(updatedMessage)
 
-      // 更新缓存
-      cached.message = enrichedMessage as AssistantMessage | UserMessage
+      // 更新缓存（合并以避免状态/结果回退）
+      cached.message = mergeAssistantMessage(
+        cached.message as AssistantMessage | UserMessage,
+        enrichedMessage as AssistantMessage | UserMessage
+      )
 
       // 如果是当前会话的消息，也更新显示
       if (cached.threadId === getActiveThreadId()) {
         const msgIndex = getMessages().findIndex((m) => m.id === msgId)
         if (msgIndex !== -1) {
-          getMessages()[msgIndex] = enrichedMessage as AssistantMessage | UserMessage
+          const merged = mergeAssistantMessage(
+            getMessages()[msgIndex] as AssistantMessage | UserMessage,
+            enrichedMessage as AssistantMessage | UserMessage
+          )
+          getMessages()[msgIndex] = merged
         }
       }
     } else if (getActiveThreadId()) {
@@ -1053,7 +1214,11 @@ export const useChatStore = defineStore('chat', () => {
         const enrichedMainMessage = await enrichMessageWithExtra(mainMessage)
         const mainMsgIndex = getMessages().findIndex((m) => m.id === mainMessage.id)
         if (mainMsgIndex !== -1) {
-          getMessages()[mainMsgIndex] = enrichedMainMessage as AssistantMessage | UserMessage
+          const merged = mergeAssistantMessage(
+            getMessages()[mainMsgIndex] as AssistantMessage | UserMessage,
+            enrichedMainMessage as AssistantMessage | UserMessage
+          )
+          getMessages()[mainMsgIndex] = merged
         }
       } else {
         // 如果不是变体消息，直接更新当前消息
@@ -1061,7 +1226,11 @@ export const useChatStore = defineStore('chat', () => {
         if (msgIndex !== -1) {
           const updatedMessage = await threadP.getMessage(msgId)
           const enrichedMessage = await enrichMessageWithExtra(updatedMessage)
-          getMessages()[msgIndex] = enrichedMessage as AssistantMessage | UserMessage
+          const merged = mergeAssistantMessage(
+            getMessages()[msgIndex] as AssistantMessage | UserMessage,
+            enrichedMessage as AssistantMessage | UserMessage
+          )
+          getMessages()[msgIndex] = merged
         }
       }
     }

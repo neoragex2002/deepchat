@@ -126,6 +126,53 @@ const autoApproveWrite = ref(
     false
 )
 
+// 每工具粒度的自动授权：toolsAutoApprove
+type Perm = 'read' | 'write' | 'all'
+const toolsAutoApproveMap = ref<Record<string, Perm[]>>({
+  ...(props.initialConfig?.toolsAutoApprove || {})
+})
+const newToolName = ref('')
+const newToolRead = ref(false)
+const newToolWrite = ref(false)
+const newToolAll = ref(false)
+
+const addToolsAutoApprove = (): void => {
+  const name = newToolName.value.trim()
+  if (!name) return
+  const list: Perm[] = []
+  if (newToolAll.value) list.push('all')
+  else {
+    if (newToolRead.value) list.push('read')
+    if (newToolWrite.value) list.push('write')
+  }
+  toolsAutoApproveMap.value[name] = list
+  // reset
+  newToolName.value = ''
+  newToolRead.value = false
+  newToolWrite.value = false
+  newToolAll.value = false
+}
+
+const removeToolsAutoApprove = (toolName: string): void => {
+  const map = { ...toolsAutoApproveMap.value }
+  delete map[toolName]
+  toolsAutoApproveMap.value = map
+}
+
+const toggleToolPerm = (toolName: string, perm: Perm, checked: boolean): void => {
+  const list = toolsAutoApproveMap.value[toolName] || []
+  let next = new Set(list)
+  if (checked) next.add(perm)
+  else next.delete(perm)
+  // all 优先：若选择 all，清理 read/write；若取消 all，保留 read/write 选择
+  if (perm === 'all') {
+    if (checked) next = new Set(['all'])
+  } else {
+    if (next.has('all')) next.delete('all')
+  }
+  toolsAutoApproveMap.value[toolName] = Array.from(next) as Perm[]
+}
+
 // 简单表单状态
 const currentStep = ref(props.editMode ? 'detailed' : 'simple')
 const jsonConfig = ref('')
@@ -202,16 +249,23 @@ const parseJsonConfig = (): void => {
       customHeaders.value = '' // 默认空字符串
     }
 
-    // 权限设置
-    autoApproveAll.value = serverConfig.autoApprove?.includes('all') || false
+  // 权限设置
+  autoApproveAll.value = serverConfig.autoApprove?.includes('all') || false
     autoApproveRead.value =
       serverConfig.autoApprove?.includes('read') ||
       serverConfig.autoApprove?.includes('all') ||
       false
-    autoApproveWrite.value =
+  autoApproveWrite.value =
       serverConfig.autoApprove?.includes('write') ||
       serverConfig.autoApprove?.includes('all') ||
       false
+
+    // 每工具粒度授权
+    if (serverConfig.toolsAutoApprove && typeof serverConfig.toolsAutoApprove === 'object') {
+      toolsAutoApproveMap.value = serverConfig.toolsAutoApprove as Record<string, Perm[]>
+    } else {
+      toolsAutoApproveMap.value = {}
+    }
 
     // 切换到详细表单
     currentStep.value = 'detailed'
@@ -521,6 +575,12 @@ const handleSubmit = (): void => {
     serverConfig.customNpmRegistry = ''
   }
 
+  // 附带每工具粒度授权
+  const taa = toolsAutoApproveMap.value
+  if (taa && Object.keys(taa).length > 0) {
+    ;(serverConfig as any).toolsAutoApprove = taa
+  }
+
   emit('submit', name.value.trim(), serverConfig)
 }
 
@@ -728,6 +788,66 @@ HTTP-Referer=deepchatai.cn`
       <div class="space-y-4 px-4 pb-4">
         <div class="text-sm">
           {{ t('settings.mcp.serverForm.jsonConfigIntro') }}
+        </div>
+
+        <!-- 权限设置（server 级） -->
+        <div class="space-y-2">
+          <Label>{{ t('settings.mcp.serverForm.autoApprove') }} (server)</Label>
+          <div class="flex items-center gap-4 text-sm">
+            <div class="flex items-center gap-2">
+              <Checkbox v-model:checked="autoApproveAll" @update:checked="handleAutoApproveAllChange" />
+              <span>{{ t('settings.mcp.serverForm.autoApproveAll') }}</span>
+            </div>
+            <div class="flex items-center gap-2">
+              <Checkbox v-model:checked="autoApproveRead" />
+              <span>{{ t('settings.mcp.serverForm.autoApproveRead') }}</span>
+            </div>
+            <div class="flex items-center gap-2">
+              <Checkbox v-model:checked="autoApproveWrite" />
+              <span>{{ t('settings.mcp.serverForm.autoApproveWrite') }}</span>
+            </div>
+          </div>
+          <div class="text-muted-foreground text-xs">
+            {{ t('settings.mcp.serverForm.autoApproveHelp') }}
+          </div>
+        </div>
+
+        <!-- 每工具粒度的自动授权（toolsAutoApprove） -->
+        <div class="space-y-2">
+          <Label>{{ t('settings.mcp.serverForm.perToolAutoApproveLabel') }}</Label>
+          <!-- 添加条目 -->
+          <div class="flex items-center gap-2">
+            <Input
+              v-model="newToolName"
+              :placeholder="t('settings.mcp.serverForm.perToolToolNamePlaceholder')"
+              class="w-64"
+            />
+            <div class="flex items-center gap-3 text-xs">
+              <label class="flex items-center gap-1"><Checkbox v-model:checked="newToolRead" />{{ t('settings.mcp.serverForm.autoApproveRead') }}</label>
+              <label class="flex items-center gap-1"><Checkbox v-model:checked="newToolWrite" />{{ t('settings.mcp.serverForm.autoApproveWrite') }}</label>
+              <label class="flex items-center gap-1"><Checkbox v-model:checked="newToolAll" />{{ t('settings.mcp.serverForm.autoApproveAll') }}</label>
+            </div>
+            <Button type="button" size="sm" @click="addToolsAutoApprove">{{ t('common.add') }}</Button>
+          </div>
+          <!-- 列表 -->
+          <div class="space-y-2">
+            <div v-for="(perms, tool) in toolsAutoApproveMap" :key="tool" class="flex items-center gap-3">
+              <div class="text-sm w-64 truncate">{{ tool }}</div>
+              <label class="flex items-center gap-1 text-xs">
+                <Checkbox :checked="(perms || []).includes('read')" @update:checked="(c:boolean)=>toggleToolPerm(tool,'read',c)" />{{ t('settings.mcp.serverForm.autoApproveRead') }}
+              </label>
+              <label class="flex items-center gap-1 text-xs">
+                <Checkbox :checked="(perms || []).includes('write')" @update:checked="(c:boolean)=>toggleToolPerm(tool,'write',c)" />{{ t('settings.mcp.serverForm.autoApproveWrite') }}
+              </label>
+              <label class="flex items-center gap-1 text-xs">
+                <Checkbox :checked="(perms || []).includes('all')" @update:checked="(c:boolean)=>toggleToolPerm(tool,'all',c)" />{{ t('settings.mcp.serverForm.autoApproveAll') }}
+              </label>
+              <Button type="button" size="sm" variant="outline" @click="removeToolsAutoApprove(tool)">{{ t('common.delete') }}</Button>
+            </div>
+            <div v-if="Object.keys(toolsAutoApproveMap).length === 0" class="text-xs text-muted-foreground">
+              {{ t('settings.mcp.serverForm.perToolNoRules') }}
+            </div>
+          </div>
         </div>
 
         <!-- MCP Marketplace 入口 -->

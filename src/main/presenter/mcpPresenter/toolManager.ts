@@ -20,65 +20,19 @@ export class ToolManager {
   private cachedToolDefinitions: MCPToolDefinition[] | null = null
   private toolNameToTargetMap: Map<string, { client: McpClient; originalName: string }> | null =
     null
-  // 一次性授权（基于 nonce）：nonce -> { server, tool, perm, expiresAt }
-  private tempApprovalsByNonce: Map<
-    string,
-    { serverName: string; toolName: string; perm: 'read' | 'write'; expiresAt: number }
-  > = new Map()
-  private nonceOrder: string[] = [] // FIFO 驱逐顺序
-  // 快速索引：server|tool -> nonce（仅作为同一 nonce 的次级索引，命中后仍以 nonce 主表为准）
-  private pendingNonceByServerTool: Map<string, string> = new Map()
-
-  private static readonly NONCE_TTL_MS = 600_000
-  private static readonly NONCE_CAPACITY = 1000
-
-  private cleanupExpiredNonces(): number {
-    const now = Date.now()
-    let removed = 0
-    for (const [k, v] of this.tempApprovalsByNonce.entries()) {
-      if (v.expiresAt <= now) {
-        this.tempApprovalsByNonce.delete(k)
-        const idx = this.nonceOrder.indexOf(k)
-        if (idx >= 0) this.nonceOrder.splice(idx, 1)
-        removed++
-      }
-    }
-    if (removed > 0) {
-      console.log(`[ToolManager] Cleaned ${removed} expired one-time approvals (nonce).`)
-    }
-    return removed
-  }
-
-  private insertNonce(
-    nonce: string,
-    entry: { serverName: string; toolName: string; perm: 'read' | 'write' }
-  ): void {
-    this.cleanupExpiredNonces()
-    // 去重，防止队列膨胀
-    if (this.tempApprovalsByNonce.has(nonce)) {
-      this.nonceOrder = this.nonceOrder.filter((n) => n !== nonce)
-    }
-    const now = Date.now()
-    this.tempApprovalsByNonce.set(nonce, {
-      ...entry,
-      expiresAt: now + ToolManager.NONCE_TTL_MS
-    })
-    this.nonceOrder.push(nonce)
-    // 记录二级索引，便于在模型未携带 nonce 时进行一次性兜底
-    const key = `${entry.serverName}|${entry.toolName}`
-    this.pendingNonceByServerTool.set(key, nonce)
-    while (this.nonceOrder.length > ToolManager.NONCE_CAPACITY) {
-      const oldest = this.nonceOrder.shift()
-      if (!oldest) break
-      if (this.tempApprovalsByNonce.delete(oldest)) {
-        console.log('[ToolManager] Evicted oldest one-time approval (nonce).')
-      }
-    }
-  }
+  // 一次性授权：server|tool -> 'read'|'write'（消费即失效）
+  private oneTimeGrantsByServerTool: Map<string, 'read' | 'write'> = new Map()
 
   private covers(granted: 'read' | 'write', required: 'read' | 'write' | 'all'): boolean {
     const req = required === 'all' ? 'write' : required
     return granted === 'write' || granted === req
+  }
+
+  private coversList(list: string[] | undefined, required: 'read' | 'write' | 'all'): boolean {
+    if (!list || list.length === 0) return false
+    if (list.includes('all')) return true
+    const req = required === 'all' ? 'write' : required
+    return list.includes('write') || list.includes(req)
   }
 
   constructor(configPresenter: IConfigPresenter, serverManager: ServerManager) {
@@ -86,6 +40,76 @@ export class ToolManager {
     this.serverManager = serverManager
     eventBus.on(MCP_EVENTS.CLIENT_LIST_UPDATED, this.handleServerListUpdate)
     eventBus.on(MCP_EVENTS.CONFIG_CHANGED, this.handleConfigChange)
+  }
+
+  // Lightweight Auth Decider within ToolManager
+  // Priority: LLM suggested permission (args.required_permission/required_privilege) -> toolsAutoApprove (server+tool) -> server.autoApprove -> heuristic fallback
+  public async decidePermission(
+    serverName: string,
+    toolName: string,
+    argsString?: string | null
+  ): Promise<{
+    decision: 'AUTO_GRANT' | 'AUTO_DENY' | 'REQUIRE_USER_PERMISSION'
+    required: 'read' | 'write' | 'all'
+  }> {
+    // Parse args safely
+    let args: Record<string, unknown> | null = null
+    if (argsString && typeof argsString === 'string') {
+      try {
+        args = JSON.parse(argsString)
+      } catch {
+        try {
+          args = JSON.parse(jsonrepair(argsString))
+        } catch {
+          args = null
+        }
+      }
+    }
+
+    // 1) LLM-suggested permission
+    const rawReq = (args &&
+      ((args as any)['required_permission'] || (args as any)['required_privilege'])) as
+      | 'read'
+      | 'write'
+      | 'all'
+      | undefined
+    const required: 'read' | 'write' | 'all' =
+      rawReq === 'read' || rawReq === 'write' || rawReq === 'all'
+        ? rawReq
+        : this.determinePermissionType(toolName, args)
+
+    // 2) toolsAutoApprove (server + tool) or server.autoApprove
+    try {
+      const servers = await this.configPresenter.getMcpServers()
+      const serverCfg = servers[serverName]
+      const toolsAutoApprove = (serverCfg as any)?.toolsAutoApprove as
+        | Record<string, Array<'read' | 'write' | 'all'>>
+        | undefined
+      const taa = toolsAutoApprove && toolsAutoApprove[toolName]
+      const perToolCovers = this.coversList(taa, required)
+      const serverAuto = serverCfg?.autoApprove || []
+      const serverCovers = this.coversList(serverAuto, required)
+
+      console.log('[ToolManager/AuthDecider]', {
+        server: serverName,
+        tool: toolName,
+        required,
+        perToolCovers,
+        serverCovers
+      })
+
+      if (perToolCovers || serverCovers) {
+        return { decision: 'AUTO_GRANT', required }
+      }
+    } catch {}
+
+    // 3) Heuristic fallback: be conservative — require user permission
+    console.log('[ToolManager/AuthDecider] Require user permission', {
+      server: serverName,
+      tool: toolName,
+      required
+    })
+    return { decision: 'REQUIRE_USER_PERMISSION', required }
   }
 
   private handleServerListUpdate = (): void => {
@@ -467,7 +491,7 @@ export class ToolManager {
       const finalName = toolCall.function.name
       const argsString = toolCall.function.arguments
 
-      // Unified call log (avoid duplicate noisy logs)
+      // Full arguments logging (debug)
       console.info('[MCP] Call', {
         toolCallId: toolCall.id,
         tool: finalName,
@@ -501,7 +525,7 @@ export class ToolManager {
       const { client: targetClient, originalName } = targetInfo
       const toolServerName = targetClient.serverName
 
-      // Log the call details including original name
+      // Log the call details including original name (full)
       console.info('[MCP] ToolManager calling tool', {
         requestedName: finalName,
         originalName: originalName,
@@ -542,76 +566,14 @@ export class ToolManager {
       const autoApprove = serverConfig?.autoApprove || []
       // 先计算本次调用的 Required（结合显式 required_permission 与启发式）
       const requiredPermission = this.determinePermissionType(originalName, args)
-      // 一次性授权（nonce 优先）
+      // 一次性授权：server|tool 维度消费
       let hasPermission = false
-      try {
-        const nonce = (args && (args as Record<string, unknown>)['approval_nonce']) as
-          | string
-          | undefined
-        if (nonce) {
-          this.cleanupExpiredNonces()
-          const entry = this.tempApprovalsByNonce.get(nonce)
-          if (
-            entry &&
-            entry.serverName === toolServerName &&
-            entry.toolName === originalName &&
-            this.covers(entry.perm, requiredPermission)
-          ) {
-            hasPermission = true
-            this.tempApprovalsByNonce.delete(nonce)
-            const idx = this.nonceOrder.indexOf(nonce)
-            if (idx >= 0) this.nonceOrder.splice(idx, 1)
-            console.log('[ToolManager] One-time nonce approval consumed.')
-            // 清理二级索引
-            const key = `${toolServerName}|${originalName}`
-            const current = this.pendingNonceByServerTool.get(key)
-            if (current === nonce) this.pendingNonceByServerTool.delete(key)
-          } else {
-            // 记录失配原因，帮助调试
-            if (!entry) {
-              console.info('[ToolManager] approval_nonce present but not found or expired')
-            } else if (entry.serverName !== toolServerName || entry.toolName !== originalName) {
-              console.info('[ToolManager] approval_nonce server/tool mismatch', {
-                expected: { server: entry.serverName, tool: entry.toolName },
-                got: { server: toolServerName, tool: originalName }
-              })
-            } else if (!this.covers(entry.perm, requiredPermission)) {
-              console.info('[ToolManager] approval_nonce permission mismatch', {
-                granted: entry.perm,
-                required: requiredPermission
-              })
-            }
-          }
-          // 为兼容严格 schema 的服务，转发前移除该字段（无论是否命中）
-          try {
-            delete (args as Record<string, unknown>)['approval_nonce']
-          } catch {}
-        }
-      } catch (e) {
-        console.warn('[ToolManager] Failed to check approval_nonce:', e)
-      }
-
-      // 兜底：若模型未携带 nonce，但我们刚授予过该 server/tool 的一次性 nonce，则尝试消费
-      if (!hasPermission) {
-        const key = `${toolServerName}|${originalName}`
-        const pending = this.pendingNonceByServerTool.get(key)
-        if (pending) {
-          this.cleanupExpiredNonces()
-          const entry = this.tempApprovalsByNonce.get(pending)
-          if (entry && this.covers(entry.perm, requiredPermission)) {
-            hasPermission = true
-            this.tempApprovalsByNonce.delete(pending)
-            const idx = this.nonceOrder.indexOf(pending)
-            if (idx >= 0) this.nonceOrder.splice(idx, 1)
-            this.pendingNonceByServerTool.delete(key)
-            console.log(
-              '[ToolManager] One-time nonce approval consumed via server/tool fallback (no nonce in args).'
-            )
-          } else if (!entry) {
-            // 映射已过期，清理二级索引，避免反复无效匹配
-            this.pendingNonceByServerTool.delete(key)
-          }
-        }
+      const otKey = `${toolServerName}|${originalName}`
+      const oneTime = this.oneTimeGrantsByServerTool.get(otKey)
+      if (oneTime && this.covers(oneTime, requiredPermission)) {
+        hasPermission = true
+        this.oneTimeGrantsByServerTool.delete(otKey)
+        console.log('[ToolManager] One-time grant consumed (server/tool).')
       }
       if (!hasPermission) {
         // Use originalName for permission check (silent)
@@ -653,15 +615,20 @@ export class ToolManager {
         }
       }
 
-      // 在转发前移除 approval_nonce（若仍存在），以兼容严格 schema 的外部服务
-      try {
-        if (args && Object.prototype.hasOwnProperty.call(args, 'approval_nonce')) {
-          delete (args as Record<string, unknown>)['approval_nonce']
-        }
-      } catch {}
-
       // Call the tool on the target client using the ORIGINAL name
       const result = await targetClient.callTool(originalName, args || {})
+      const anyRes = result as unknown as { structured_content?: any }
+      const exitCode = (() => {
+        try {
+          return anyRes &&
+            anyRes.structured_content &&
+            typeof anyRes.structured_content.exit_code === 'number'
+            ? (anyRes.structured_content.exit_code as number)
+            : undefined
+        } catch {
+          return undefined
+        }
+      })()
 
       // Format response
       let formattedContent: string | MCPContentItem[] = ''
@@ -687,11 +654,18 @@ export class ToolManager {
       const response: MCPToolResponse = {
         toolCallId: toolCall.id,
         content: formattedContent,
-        isError: result.isError
+        isError: result.isError || (typeof exitCode === 'number' && exitCode !== 0)
       }
 
-      // Log tool result with safe, high-fidelity preview
+      // Log tool result with full content for debugging
       try {
+        try {
+          console.info('[MCP] Tool full result', JSON.stringify(result, null, 2))
+        } catch {
+          console.info('[MCP] Tool full result (raw object printed next):')
+          // eslint-disable-next-line no-console
+          console.info(result)
+        }
         const MAX_LOG_CHARS = 1000
         const summarizeArrayContent = (items: unknown[]): unknown => {
           // Only log types and short previews to avoid huge dumps
@@ -829,26 +803,49 @@ export class ToolManager {
     serverName: string,
     permissionType: 'read' | 'write' | 'all',
     remember: boolean = true,
-    toolName?: string,
-    approvalNonce?: string
+    toolName?: string
   ): Promise<void> {
     console.log(
       `[ToolManager] Granting permission: ${permissionType} for server: ${serverName}, remember: ${remember}`
     )
 
     if (remember) {
-      // Persist to configuration
-      await this.updateServerPermissions(serverName, permissionType)
+      // Persist to configuration (prefer server+tool granularity if toolName provided)
+      try {
+        const servers = await this.configPresenter.getMcpServers()
+        const serverConfig = servers[serverName]
+        if (!serverConfig) throw new Error(`Server config not found: ${serverName}`)
+
+        if (toolName && toolName.trim()) {
+          const cfg: any = { ...serverConfig }
+          const taa: Record<string, Array<'read' | 'write' | 'all'>> = cfg.toolsAutoApprove || {}
+          const list = taa[toolName] || []
+          const eff = permissionType === 'all' ? 'all' : permissionType
+          if (!list.includes(eff)) list.push(eff)
+          taa[toolName] = list
+          cfg.toolsAutoApprove = taa
+          await this.configPresenter.updateMcpServer(serverName, cfg)
+          console.log(`[ToolManager] Updated toolsAutoApprove for ${serverName}/${toolName}:`, list)
+        } else {
+          await this.updateServerPermissions(serverName, permissionType)
+        }
+      } catch (e) {
+        console.warn('[ToolManager] Persist permission failed, fallback to server-level:', e)
+        await this.updateServerPermissions(serverName, permissionType)
+      }
     } else {
-      // One-time permission: nonce-scoped（复述握手）
+      // One-time permission: in-memory server|tool grant
       const effective: 'read' | 'write' = permissionType === 'all' ? 'write' : permissionType
-      if (approvalNonce && toolName) {
-        this.insertNonce(approvalNonce, { serverName, toolName, perm: effective })
-        console.log('[ToolManager] Temporary nonce permission granted.')
-      } else {
-        console.log(
-          '[ToolManager] No nonce provided for one-time approval; will require nonce in follow-up call.'
-        )
+      if (toolName) {
+        let resolvedToolName = toolName
+        try {
+          await this.getAllToolDefinitions()
+          const entry = this.toolNameToTargetMap?.get(toolName)
+          if (entry?.originalName) resolvedToolName = entry.originalName
+        } catch {}
+        const key = `${serverName}|${resolvedToolName}`
+        this.oneTimeGrantsByServerTool.set(key, effective)
+        console.log('[ToolManager] Temporary one-time grant recorded (server/tool).')
       }
     }
   }

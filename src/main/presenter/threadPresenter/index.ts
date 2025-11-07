@@ -37,7 +37,6 @@ import { getFileContext } from './fileContext'
 import { ContentEnricher } from './contentEnricher'
 import { CONVERSATION_EVENTS, STREAM_EVENTS, TAB_EVENTS } from '@/events'
 import { DEFAULT_SETTINGS } from './const'
-import { randomBytes } from 'crypto'
 
 interface GeneratingMessageState {
   message: AssistantMessage
@@ -50,6 +49,8 @@ interface GeneratingMessageState {
   lastReasoningTime: number | null
   isSearching?: boolean
   isCancelled?: boolean
+  // 调试：实例标识，用于追踪同一 messageId 的状态对象更替
+  __id?: number
   totalUsage?: {
     prompt_tokens: number
     completion_tokens: number
@@ -72,8 +73,8 @@ interface GeneratingMessageState {
   flushTimeout?: NodeJS.Timeout
   throttleTimeout?: NodeJS.Timeout
   lastRendererUpdateTime?: number
-  // 最近一次被用户授予权限的 tool_call.id（用于在多权限块场景下精准续写）
-  lastGrantedToolCallId?: string
+  // 防止对同一消息启动并发的 continue 流
+  continuationInProgress?: boolean
 }
 
 export class ThreadPresenter implements IThreadPresenter {
@@ -88,6 +89,14 @@ export class ThreadPresenter implements IThreadPresenter {
   private searchingMessages: Set<string> = new Set()
   private activeConversationIds: Map<number, string> = new Map()
   private fetchThreadLength: number = 300
+  // 调试：是否输出 Step/权限块摘要与内容快照
+  private static readonly DEBUG_STEP_LOG = false
+  // IO 日志：是否输出工具调用的完整请求与响应
+  private static readonly DEBUG_TOOL_IO_LOG = true
+  // 生成状态对象自增ID
+  private genStateSeq: number = 0
+  // 待执行的 continuation（单位排队，coalesce）
+  private pendingContinuation: Set<string> = new Set()
 
   constructor(
     sqlitePresenter: ISQLitePresenter,
@@ -173,8 +182,145 @@ export class ThreadPresenter implements IThreadPresenter {
         `[ThreadPresenter] Handling LLM agent end for message: ${eventId}, userStop: ${userStop}`
       )
 
+      // 统一准则：以 DB 为准。先刷新当前助手消息的最新内容，避免使用过期的内存态覆盖最新内容
+      try {
+        const latest = await this.messageManager.getMessage(eventId)
+        if (latest && latest.role === 'assistant') {
+          state.message.content = latest.content as AssistantMessageBlock[]
+        }
+      } catch (e) {
+        console.warn('[ThreadPresenter] Failed to refresh latest message before END handling:', e)
+      }
+
+      // NEW (collect-only): If provider sent planned_tool_calls at END, create permission blocks once
+      try {
+        let planned = (
+          msg as unknown as {
+            planned_tool_calls?: { id: string; name: string; arguments: string }[]
+          }
+        ).planned_tool_calls
+        if (planned && Array.isArray(planned) && planned.length > 0) {
+          console.log(
+            `[Permission] planned_tool_calls at END for message ${eventId}:`,
+            planned.map((p) => p.name)
+          )
+          // 不做 planned 去重过滤，保持最小流程，交由后续授权/执行阶段自然处理
+          // Resolve server info by tool name
+          let toolDefs: Array<{
+            function: { name: string }
+            server: { name: string; icons: string; description: string }
+          }> = []
+          try {
+            toolDefs = await presenter.mcpPresenter.getAllToolDefinitions()
+          } catch (e) {
+            console.warn(
+              '[ThreadPresenter] Failed to fetch tool definitions for permission blocks:',
+              e
+            )
+          }
+          const defMap = new Map<
+            string,
+            { server: { name: string; icons: string; description: string } }
+          >()
+          for (const td of toolDefs) defMap.set(td.function.name, { server: td.server })
+
+          const now = Date.now()
+          let pendingCount = 0
+          let grantedCount = 0
+          let deniedCount = 0
+          // 基于最新内容进行合并修改
+          const content = state.message.content as AssistantMessageBlock[]
+          for (const call of planned) {
+            const serverInfo = defMap.get(call.name)?.server
+            const serverName = serverInfo?.name || ''
+            const serverIcons = serverInfo?.icons || ''
+            const serverDescription = serverInfo?.description || ''
+            // Pre-judge via ToolManager Auth Decider
+            let decision: 'AUTO_GRANT' | 'AUTO_DENY' | 'REQUIRE_USER_PERMISSION' =
+              'REQUIRE_USER_PERMISSION'
+            let required: 'read' | 'write' | 'all' = 'write'
+            try {
+              const res = await (presenter.mcpPresenter as any).decideToolCallPermission(
+                serverName,
+                call.name,
+                call.arguments
+              )
+              decision = res.decision
+              required = res.required
+            } catch (e) {
+              console.warn('[ThreadPresenter] Auth decider failed, fallback to pending:', e)
+            }
+
+            const block: AssistantMessageBlock = {
+              type: 'action',
+              action_type: 'tool_call_permission',
+              content: 'Permission required for this operation',
+              status:
+                decision === 'AUTO_GRANT'
+                  ? 'granted'
+                  : decision === 'AUTO_DENY'
+                    ? 'denied'
+                    : 'pending',
+              timestamp: now,
+              tool_call: {
+                id: call.id,
+                name: call.name,
+                params: call.arguments,
+                server_name: serverName,
+                server_icons: serverIcons,
+                server_description: serverDescription
+              },
+              extra: {
+                permissionType: required,
+                serverName,
+                toolName: call.name,
+                needsUserAction: decision === 'REQUIRE_USER_PERMISSION',
+                permissionRequest: JSON.stringify({
+                  toolName: call.name,
+                  serverName,
+                  permissionType: required,
+                  description: 'Permission required for this operation'
+                })
+              }
+            }
+            content.push(block)
+            if (block.status === 'pending') pendingCount++
+            else if (block.status === 'granted') grantedCount++
+            else if (block.status === 'denied') deniedCount++
+          }
+          await this.messageManager.editMessage(eventId, JSON.stringify(content))
+          try {
+            state.message.content = content
+          } catch {}
+          this.logPermissionSummary(state.message.content, `END.inject`, eventId)
+          console.log(
+            `[Permission] Injected ${planned.length} blocks (pending=${pendingCount}, granted=${grantedCount}, denied=${deniedCount}) for message ${eventId}`
+          )
+          // Permission gating: if no pending items, act immediately
+          if (pendingCount === 0) {
+            if (grantedCount >= 1) {
+              // 通知渲染层本轮 Provider 流已结束（确保 UI 刷新并展示已注入的块）
+              eventBus.sendToRenderer(STREAM_EVENTS.END, SendTarget.ALL_WINDOWS, msg)
+              await this.executeGrantedToolsAndContinue(eventId)
+            } else {
+              // 通知渲染层 END，再继续作答流程
+              eventBus.sendToRenderer(STREAM_EVENTS.END, SendTarget.ALL_WINDOWS, msg)
+              await this.continueAfterAllDenied(eventId)
+            }
+            return
+          }
+          // Otherwise keep message in generating state, waiting for user actions
+          // 即便等待用户授权，也需要向渲染层发送 END，触发前端解除“生成中”并刷新消息内容
+          eventBus.sendToRenderer(STREAM_EVENTS.END, SendTarget.ALL_WINDOWS, msg)
+          return
+        }
+      } catch (e) {
+        console.warn('[ThreadPresenter] Failed to handle planned_tool_calls at END:', e)
+      }
+
       // 检查是否有未处理的权限请求
-      const hasPendingPermissions = state.message.content.some(
+      // 基于最新 DB 刷新后的内容判断 pending
+      const hasPendingPermissions = (state.message.content as AssistantMessageBlock[]).some(
         (block) =>
           block.type === 'action' &&
           block.action_type === 'tool_call_permission' &&
@@ -182,12 +328,11 @@ export class ThreadPresenter implements IThreadPresenter {
       )
 
       if (hasPendingPermissions) {
-        console.log(
-          `[ThreadPresenter] Message ${eventId} has pending permissions, keeping in generating state`
-        )
+        console.log(`[Permission] Pending permissions, keep generating (message ${eventId})`)
         // 保持消息在generating状态，等待权限响应
         // 但是要更新非权限块为success状态
-        state.message.content.forEach((block) => {
+        const content = state.message.content as AssistantMessageBlock[]
+        content.forEach((block) => {
           if (
             !(block.type === 'action' && block.action_type === 'tool_call_permission') &&
             block.status === 'loading'
@@ -195,13 +340,19 @@ export class ThreadPresenter implements IThreadPresenter {
             block.status = 'success'
           }
         })
-        await this.messageManager.editMessage(eventId, JSON.stringify(state.message.content))
+        await this.messageManager.editMessage(eventId, JSON.stringify(content))
+        try {
+          state.message.content = content
+        } catch {}
+        this.logPermissionSummary(state.message.content, `END.pending`, eventId)
+        // 处于 pending 状态同样需要向渲染层发送 END，让前端显示授权块并解除“生成中”
+        eventBus.sendToRenderer(STREAM_EVENTS.END, SendTarget.ALL_WINDOWS, msg)
         return
       }
 
-      console.log(`[ThreadPresenter] Finalizing message ${eventId} - no pending permissions`)
+      console.log(`[Thread] Finalizing message ${eventId} - no pending permissions`)
 
-      // 正常完成流程
+      // 正常完成流程（无 pending 权限块）
       await this.finalizeMessage(state, eventId, userStop || false)
     }
 
@@ -228,13 +379,23 @@ export class ThreadPresenter implements IThreadPresenter {
     eventId: string,
     userStop: boolean
   ): Promise<void> {
-    // 将所有块设为success状态，但保留权限块的状态
+    if (ThreadPresenter.DEBUG_STEP_LOG) {
+      try {
+        console.log('[Step/Finalize/Before]', {
+          messageId: eventId,
+          blocks: state.message.content?.length || 0
+        })
+      } catch {}
+    }
+    // 仅将内容类块设为 success；不触碰 tool_call 与权限块
     state.message.content.forEach((block) => {
-      if (block.type === 'action' && block.action_type === 'tool_call_permission') {
-        // 权限块保持其当前状态（granted/denied/error）
-        return
+      if (
+        block.type === 'content' ||
+        block.type === 'reasoning_content' ||
+        block.type === 'image'
+      ) {
+        block.status = 'success'
       }
-      block.status = 'success'
     })
 
     // 计算completion tokens
@@ -309,6 +470,15 @@ export class ThreadPresenter implements IThreadPresenter {
     await this.messageManager.editMessage(eventId, JSON.stringify(state.message.content))
     this.generatingMessages.delete(eventId)
 
+    if (ThreadPresenter.DEBUG_STEP_LOG) {
+      try {
+        console.log('[Step/Finalize/After]', {
+          messageId: eventId,
+          contentSnapshot: JSON.stringify(state.message.content).slice(0, 4000)
+        })
+      } catch {}
+    }
+
     // 处理标题更新和会话更新
     await this.handleConversationUpdates(state)
 
@@ -347,10 +517,12 @@ export class ThreadPresenter implements IThreadPresenter {
           updatedAt: Date.now()
         })
         .then(() => {
-          console.log('updated conv time', state.conversationId)
+          // updated conv time (quiet)
         })
       await this.broadcastThreadListUpdate()
     }
+
+    // 无跨会话去重签名清理（已移除去重机制）
   }
 
   // 释放缓冲的内容
@@ -558,17 +730,14 @@ export class ThreadPresenter implements IThreadPresenter {
         : undefined
 
     if (lastBlock) {
+      // 不自动修改权限请求块的状态；也不改进行中的工具块
       if (
-        lastBlock.type === 'action' &&
-        lastBlock.action_type === 'tool_call_permission' &&
-        lastBlock.status === 'pending'
+        (lastBlock.type === 'action' && lastBlock.action_type === 'tool_call_permission') ||
+        (lastBlock.type === 'tool_call' && lastBlock.status === 'loading')
       ) {
-        lastBlock.status = 'granted'
         return
       }
-      if (!(lastBlock.type === 'tool_call' && lastBlock.status === 'loading')) {
-        lastBlock.status = 'success'
-      }
+      lastBlock.status = 'success'
     }
   }
 
@@ -817,44 +986,10 @@ export class ThreadPresenter implements IThreadPresenter {
             }
           }
         } else if (tool_call === 'permission-required') {
-          // 处理权限请求：创建权限请求块
-          // 注意：不调用finalizeLastBlock，因为工具调用还没有完成，在等待权限
-
-          // 从 msg 中获取权限请求信息
-          const { permission_request } = msg
-
-          state.message.content.push({
-            type: 'action',
-            action_type: 'tool_call_permission',
-            content:
-              typeof tool_call_response === 'string'
-                ? tool_call_response
-                : 'Permission required for this operation',
-            status: 'pending',
-            timestamp: currentTime,
-            tool_call: {
-              id: tool_call_id,
-              name: tool_call_name,
-              params: tool_call_params || '',
-              server_name: tool_call_server_name,
-              server_icons: tool_call_server_icons,
-              server_description: tool_call_server_description
-            },
-            extra: {
-              permissionType: permission_request?.permissionType || 'write',
-              serverName: permission_request?.serverName || tool_call_server_name || '',
-              toolName: permission_request?.toolName || tool_call_name || '',
-              needsUserAction: true,
-              permissionRequest: JSON.stringify(
-                permission_request || {
-                  toolName: tool_call_name || '',
-                  serverName: tool_call_server_name || '',
-                  permissionType: 'write' as const,
-                  description: 'Permission required for this operation'
-                }
-              )
-            }
-          })
+          // legacy path (provider-side permission interception) is no longer used in collect-only mode
+          console.warn(
+            '[ThreadPresenter] Ignoring legacy permission-required event in collect-only mode'
+          )
         } else if (tool_call === 'end' || tool_call === 'error') {
           // 查找对应的工具调用块
           const toolCallBlock = state.message.content.find(
@@ -869,20 +1004,18 @@ export class ThreadPresenter implements IThreadPresenter {
             if (tool_call === 'error') {
               toolCallBlock.status = 'error'
               if (toolCallBlock.tool_call) {
-                if (typeof tool_call_response === 'string') {
-                  toolCallBlock.tool_call.response = tool_call_response || '执行失败'
-                } else {
-                  toolCallBlock.tool_call.response = JSON.stringify(tool_call_response)
+                const env = {
+                  ok: false,
+                  error: 'tool_execution_error',
+                  data: tool_call_response ?? null
                 }
+                toolCallBlock.tool_call.response = JSON.stringify(env)
               }
             } else {
               toolCallBlock.status = 'success'
               if (toolCallBlock.tool_call) {
-                if (typeof tool_call_response === 'string') {
-                  toolCallBlock.tool_call.response = tool_call_response
-                } else {
-                  toolCallBlock.tool_call.response = JSON.stringify(tool_call_response)
-                }
+                const env = { ok: true, data: tool_call_response ?? null }
+                toolCallBlock.tool_call.response = JSON.stringify(env)
               }
             }
           }
@@ -926,6 +1059,9 @@ export class ThreadPresenter implements IThreadPresenter {
 
       // 更新消息内容
       await this.messageManager.editMessage(eventId, JSON.stringify(state.message.content))
+      if (ThreadPresenter.DEBUG_STEP_LOG && tool_call) {
+        this.logPermissionSummary(state.message.content, `STREAM.${tool_call}`, eventId)
+      }
     }
     eventBus.sendToRenderer(STREAM_EVENTS.RESPONSE, SendTarget.ALL_WINDOWS, msg)
   }
@@ -1330,7 +1466,7 @@ export class ThreadPresenter implements IThreadPresenter {
   ): Promise<AssistantMessage | null> {
     const conversation = await this.getConversation(conversationId)
     const { providerId, modelId } = conversation.settings
-    console.log('sendMessage', conversation)
+    // sendMessage (quiet)
     const message = await this.messageManager.sendMessage(
       conversationId,
       content,
@@ -1359,8 +1495,10 @@ export class ThreadPresenter implements IThreadPresenter {
         promptTokens: 0,
         reasoningStartTime: null,
         reasoningEndTime: null,
-        lastReasoningTime: null
+        lastReasoningTime: null,
+        __id: ++this.genStateSeq
       })
+      // state created (quiet)
 
       // 检查是否是新会话的第一条消息
       const { list: messages } = await this.getMessages(conversationId, 1, 2)
@@ -1597,7 +1735,6 @@ export class ThreadPresenter implements IThreadPresenter {
       // 重写搜索查询
       searchBlock.status = 'optimizing'
       await this.messageManager.editMessage(messageId, JSON.stringify(state.message.content))
-      console.log('optimizing')
 
       const optimizedQuery = await this.rewriteUserSearchQuery(
         query,
@@ -1700,7 +1837,8 @@ export class ThreadPresenter implements IThreadPresenter {
   async startStreamCompletion(
     conversationId: string,
     queryMsgId?: string,
-    selectedVariantsMap?: Record<string, string>
+    selectedVariantsMap?: Record<string, string>,
+    contextMode?: 'msg_retry' | 'toolcall_continue'
   ) {
     const state = this.findGeneratingState(conversationId)
     if (!state) {
@@ -1715,7 +1853,8 @@ export class ThreadPresenter implements IThreadPresenter {
       const { conversation, userMessage, contextMessages } = await this.prepareConversationContext(
         conversationId,
         queryMsgId,
-        selectedVariantsMap
+        selectedVariantsMap,
+        contextMode
       )
 
       const { providerId, modelId } = conversation.settings
@@ -1903,7 +2042,8 @@ export class ThreadPresenter implements IThreadPresenter {
       const { conversation, contextMessages, userMessage } = await this.prepareConversationContext(
         conversationId,
         state.message.id,
-        selectedVariantsMap
+        selectedVariantsMap,
+        'toolcall_continue'
       )
 
       // 检查是否已被取消
@@ -2034,7 +2174,8 @@ export class ThreadPresenter implements IThreadPresenter {
   private async prepareConversationContext(
     conversationId: string,
     queryMsgId?: string,
-    selectedVariantsMap?: Record<string, string>
+    selectedVariantsMap?: Record<string, string>,
+    contextMode?: 'msg_retry' | 'toolcall_continue'
   ): Promise<{
     conversation: CONVERSATION
     userMessage: Message
@@ -2043,8 +2184,13 @@ export class ThreadPresenter implements IThreadPresenter {
     const conversation = await this.getConversation(conversationId)
     let contextMessages: Message[] = []
     let userMessage: Message | null = null
+    let assistantMessageForR2: Message | null = null
+    let retryAssistantId: string | null = null
 
     if (queryMsgId) {
+      try {
+        console.log('[Context/Mode]', { mode: contextMode || 'default' })
+      } catch {}
       // 处理指定消息ID的情况
       const queryMessage = await this.getMessage(queryMsgId)
       if (!queryMessage) {
@@ -2064,6 +2210,13 @@ export class ThreadPresenter implements IThreadPresenter {
         if (!userMessage) {
           throw new Error('找不到触发消息')
         }
+        // 标记当前助手消息（用于 R2 回放工具结果）
+        // 注意：当 contextMode 为 msg_retry 时，不进行 R2 回放注入
+        assistantMessageForR2 = contextMode === 'msg_retry' ? null : queryMessage
+        // msg_retry 下记录被重试的助手消息ID，用于后续变体替换跳过
+        if (contextMode === 'msg_retry') {
+          retryAssistantId = queryMessage.id
+        }
       } else {
         throw new Error('不支持的消息类型')
       }
@@ -2072,6 +2225,56 @@ export class ThreadPresenter implements IThreadPresenter {
         userMessage.id,
         conversation.settings.contextLength
       )
+
+      // R2 上下文选择范围（仅当上一条助手消息包含已完成的 tool_call 结果时，将其注入上下文用于回放）。
+      try {
+        console.log('[R2/ContextPick]', {
+          queryMsgId,
+          resolvedUserMsgId: userMessage.id,
+          baseContextCount: contextMessages.length
+        })
+      } catch {}
+
+      if (assistantMessageForR2 && Array.isArray(assistantMessageForR2.content)) {
+        const blocks = assistantMessageForR2.content as AssistantMessageBlock[]
+        // 判断是否存在可回放的 tool_call 结果：id/name/params 存在，且 response 非空或块状态为 success/error
+        const hasRePlayableTool = blocks.some((b) => {
+          if (b.type !== 'tool_call' || !b.tool_call) return false
+          const idOk = Boolean(b.tool_call.id && String(b.tool_call.id).trim())
+          const nameOk = Boolean(b.tool_call.name && String(b.tool_call.name).trim())
+          const paramsOk = Boolean(b.tool_call.params && String(b.tool_call.params).trim())
+          const respOk = Boolean(b.tool_call.response && String(b.tool_call.response).trim())
+          const statusOk = b.status === 'success' || b.status === 'error'
+          return idOk && nameOk && paramsOk && (respOk || statusOk)
+        })
+
+        if (hasRePlayableTool) {
+          // 深拷贝注入，并强制标记为 sent 以避免被 selectContextMessages 过滤掉
+          const injected = JSON.parse(JSON.stringify(assistantMessageForR2)) as Message
+          ;(injected as any).status = 'sent'
+          ;(injected as any).__r2Injected = true
+          contextMessages.push(injected)
+          try {
+            const variant = (injected as any).is_variant ? 'variant' : 'main'
+            console.log('[R2/UseCurrent]', {
+              assistantId: injected.id,
+              variant
+            })
+          } catch {}
+          try {
+            console.log('[R2/ContextPick] InjectedAssistantForReplay', {
+              injectedId: injected.id,
+              newContextCount: contextMessages.length
+            })
+          } catch {}
+        } else {
+          try {
+            console.log('[R2/ContextPick] NoRePlayableToolInAssistant', {
+              assistantId: assistantMessageForR2.id
+            })
+          } catch {}
+        }
+      }
     } else {
       // 获取最新的用户消息
       userMessage = await this.getLastUserMessage(conversationId)
@@ -2083,26 +2286,25 @@ export class ThreadPresenter implements IThreadPresenter {
 
     // 在获取原始 contextMessages 列表之后，但在将其传递给 LLM 上下文筛选和格式化函数之前，
     // 插入核心“变体内容和元数据替换”逻辑。
+    // 变体替换：
+    // - 允许在 msg_retry 下对“边界之前”的历史消息执行变体替换
+    // - 但跳过：被重试的助手消息（retryAssistantId）与任何回放注入的消息（__r2Injected）
     if (selectedVariantsMap && Object.keys(selectedVariantsMap).length > 0) {
       contextMessages = contextMessages.map((msg) => {
+        if ((msg as any).__r2Injected) return msg
+        if (retryAssistantId && msg.id === retryAssistantId) return msg
         if (msg.role === 'assistant' && selectedVariantsMap[msg.id] && msg.variants) {
           const selectedVariantId = selectedVariantsMap[msg.id]
           const selectedVariant = msg.variants.find((v) => v.id === selectedVariantId)
-
           if (selectedVariant) {
-            // 创建一个新的 Message 对象副本，并用变体的内容和元数据替换
-            // 使用深拷贝以避免意外修改原始对象
             const newMsg = JSON.parse(JSON.stringify(msg))
             newMsg.content = selectedVariant.content
             newMsg.usage = selectedVariant.usage
             newMsg.model_id = selectedVariant.model_id
             newMsg.model_provider = selectedVariant.model_provider
-            // 返回修改后的副本
             return newMsg
           }
-          // 防御性代码：如果找不到变体，则静默回退到使用原始主消息
         }
-        // 对于非助手消息或没有选择变体的助手消息，返回原始消息
         return msg
       })
     }
@@ -2240,8 +2442,28 @@ export class ThreadPresenter implements IThreadPresenter {
           imageFiles.reduce((acc, file) => acc + file.token, 0)
       }
     }
-    // console.log('preparePromptContent', mergedMessages, promptTokens)
+    // R1/R2 输入摘要（仅元信息，便于核对回放是否匹配规范）
+    try {
+      const toolCallIds: string[] = []
+      const toolIds: string[] = []
+      for (const m of mergedMessages) {
+        if ((m as any).tool_calls && Array.isArray((m as any).tool_calls)) {
+          for (const tc of (m as any).tool_calls) toolCallIds.push(tc.id)
+        }
+        if ((m as any).tool_call_id) toolIds.push((m as any).tool_call_id)
+      }
+      const missingPairs = toolCallIds.filter((id) => !toolIds.includes(id))
+      console.log('[ContextSummary]', {
+        supportsFunctionCall,
+        assistantToolCalls: toolCallIds.map((s) => (s || '').slice(0, 8)),
+        toolMessages: toolIds.map((s) => (s || '').slice(0, 8)),
+        missingPairs: missingPairs.map((s) => (s || '').slice(0, 8)),
+        totalMessages: mergedMessages.length,
+        promptTokens
+      })
+    } catch {}
 
+    // 为避免日志过长，默认不打印完整 ContextDump。需要时可临时恢复。
     return { finalContent: mergedMessages, promptTokens }
   }
 
@@ -2251,11 +2473,41 @@ export class ThreadPresenter implements IThreadPresenter {
     userMessage: Message,
     remainingContextLength: number
   ): Message[] {
-    if (remainingContextLength <= 0) {
-      return []
+    // R2 专用：如存在为回放注入的助手消息（携带工具结果），先从候选集中剔除，避免它参与预算筛选
+    const injectedAssistant = contextMessages.find((msg) => (msg as any).__r2Injected === true)
+
+    // 预算预留：为回放消息（injectedAssistant）预先扣减 token，确保稍后强制追加不会挤爆预算
+    // 说明：工具结果的摘要/裁剪由 MCP 工具自行负责；此处只做预算预留，不做内容裁剪。
+    let adjustedBudget = remainingContextLength
+    if (injectedAssistant) {
+      try {
+        const injectedTokens = approximateTokenSize(
+          JSON.stringify((injectedAssistant as any).content)
+        )
+        adjustedBudget = Math.max(0, remainingContextLength - injectedTokens)
+        try {
+          console.log('[R2/Budget]', {
+            injectedTokens,
+            remainingContextLength,
+            adjustedBudget
+          })
+        } catch {}
+      } catch {
+        // 忽略个别 stringify 异常，保持原预算
+      }
     }
 
-    const messages = contextMessages.filter((msg) => msg.id !== userMessage?.id).reverse()
+    // 若总体预算不够，但存在必须回放的注入消息，仍然返回该注入消息，确保 R2 能看到工具结果
+    if (adjustedBudget <= 0) {
+      return injectedAssistant ? [injectedAssistant] : []
+    }
+
+    const messages = contextMessages
+      .filter(
+        (msg) =>
+          msg.id !== userMessage?.id && (!injectedAssistant || msg.id !== injectedAssistant.id)
+      )
+      .reverse()
 
     let currentLength = 0
     const selectedMessages: Message[] = []
@@ -2276,7 +2528,7 @@ export class ThreadPresenter implements IThreadPresenter {
           : JSON.stringify(msg.content)
       )
 
-      if (currentLength + msgTokens <= remainingContextLength) {
+      if (currentLength + msgTokens <= adjustedBudget) {
         // 如果是用户消息且有 content 但没有 text，添加 text
         if (msg.role === 'user') {
           const userMsgContent = msg.content as UserMessageContent
@@ -2293,6 +2545,18 @@ export class ThreadPresenter implements IThreadPresenter {
     }
     while (selectedMessages.length > 0 && selectedMessages[0].role !== 'user') {
       selectedMessages.shift()
+    }
+
+    // R2 专用：将为回放注入的助手消息追加到结果末尾
+    // 备注：此处可能造成极小概率的 token 预算突破，但这是为了保证 R2 能完整回放上一条工具结果（对普通请求无影响）
+    if (injectedAssistant) {
+      selectedMessages.push(injectedAssistant)
+      try {
+        console.log('[R2/ContextPick/Final]', {
+          injectedAssistantAppended: true,
+          selectedCount: selectedMessages.length
+        })
+      } catch {}
     }
     return selectedMessages
   }
@@ -2311,10 +2575,14 @@ export class ThreadPresenter implements IThreadPresenter {
   ): ChatMessage[] {
     const formattedMessages: ChatMessage[] = []
 
-    // 添加上下文消息
-    formattedMessages.push(
-      ...this.addContextMessages(contextMessages, vision, supportsFunctionCall)
-    )
+    // 在存在回放注入（__r2Injected）时，确保顺序：system -> 历史(不含注入) -> user -> 回放(注入)
+    const injected = contextMessages.find((m) => (m as any).__r2Injected === true)
+    const nonInjected = injected
+      ? contextMessages.filter((m) => !(m as any).__r2Injected)
+      : contextMessages
+
+    // 先追加历史（不含注入回放）
+    formattedMessages.push(...this.addContextMessages(nonInjected, vision, supportsFunctionCall))
 
     // 添加系统提示
     if (systemPrompt) {
@@ -2326,7 +2594,7 @@ export class ThreadPresenter implements IThreadPresenter {
       // console.log('-------------> system prompt \n', systemPrompt, artifacts, formattedMessages)
     }
 
-    // 添加当前用户消息
+    // 添加当前用户消息（放在回放注入之前）
     let finalContent = searchPrompt || userContent
 
     if (enrichedUserMessage) {
@@ -2348,6 +2616,11 @@ export class ThreadPresenter implements IThreadPresenter {
         role: 'user',
         content: finalContent.trim()
       })
+    }
+
+    // 如果存在回放注入，则最后追加回放（S1 文本 + 工具对）
+    if (injected) {
+      formattedMessages.push(...this.addContextMessages([injected], vision, supportsFunctionCall))
     }
 
     return formattedMessages
@@ -2390,6 +2663,7 @@ export class ThreadPresenter implements IThreadPresenter {
           })
         } else if (msg.role === 'assistant') {
           // 处理助手消息
+          // 注入与否不改变回放顺序（均先文本、后工具对）
           let afterSearch = false
           const assistantBlocks = msg.content as AssistantMessageBlock[]
           for (const subMsg of assistantBlocks) {
@@ -2400,6 +2674,16 @@ export class ThreadPresenter implements IThreadPresenter {
               subMsg?.tool_call?.params?.trim() &&
               subMsg?.tool_call?.response?.trim()
             ) {
+              try {
+                const paramsLen = subMsg.tool_call?.params ? subMsg.tool_call.params.length : 0
+                const respLen = subMsg.tool_call?.response ? subMsg.tool_call.response.length : 0
+                console.log('[R2Context/SupportsFC/ReplayPair]', {
+                  toolCallId: subMsg.tool_call?.id,
+                  name: subMsg.tool_call?.name,
+                  paramsLength: paramsLen,
+                  responseLength: respLen
+                })
+              } catch {}
               resultMessages.push({
                 role: 'assistant',
                 tool_calls: [
@@ -2418,11 +2702,30 @@ export class ThreadPresenter implements IThreadPresenter {
                 tool_call_id: subMsg.tool_call.id,
                 content: subMsg.tool_call.response
               })
+            } else if (subMsg.type === 'tool_call') {
+              try {
+                const idOk = Boolean(subMsg.tool_call?.id && String(subMsg.tool_call?.id).trim())
+                const nameOk = Boolean(
+                  subMsg.tool_call?.name && String(subMsg.tool_call?.name).trim()
+                )
+                const paramsOk = Boolean(
+                  subMsg.tool_call?.params && String(subMsg.tool_call?.params).trim()
+                )
+                const respOk = Boolean(
+                  subMsg.tool_call?.response && String(subMsg.tool_call?.response).trim()
+                )
+                console.log('[R2Context/SupportsFC/SkipReason]', {
+                  idOk,
+                  nameOk,
+                  paramsOk,
+                  respOk
+                })
+              } catch {}
             } else if (subMsg.type === 'search') {
               // 删除强制搜索结果中遗留的[x]引文标记
               afterSearch = true
             } else if (subMsg.type === 'content') {
-              // 删除强制搜索结果中遗留的[x]引文标记
+              // 原样回放 S1 文本（带清洗）
               let content = subMsg.content ?? ''
               if (afterSearch) content = content.replace(/\[\d+\]/g, '')
               resultMessages.push({
@@ -2651,13 +2954,24 @@ export class ThreadPresenter implements IThreadPresenter {
     state: GeneratingMessageState,
     promptTokens: number
   ): Promise<void> {
-    // 更新生成状态
-    this.generatingMessages.set(state.message.id, {
-      ...state,
-      startTime: Date.now(),
-      firstTokenTime: null,
-      promptTokens
-    })
+    // 原地更新，避免替换对象引用（防止 finally 清标志清到旧对象）
+    const cur = this.generatingMessages.get(state.message.id)
+    if (cur) {
+      cur.startTime = Date.now()
+      cur.firstTokenTime = null
+      cur.promptTokens = promptTokens
+      // 保持 __id 不变
+      // state updated (quiet)
+    } else {
+      this.generatingMessages.set(state.message.id, {
+        ...state,
+        startTime: Date.now(),
+        firstTokenTime: null,
+        promptTokens,
+        __id: state.__id ?? ++this.genStateSeq
+      })
+      // state initialized (quiet)
+    }
 
     // 更新消息的usage信息
     await this.messageManager.updateMessageMetadata(state.message.id, {
@@ -2709,8 +3023,10 @@ export class ThreadPresenter implements IThreadPresenter {
       promptTokens: 0,
       reasoningStartTime: null,
       reasoningEndTime: null,
-      lastReasoningTime: null
+      lastReasoningTime: null,
+      __id: ++this.genStateSeq
     })
+    // state created (quiet)
 
     return assistantMessage as AssistantMessage
   }
@@ -2755,10 +3071,17 @@ export class ThreadPresenter implements IThreadPresenter {
       promptTokens: 0,
       reasoningStartTime: null,
       reasoningEndTime: null,
-      lastReasoningTime: null
+      lastReasoningTime: null,
+      __id: ++this.genStateSeq
     })
+    // state created (quiet)
 
-    this.startStreamCompletion(conversationId, userMessageId, selectedVariantsMap).catch((e) => {
+    this.startStreamCompletion(
+      conversationId,
+      userMessageId,
+      selectedVariantsMap,
+      'msg_retry'
+    ).catch((e) => {
       console.error('Failed to start regeneration from user message:', e)
     })
 
@@ -3911,7 +4234,7 @@ export class ThreadPresenter implements IThreadPresenter {
     permissionType: 'read' | 'write' | 'all',
     remember: boolean = true
   ): Promise<void> {
-    console.log(`[ThreadPresenter] Handling permission response:`, {
+    console.log(`[Permission] Handling response`, {
       messageId,
       toolCallId,
       granted,
@@ -3924,7 +4247,7 @@ export class ThreadPresenter implements IThreadPresenter {
       const message = await this.messageManager.getMessage(messageId)
       if (!message || message.role !== 'assistant') {
         const errorMsg = `Message not found or not an assistant message (messageId: ${messageId})`
-        console.error(`[ThreadPresenter] ${errorMsg}`)
+        console.error(`[Permission] ${errorMsg}`)
         throw new Error(errorMsg)
       }
 
@@ -3938,9 +4261,9 @@ export class ThreadPresenter implements IThreadPresenter {
 
       if (!permissionBlock) {
         const errorMsg = `Permission block not found (messageId: ${messageId}, toolCallId: ${toolCallId})`
-        console.error(`[ThreadPresenter] ${errorMsg}`)
+        console.error(`[Permission] ${errorMsg}`)
         console.error(
-          `[ThreadPresenter] Available blocks:`,
+          `[Permission] Available blocks:`,
           content.map((block) => ({
             type: block.type,
             toolCallId: block.tool_call?.id
@@ -3949,9 +4272,7 @@ export class ThreadPresenter implements IThreadPresenter {
         throw new Error(errorMsg)
       }
 
-      console.log(
-        `[ThreadPresenter] Found permission block for tool: ${permissionBlock.tool_call?.name}`
-      )
+      console.log(`[Permission] Found block for tool: ${permissionBlock.tool_call?.name}`)
 
       // 2. 更新权限块状态
       permissionBlock.status = granted ? 'granted' : 'denied'
@@ -3962,107 +4283,131 @@ export class ThreadPresenter implements IThreadPresenter {
         }
       }
 
-      // 3. 保存消息更新
+      // 2.1 对于单个“拒绝”，同步生成/更新对应的 tool_call 错误结果块，保证每次 FC 都有配对结果
+      if (!granted) {
+        const tc = permissionBlock.tool_call
+        if (tc) {
+          let toolBlock = content.find((b) => b.type === 'tool_call' && b.tool_call?.id === tc.id)
+          if (!toolBlock) {
+            toolBlock = {
+              type: 'tool_call',
+              content: '',
+              status: 'error',
+              timestamp: Date.now(),
+              tool_call: {
+                id: tc.id,
+                name: tc.name,
+                params: tc.params || '',
+                server_name: tc.server_name || (permissionBlock.extra?.serverName as string) || '',
+                server_icons: tc.server_icons || '',
+                server_description: tc.server_description || '',
+                response: JSON.stringify({ ok: false, error: 'permission_denied' })
+              }
+            }
+            content.push(toolBlock)
+          } else {
+            toolBlock.status = 'error'
+            if (toolBlock.tool_call) {
+              // 补齐元信息与错误响应
+              toolBlock.tool_call.name = toolBlock.tool_call.name || tc.name
+              toolBlock.tool_call.params = toolBlock.tool_call.params || tc.params || ''
+              toolBlock.tool_call.server_name =
+                toolBlock.tool_call.server_name ||
+                tc.server_name ||
+                (permissionBlock.extra?.serverName as string) ||
+                ''
+              toolBlock.tool_call.server_icons =
+                toolBlock.tool_call.server_icons || tc.server_icons || ''
+              toolBlock.tool_call.server_description =
+                toolBlock.tool_call.server_description || tc.server_description || ''
+              toolBlock.tool_call.response = JSON.stringify({
+                ok: false,
+                error: 'permission_denied'
+              })
+            }
+          }
+        }
+      }
+
+      // 3. 保存消息更新（以 DB 为准，合并写库）
       await this.messageManager.editMessage(messageId, JSON.stringify(content))
       // 同步内存态：确保 resumeStreamCompletion 使用到最新的权限块与工具信息
       try {
         const st = this.generatingMessages.get(messageId)
         if (st) st.message.content = content
       } catch {}
-      console.log(`[ThreadPresenter] Updated permission block status to: ${permissionBlock.status}`)
+      console.log(`[Permission] Status updated: ${permissionBlock.status}`)
+
+      // 4. 授权/拒绝后执行“总闸检查”
       try {
-        // 记录最近一次被授予的工具调用 id，避免后续误匹配到旧授权块
-        const st = this.generatingMessages.get(messageId)
-        if (st && granted && permissionBlock.tool_call?.id) {
-          st.lastGrantedToolCallId = permissionBlock.tool_call.id
-        }
-      } catch {}
-
-      if (granted) {
-        // 4. 权限授予流程
-        const serverName = permissionBlock?.extra?.serverName as string
-        if (!serverName) {
-          const errorMsg = `Server name not found in permission block (messageId: ${messageId})`
-          console.error(`[ThreadPresenter] ${errorMsg}`)
-          throw new Error(errorMsg)
-        }
-
-        console.log(
-          `[ThreadPresenter] Granting permission: ${permissionType} for server: ${serverName}`
-        )
-        console.log(
-          `[ThreadPresenter] Waiting for permission configuration to complete before restarting agent loop...`
-        )
-
-        try {
-          // 传入一次性审批口令（approval_nonce），用于复述握手
-          // 优先使用 permissionRequest 中的原始工具名（originalName），避免冲突重命名导致指纹不一致
-          let toolCallName = permissionBlock.tool_call?.name as string | undefined
+        // 记住授权（server 级别）
+        let serverName =
+          (permissionBlock?.extra?.serverName as string) ||
+          (permissionBlock.tool_call?.server_name as string) ||
+          ''
+        // Fallback resolve serverName by tool definition if missing or unknown
+        if (granted) {
           try {
-            const prStr = permissionBlock.extra?.permissionRequest as string | undefined
-            if (prStr && typeof prStr === 'string') {
-              const pr = JSON.parse(prStr) as { toolName?: string }
-              if (pr.toolName && typeof pr.toolName === 'string') {
-                toolCallName = pr.toolName
+            const servers = await this.configPresenter.getMcpServers()
+            if (!serverName || !servers[serverName]) {
+              try {
+                const defs = await presenter.mcpPresenter.getAllToolDefinitions()
+                const found = defs.find((d) => d.function.name === permissionBlock.tool_call?.name)
+                if (found?.server?.name) serverName = found.server.name as string
+              } catch (e) {
+                console.warn('[Permission] Fallback resolve serverName failed:', e)
               }
             }
           } catch {}
-          let approvalNonce: string | undefined
-          if (!remember) {
-            approvalNonce = randomBytes(16).toString('base64url')
-            if (permissionBlock.extra) {
-              ;(permissionBlock.extra as Record<string, unknown>)['approvalNonce'] = approvalNonce
-            }
-            // 立即保存到消息中，供后续复述上下文使用
-            await this.messageManager.editMessage(messageId, JSON.stringify(content))
-            // 同步内存态，避免后续查找 pending tool call 读到旧内容
-            try {
-              const st2 = this.generatingMessages.get(messageId)
-              if (st2) st2.message.content = content
-            } catch {}
-          }
-          await presenter.mcpPresenter.grantPermission(
-            serverName,
-            permissionType,
-            remember,
-            toolCallName,
-            approvalNonce
-          )
-          console.log(`[ThreadPresenter] Permission granted successfully`)
-
-          if (remember) {
-            // 仅在记住时等待服务重启
-            console.log(
-              `[ThreadPresenter] Permission configuration completed, waiting for MCP service restart...`
-            )
-            await this.waitForMcpServiceReady(serverName)
-            console.log(
-              `[ThreadPresenter] MCP service ready, now restarting agent loop for message: ${messageId}`
-            )
-          }
-        } catch (permissionError) {
-          console.error(`[ThreadPresenter] Failed to grant permission:`, permissionError)
-          // 权限授予失败，将状态更新为错误
-          permissionBlock.status = 'error'
-          await this.messageManager.editMessage(messageId, JSON.stringify(content))
+        }
+        if (granted && remember && serverName) {
           try {
-            const st3 = this.generatingMessages.get(messageId)
-            if (st3) st3.message.content = content
-          } catch {}
-          throw permissionError
+            await presenter.mcpPresenter.grantPermission(
+              serverName,
+              permissionType,
+              /* remember */ true,
+              permissionBlock.tool_call?.name
+            )
+          } catch (e) {
+            console.warn('[Permission] Persisting server permission failed:', e)
+          }
+        }
+      } catch {}
+
+      // 授权总闸检查
+      try {
+        const permissionBlocks = content.filter(
+          (b) => b.type === 'action' && b.action_type === 'tool_call_permission'
+        )
+        const pendingCount = permissionBlocks.filter((b) => b.status === 'pending').length
+        const grantedCount = permissionBlocks.filter((b) => b.status === 'granted').length
+        const deniedCount = permissionBlocks.filter((b) => b.status === 'denied').length
+
+        console.log(`[Permission] Gating counts for message ${messageId}:`, {
+          pendingCount,
+          grantedCount,
+          deniedCount
+        })
+
+        if (pendingCount > 0) {
+          // 仍有待处理项，等待后续响应
+          return
         }
 
-        // 5. 现在重启agent loop
-        await this.restartAgentLoopAfterPermission(messageId)
-      } else {
-        console.log(
-          `[ThreadPresenter] Permission denied, ending generation for message: ${messageId}`
-        )
-        // 6. 权限被拒绝 - 正常结束消息
-        await this.finalizeMessageAfterPermissionDenied(messageId)
+        if (grantedCount >= 1) {
+          // 进入统一执行阶段
+          await this.executeGrantedToolsAndContinue(messageId)
+          return
+        }
+
+        // 全部被拒绝：注入说明并触发一次继续作答
+        await this.continueAfterAllDenied(messageId)
+      } catch (gateError) {
+        console.error('[Permission] Gating failed:', gateError)
+        throw gateError
       }
     } catch (error) {
-      console.error(`[ThreadPresenter] Failed to handle permission response:`, error)
+      console.error(`[Permission] Failed to handle response:`, error)
 
       // 确保消息状态正确更新
       try {
@@ -4071,554 +4416,481 @@ export class ThreadPresenter implements IThreadPresenter {
           await this.messageManager.handleMessageError(messageId, String(error))
         }
       } catch (updateError) {
-        console.error(`[ThreadPresenter] Failed to update message error status:`, updateError)
+        console.error(`[Permission] Failed to update message error status:`, updateError)
       }
 
       throw error
     }
   }
 
-  // 重新启动agent loop (权限授予后)
-  private async restartAgentLoopAfterPermission(messageId: string): Promise<void> {
-    console.log(
-      `[ThreadPresenter] Restarting agent loop after permission for message: ${messageId}`
+  // 在全部被拒绝时，注入说明并触发一次继续作答
+  private async continueAfterAllDenied(messageId: string): Promise<void> {
+    const message = await this.messageManager.getMessage(messageId)
+    if (!message || message.role !== 'assistant') return
+
+    const content = message.content as AssistantMessageBlock[]
+    const deniedBlocks = content.filter(
+      (b) =>
+        b.type === 'action' && b.action_type === 'tool_call_permission' && b.status === 'denied'
     )
 
-    try {
-      // 获取消息和会话信息
-      const message = await this.messageManager.getMessage(messageId)
-      if (!message) {
-        const errorMsg = `Message not found (messageId: ${messageId})`
-        console.error(`[ThreadPresenter] ${errorMsg}`)
-        throw new Error(errorMsg)
-      }
-
-      const conversationId = message.conversationId
-      console.log(`[ThreadPresenter] Found message in conversation: ${conversationId}`)
-
-      // 验证权限是否生效 - 获取最新的服务器配置
-      const content = message.content as AssistantMessageBlock[]
-      const permissionBlock = content.find(
-        (block) =>
-          block.type === 'action' &&
-          block.action_type === 'tool_call_permission' &&
-          block.status === 'granted'
-      )
-
-      if (!permissionBlock) {
-        const errorMsg = `No granted permission block found (messageId: ${messageId})`
-        console.error(`[ThreadPresenter] ${errorMsg}`)
-        console.error(
-          `[ThreadPresenter] Available blocks:`,
-          content.map((block) => ({
-            type: block.type,
-            status: block.status,
-            toolCallId: block.tool_call?.id
-          }))
-        )
-        throw new Error(errorMsg)
-      }
-
-      if (permissionBlock?.extra?.serverName) {
-        console.log(
-          `[ThreadPresenter] Verifying permission is active for server: ${permissionBlock.extra.serverName}`
-        )
-        try {
-          const servers = await this.configPresenter.getMcpServers()
-          const serverConfig = servers[permissionBlock.extra.serverName as string]
-          console.log(
-            `[ThreadPresenter] Current server permissions:`,
-            serverConfig?.autoApprove || []
-          )
-        } catch (configError) {
-          console.warn(`[ThreadPresenter] Failed to verify server permissions:`, configError)
+    const now = Date.now()
+    for (const perm of deniedBlocks) {
+      const tc = perm.tool_call
+      if (!tc) continue
+      let toolBlock = content.find((b) => b.type === 'tool_call' && b.tool_call?.id === tc.id)
+      if (!toolBlock) {
+        toolBlock = {
+          type: 'tool_call',
+          content: '',
+          status: 'error',
+          timestamp: now,
+          tool_call: {
+            id: tc.id,
+            name: tc.name,
+            params: tc.params || '',
+            server_name: tc.server_name,
+            server_icons: tc.server_icons,
+            server_description: tc.server_description,
+            response: JSON.stringify({ ok: false, error: 'permission_denied' })
+          }
         }
+        content.push(toolBlock)
+      } else {
+        toolBlock.status = 'error'
+        if (toolBlock.tool_call)
+          toolBlock.tool_call.response = JSON.stringify({ ok: false, error: 'permission_denied' })
       }
+    }
 
-      // 如果消息还在generating状态，直接继续
-      const state = this.generatingMessages.get(messageId)
-      if (state) {
-        console.log(`[ThreadPresenter] Message still in generating state, resuming from memory`)
-        await this.resumeStreamCompletion(conversationId, messageId)
-        return
-      }
+    await this.messageManager.editMessage(messageId, JSON.stringify(content))
 
-      // 否则重新启动完整的agent loop
-      console.log(`[ThreadPresenter] Message not in generating state, starting fresh agent loop`)
+    // 同步内存态，保持与 DB 一致
+    try {
+      const st = this.generatingMessages.get(messageId)
+      if (st) st.message.content = content
+    } catch {}
 
-      // 重新创建生成状态
-      const assistantMessage = message as AssistantMessage
-
+    const conversationId = message.conversationId
+    if (!this.generatingMessages.get(messageId)) {
       this.generatingMessages.set(messageId, {
-        message: assistantMessage,
+        message: message as AssistantMessage,
         conversationId,
         startTime: Date.now(),
         firstTokenTime: null,
         promptTokens: 0,
         reasoningStartTime: null,
         reasoningEndTime: null,
-        lastReasoningTime: null
+        lastReasoningTime: null,
+        __id: ++this.genStateSeq
       })
-
-      console.log(`[ThreadPresenter] Created new generating state for message: ${messageId}`)
-
-      // 启动新的流式完成
-      await this.startStreamCompletion(conversationId, messageId)
-    } catch (error) {
-      console.error(`[ThreadPresenter] Failed to restart agent loop:`, error)
-
-      // 确保清理生成状态
-      this.generatingMessages.delete(messageId)
-
-      try {
-        await this.messageManager.handleMessageError(messageId, String(error))
-      } catch (updateError) {
-        console.error(`[ThreadPresenter] Failed to update message error status:`, updateError)
-      }
-
-      throw error
+      // ensure state (quiet)
     }
+    await this.startStreamCompletion(conversationId, messageId, undefined, 'toolcall_continue')
   }
 
-  // 权限被拒绝后完成消息
-  private async finalizeMessageAfterPermissionDenied(messageId: string): Promise<void> {
-    console.log(`[ThreadPresenter] Finalizing message after permission denied: ${messageId}`)
-
-    try {
-      const message = await this.messageManager.getMessage(messageId)
-      if (!message) return
-
-      const content = message.content as AssistantMessageBlock[]
-
-      // 将所有loading状态的块设为success，但保留权限块的状态
-      content.forEach((block) => {
-        if (block.type === 'action' && block.action_type === 'tool_call_permission') {
-          // 权限块保持其当前状态（granted/denied/error）
-          return
-        }
-        if (block.status === 'loading') {
-          block.status = 'success'
-        }
-      })
-
-      // 添加权限被拒绝的提示
-      content.push({
-        type: 'error',
-        content: 'Permission denied by user',
-        status: 'error',
-        timestamp: Date.now()
-      })
-
-      await this.messageManager.editMessage(messageId, JSON.stringify(content))
-      await this.messageManager.updateMessageStatus(messageId, 'sent')
-
-      // 清理生成状态
-      this.generatingMessages.delete(messageId)
-
-      // 发送结束事件
-      eventBus.sendToRenderer(STREAM_EVENTS.END, SendTarget.ALL_WINDOWS, {
-        eventId: messageId,
-        userStop: false
-      })
-
-      console.log(`[ThreadPresenter] Message finalized after permission denial: ${messageId}`)
-    } catch (error) {
-      console.error(`[ThreadPresenter] Failed to finalize message after permission denial:`, error)
+  // 统一执行 granted 的工具调用，并触发一次“继续作答”
+  private async executeGrantedToolsAndContinue(messageId: string): Promise<void> {
+    console.log(`[Permission] Executing granted tools and continuing: ${messageId}`)
+    const message = await this.messageManager.getMessage(messageId)
+    if (!message || message.role !== 'assistant') {
+      throw new Error('executeGrantedToolsAndContinue: message not found or not assistant')
     }
-  }
 
-  // 恢复流式完成 (用于内存状态存在的情况)
-  private async resumeStreamCompletion(conversationId: string, messageId: string): Promise<void> {
-    const state = this.generatingMessages.get(messageId)
-    if (!state) {
-      console.log(
-        `[ThreadPresenter] No generating state found for ${messageId}, starting fresh agent loop`
-      )
-      await this.startStreamCompletion(conversationId)
+    const content = message.content as AssistantMessageBlock[]
+    // 收集已“消耗”的 tool_call：
+    // 仅当该调用已经真实执行过（成功或硬错误）才视为已消耗；
+    // 对于 permission_denied / permission_required 的占位结果，不视为已执行，允许后续授权后再执行。
+    const respondedIds = new Set(
+      content
+        .filter((b) => b.type === 'tool_call' && b.tool_call?.id?.trim() && b.tool_call?.response)
+        .filter((b) => {
+          try {
+            const env = JSON.parse(b.tool_call!.response as string)
+            const ok = env && typeof env === 'object' ? env.ok : undefined
+            const err = env && typeof env === 'object' ? env.error : undefined
+            if (ok === true) return true
+            if (ok === false && typeof err === 'string') {
+              return err !== 'permission_denied' && err !== 'permission_required'
+            }
+            return false
+          } catch {
+            // 无法解析时不据此判定为已执行，留给 executed 标志兜底
+            return false
+          }
+        })
+        .map((b) => b.tool_call!.id)
+    )
+    // 仅选择“尚未执行/未落地结果”的 granted 权限块
+    const grantedBlocks = content.filter(
+      (b) =>
+        b.type === 'action' &&
+        b.action_type === 'tool_call_permission' &&
+        b.status === 'granted' &&
+        b.tool_call?.id?.trim() &&
+        // 跳过已写入结果的调用
+        !respondedIds.has(b.tool_call!.id) &&
+        // 跳过标记为 executed 的授权块（防御性）
+        !(b.extra && (b.extra as any).executed === true)
+    )
+
+    const servers = await this.configPresenter.getMcpServers()
+
+    // 并发防护：同一消息的 continue 流不能重入
+    const genState = this.generatingMessages.get(messageId)
+    // continue check (quiet)
+    if (genState?.continuationInProgress) {
+      const stateId = (genState as any)?.__id
+      this.pendingContinuation.add(messageId)
+      console.log('[Continue/Enqueue]', { messageId, stateId })
       return
     }
 
-    try {
-      console.log(`[ThreadPresenter] Resuming stream completion for message: ${messageId}`)
+    // 不再记录执行签名，保持最小流程
 
-      // 关键修复：重新构建上下文，确保包含被中断的工具调用信息
-      const conversation = await this.getConversation(conversationId)
-      if (!conversation) {
-        const errorMsg = `Conversation not found (conversationId: ${conversationId})`
-        console.error(`[ThreadPresenter] ${errorMsg}`)
-        throw new Error(errorMsg)
-      }
-
-      const {
-        providerId,
-        modelId,
-        temperature,
-        maxTokens,
-        enabledMcpTools,
-        thinkingBudget,
-        reasoningEffort,
-        verbosity,
-        enableSearch,
-        forcedSearch,
-        searchStrategy
-      } = conversation.settings
-      const modelConfig = this.configPresenter.getModelConfig(modelId, providerId)
-
-      if (!modelConfig) {
-        console.warn(
-          `[ThreadPresenter] Model config not found for ${modelId} (${providerId}), using default`
-        )
-      }
-
-      // 查找被权限中断的工具调用
-      let pendingToolCall = null as { id: string; name: string; params: string } | null
-      // 优先根据最近一次被授予的 tool_call.id 精准匹配
-      const lastGrantedId = state.lastGrantedToolCallId
-      if (lastGrantedId) {
-        const block = state.message.content.find(
-          (b) =>
-            b.type === 'action' &&
-            b.action_type === 'tool_call_permission' &&
-            b.status === 'granted' &&
-            b.tool_call?.id === lastGrantedId
-        )
-        if (block?.tool_call?.id && block.tool_call.name && block.tool_call.params) {
-          pendingToolCall = {
-            id: block.tool_call.id,
-            name: block.tool_call.name,
-            params: block.tool_call.params
-          }
-          console.log(
-            `[ThreadPresenter] Using lastGrantedToolCallId to resume: ${pendingToolCall.name} (${pendingToolCall.id})`
-          )
-        }
-      }
-      // 若没有 lastGrantedId 或未命中，回退到“最近 granted 块”策略
-      if (!pendingToolCall) {
-        pendingToolCall = this.findPendingToolCallAfterPermission(state.message.content)
-      }
-
-      if (!pendingToolCall) {
+    let needsMorePermission = false
+    for (const perm of grantedBlocks) {
+      const tc = perm.tool_call
+      if (!tc || !tc.id || !tc.name) continue
+      let serverName = (perm.extra?.serverName as string) || tc.server_name || ''
+      let serverCfg = servers[serverName]
+      if (!serverName || !serverCfg) {
         try {
-          // 精简诊断：统计权限块与字段完备性，便于快速定位问题
-          const actionBlocks = state.message.content
-            .map((b, i) => ({ i, b }))
-            .filter(({ b }) => b.type === 'action' && b.action_type === 'tool_call_permission')
-          const diag = actionBlocks.map(({ i, b }) => ({
-            idx: i,
-            status: (b as any).status,
-            has: {
-              id: Boolean((b as any).tool_call?.id),
-              name: Boolean((b as any).tool_call?.name),
-              params: Boolean((b as any).tool_call?.params)
-            },
-            server: (b as any).extra?.serverName,
-            tool: (b as any).extra?.toolName
-          }))
-          console.info(
-            '[ThreadPresenter] No pending tool call after grant. Summary of permission blocks:',
-            {
-              count: actionBlocks.length,
-              blocks: diag
-            }
-          )
-        } catch {}
-        console.warn(
-          `[ThreadPresenter] No pending tool call found after permission grant, using normal context`
-        )
-        // 如果没有找到待执行的工具调用，使用正常流程
-        await this.startStreamCompletion(conversationId, messageId)
-        return
-      }
-
-      console.log(
-        `[ThreadPresenter] Found pending tool call: ${pendingToolCall.name} with ID: ${pendingToolCall.id}`
-      )
-
-      // 获取对话上下文（基于助手消息，它会自动找到相应的用户消息）
-      const { contextMessages, userMessage } = await this.prepareConversationContext(
-        conversationId,
-        messageId // 使用助手消息ID，让prepareConversationContext自动解析
-      )
-
-      console.log(
-        `[ThreadPresenter] Prepared conversation context with ${contextMessages.length} messages`
-      )
-
-      // 构建专门的继续执行上下文
-      // 精确匹配：优先从与 pendingToolCall.id 相同的授权块中取出一次性审批口令
-      let approvalNonce: string | undefined
-      try {
-        const grantedMatching = state.message.content.find(
-          (block) =>
-            block.type === 'action' &&
-            block.action_type === 'tool_call_permission' &&
-            block.status === 'granted' &&
-            block.tool_call?.id === pendingToolCall.id
-        ) as AssistantMessageBlock | undefined
-        approvalNonce = (grantedMatching?.extra as any)?.approvalNonce as string | undefined
-        // 兜底：若未匹配到同 id 的授权块，则寻找最近带有 approvalNonce 的授权块
-        if (!approvalNonce) {
-          for (let i = state.message.content.length - 1; i >= 0; i--) {
-            const b = state.message.content[i]
-            if (
-              b.type === 'action' &&
-              b.action_type === 'tool_call_permission' &&
-              b.status === 'granted' &&
-              (b as any).extra?.approvalNonce
-            ) {
-              approvalNonce = ((b as any).extra?.approvalNonce as string) || undefined
-              break
-            }
-          }
-        }
-      } catch {}
-
-      const finalContent = await this.buildContinueToolCallContext(
-        conversation,
-        contextMessages,
-        userMessage,
-        pendingToolCall,
-        modelConfig,
-        approvalNonce
-      )
-
-      console.log(`[ThreadPresenter] Built continue context for tool: ${pendingToolCall.name}`)
-
-      // Continue the agent loop with the correct context
-      const stream = this.llmProviderPresenter.startStreamCompletion(
-        providerId,
-        finalContent,
-        modelId,
-        messageId,
-        temperature,
-        maxTokens,
-        enabledMcpTools,
-        thinkingBudget,
-        reasoningEffort,
-        verbosity,
-        enableSearch,
-        forcedSearch,
-        searchStrategy
-      )
-
-      for await (const event of stream) {
-        const msg = event.data
-        if (event.type === 'response') {
-          await this.handleLLMAgentResponse(msg)
-        } else if (event.type === 'error') {
-          await this.handleLLMAgentError(msg)
-        } else if (event.type === 'end') {
-          await this.handleLLMAgentEnd(msg)
-        }
-      }
-    } catch (error) {
-      console.error('[ThreadPresenter] Failed to resume stream completion:', error)
-
-      // 确保清理生成状态
-      this.generatingMessages.delete(messageId)
-
-      try {
-        await this.messageManager.handleMessageError(messageId, String(error))
-      } catch (updateError) {
-        console.error(`[ThreadPresenter] Failed to update message error status:`, updateError)
-      }
-
-      throw error
-    }
-  }
-
-  // 等待MCP服务重启完成并准备就绪
-  private async waitForMcpServiceReady(
-    serverName: string,
-    maxWaitTime: number = 3000
-  ): Promise<void> {
-    console.log(`[ThreadPresenter] Waiting for MCP service ${serverName} to be ready...`)
-
-    const startTime = Date.now()
-    const checkInterval = 100 // 100ms
-
-    return new Promise((resolve) => {
-      const checkReady = async () => {
-        try {
-          // 检查服务是否正在运行
-          const isRunning = await presenter.mcpPresenter.isServerRunning(serverName)
-
-          if (isRunning) {
-            // 服务正在运行，再等待一下确保完全初始化
-            setTimeout(() => {
-              console.log(`[ThreadPresenter] MCP service ${serverName} is ready`)
-              resolve()
-            }, 200)
-            return
-          }
-
-          // 检查是否超时
-          if (Date.now() - startTime > maxWaitTime) {
-            console.warn(
-              `[ThreadPresenter] Timeout waiting for MCP service ${serverName} to be ready`
-            )
-            resolve() // 超时也继续，避免阻塞
-            return
-          }
-
-          // 继续等待
-          setTimeout(checkReady, checkInterval)
-        } catch (error) {
-          console.error(`[ThreadPresenter] Error checking MCP service status:`, error)
-          resolve() // 出错也继续，避免阻塞
-        }
-      }
-
-      checkReady()
-    })
-  }
-
-  // 查找权限授予后待执行的工具调用
-  private findPendingToolCallAfterPermission(
-    content: AssistantMessageBlock[]
-  ): { id: string; name: string; params: string } | null {
-    // 从后向前查找“最近授予”的权限块，避免命中早前的授权块
-    for (let i = content.length - 1; i >= 0; i--) {
-      const block = content[i]
-      if (
-        block.type === 'action' &&
-        block.action_type === 'tool_call_permission' &&
-        block.status === 'granted' &&
-        block.tool_call
-      ) {
-        const { id, name, params } = block.tool_call
-        if (id && name && params) {
-          return { id, name, params }
-        }
-        console.warn('[ThreadPresenter] Incomplete tool call info in granted block at index', i)
-        return null
-      }
-    }
-    return null
-  }
-
-  // 构建继续工具调用执行的上下文
-  private async buildContinueToolCallContext(
-    conversation: any,
-    contextMessages: any[],
-    userMessage: any,
-    pendingToolCall: { id: string; name: string; params: string },
-    modelConfig: any,
-    approvalNonce?: string
-  ): Promise<ChatMessage[]> {
-    const { systemPrompt } = conversation.settings
-    const formattedMessages: ChatMessage[] = []
-
-    // 1. 添加系统提示（包含当前时间信息）
-    if (systemPrompt) {
-      const finalSystemPrompt = this.enhanceSystemPromptWithDateTime(systemPrompt)
-      formattedMessages.push({
-        role: 'system',
-        content: finalSystemPrompt
-      })
-    }
-
-    // 2. 添加上下文消息
-    const contextChatMessages = this.addContextMessages(
-      contextMessages,
-      false,
-      modelConfig.functionCall
-    )
-    formattedMessages.push(...contextChatMessages)
-
-    // 3. 添加当前用户消息
-    const userContent = userMessage.content
-    const msgText = userContent.content
-      ? this.formatUserMessageContent(userContent.content)
-      : userContent.text
-    const finalUserContent = `${msgText}${getFileContext(userContent.files || [])}`
-
-    formattedMessages.push({
-      role: 'user',
-      content: finalUserContent
-    })
-
-    // 4. 添加助手消息，说明需要执行工具调用
-    if (modelConfig.functionCall) {
-      // 对于原生支持函数调用的模型，添加tool_calls
-      let patchedArgs = pendingToolCall.params
-      if (approvalNonce) {
-        try {
-          const obj = JSON.parse(patchedArgs)
-          // 仅在不存在时添加，避免重复
-          if (!Object.prototype.hasOwnProperty.call(obj, 'approval_nonce')) {
-            obj['approval_nonce'] = approvalNonce
-            patchedArgs = JSON.stringify(obj)
+          const defs = await presenter.mcpPresenter.getAllToolDefinitions()
+          const found = defs.find((d) => d.function.name === tc.name)
+          if (found?.server?.name) {
+            serverName = found.server.name as string
+            serverCfg = servers[serverName]
           }
         } catch (e) {
-          // 若解析失败，保留原样；模型仍可从下方提示中得到指引
+          console.warn(
+            '[Permission] Unable to resolve server for tool, proceeding without server meta:',
+            e
+          )
         }
       }
-      formattedMessages.push({
-        role: 'assistant',
-        tool_calls: [
-          {
-            id: pendingToolCall.id,
-            type: 'function',
-            function: {
-              name: pendingToolCall.name,
-              arguments: patchedArgs
+      const server = {
+        name: serverName,
+        icons: (serverCfg?.icons as string) || tc.server_icons || '',
+        description: (serverCfg?.descriptions as string) || tc.server_description || ''
+      }
+
+      try {
+        // Prepare a one-time internal grant for this exact call when server-level autoApprove does not cover it
+        const required = (perm.extra?.permissionType as 'read' | 'write' | 'all') || 'write'
+        try {
+          await presenter.mcpPresenter.grantPermission(
+            serverName,
+            required,
+            /*remember*/ false,
+            tc.name
+          )
+        } catch (e) {
+          console.warn('[ThreadPresenter] grantPermission(one-time) failed (will still try):', e)
+        }
+        console.log(
+          `[ThreadPresenter] Prepared one-time internal grant for tool execution, tool: ${tc.name}, server: ${serverName}, required: ${required}`
+        )
+
+        // Do NOT inject any approval token into arguments; rely on internal one-time grant
+        const effectiveArgs = tc.params || '{}'
+        console.log('[ThreadPresenter] Tool request raw', {
+          id: tc.id,
+          name: tc.name,
+          server,
+          arguments: effectiveArgs
+        })
+        const toolRequest = {
+          id: tc.id,
+          type: 'function',
+          function: {
+            name: tc.name,
+            arguments: effectiveArgs
+          },
+          server
+        }
+        if (ThreadPresenter.DEBUG_TOOL_IO_LOG) {
+          try {
+            console.log('[IO/Tool/Request]', {
+              messageId,
+              toolCallId: tc.id,
+              server: server.name,
+              name: tc.name,
+              arguments: effectiveArgs
+            })
+          } catch {}
+        }
+        const result = await presenter.mcpPresenter.callTool(toolRequest)
+        if (ThreadPresenter.DEBUG_TOOL_IO_LOG) {
+          try {
+            const respStr =
+              typeof result.content === 'string' ? result.content : JSON.stringify(result.content)
+            console.log('[IO/Tool/Response]', {
+              messageId,
+              toolCallId: tc.id,
+              server: server.name,
+              name: tc.name,
+              isError: Boolean((result as any)?.isError || result.rawData?.isError),
+              content: respStr
+            })
+          } catch {}
+        }
+
+        // 若仍需权限（如权限级别不足或一次性授权未命中），回退为 pending 授权并写入错误结果，不进入 R2
+        const anyRes: any = result as any
+        const requiresPerm = Boolean(
+          anyRes?.requiresPermission || anyRes?.rawData?.requiresPermission
+        )
+        if (requiresPerm) {
+          const req = anyRes?.permissionRequest || anyRes?.rawData?.permissionRequest || {}
+          const need: 'read' | 'write' | 'all' = (req.permissionType as any) || 'write'
+
+          // 回退授权块为 pending，并升级权限类型
+          const permBlock = content.find(
+            (b) =>
+              b.type === 'action' &&
+              b.action_type === 'tool_call_permission' &&
+              b.tool_call?.id === tc.id
+          )
+          if (permBlock) {
+            permBlock.status = 'pending'
+            permBlock.extra = permBlock.extra || {}
+            ;(permBlock.extra as any).permissionType = need
+            ;(permBlock.extra as any).needsUserAction = true
+            if (req.serverName) (permBlock.extra as any).serverName = req.serverName
+            if (req.toolName) (permBlock.extra as any).toolName = req.toolName
+          } else {
+            // 兜底：若未找到授权块，创建一条新的 pending 授权块
+            content.push({
+              type: 'action',
+              action_type: 'tool_call_permission',
+              content: 'Permission required for this operation',
+              status: 'pending',
+              timestamp: Date.now(),
+              tool_call: {
+                id: tc.id,
+                name: tc.name,
+                params: tc.params || '',
+                server_name: server.name,
+                server_icons: server.icons,
+                server_description: server.description
+              },
+              extra: {
+                permissionType: need,
+                serverName: server.name,
+                toolName: tc.name,
+                needsUserAction: true,
+                permissionRequest: JSON.stringify({
+                  toolName: tc.name,
+                  serverName: server.name,
+                  permissionType: need,
+                  description: `Allow ${tc.name} to perform ${need} operations on ${server.name}?`
+                })
+              }
+            } as AssistantMessageBlock)
+          }
+
+          // 为该调用写入/更新错误结果（permission_required）
+          let toolBlock = content.find((b) => b.type === 'tool_call' && b.tool_call?.id === tc.id)
+          if (!toolBlock) {
+            toolBlock = {
+              type: 'tool_call',
+              content: '',
+              status: 'error',
+              timestamp: Date.now(),
+              tool_call: {
+                id: tc.id,
+                name: tc.name,
+                params: tc.params || '',
+                server_name: server.name,
+                server_icons: server.icons,
+                server_description: server.description,
+                response: JSON.stringify({ ok: false, error: 'permission_required', need })
+              }
+            }
+            content.push(toolBlock)
+          } else {
+            toolBlock.status = 'error'
+            if (toolBlock.tool_call) {
+              toolBlock.tool_call.response = JSON.stringify({
+                ok: false,
+                error: 'permission_required',
+                need
+              })
             }
           }
-        ]
-      })
 
-      // 添加一个虚拟的工具响应，说明权限已经授予；如有一次性审批口令，要求在 JSON 中加入 approval_nonce
-      if (approvalNonce) {
-        formattedMessages.push({
-          role: 'tool',
-          tool_call_id: pendingToolCall.id,
-          content: `Permission granted. In your next function call, include an extra field approval_nonce with the exact value '${approvalNonce}' in function.arguments JSON. Do not change it. This approval_nonce is SINGLE-USE and scoped ONLY to resuming this exact function call; it is not a long-term token and must NOT be reused or persisted. **Re-emit the SAME function.name, approval_nonce and arguments content**; if your platform supports reusing tool_call_id, reuse it; otherwise keep name and arguments identical for ${pendingToolCall.name}.`
-        })
-        // 强化要求（作为额外的用户指令，避免模型忽略上面的提示）
-        formattedMessages.push({
-          role: 'user',
-          content:
-            `STRICT RULES:\n` +
-            `1) You MUST include \"approval_nonce\": \"${approvalNonce}\" in function.arguments JSON exactly.\n` +
-            `2) Do NOT translate, alter, log, reveal, or persist approval_nonce.\n` +
-            `3) approval_nonce is SINGLE-USE and scoped ONLY to this resumed function call; do NOT reuse it for any other call.\n` +
-            `4) If you cannot include approval_nonce, reply: ABORT: MISSING_APPROVAL_NONCE.\n` +
-            `5) Do NOT change other fields (name/arguments structure).`
-        })
-      } else {
-        formattedMessages.push({
-          role: 'tool',
-          tool_call_id: pendingToolCall.id,
-          content: `Permission granted. Re-emit the EXACT same function call with the SAME function.name and function.arguments. If your platform supports reusing tool_call_id, reuse it; otherwise keep name and arguments identical for ${pendingToolCall.name}.`
-        })
-      }
-    } else {
-      // 对于非原生支持的模型，使用文本提示
-      formattedMessages.push({
-        role: 'assistant',
-        content: `I need to call the ${pendingToolCall.name} function with the following parameters: ${pendingToolCall.params}`
-      })
+          // 持久化并标记需要等待授权，暂不进入 R2
+          try {
+            const st = this.generatingMessages.get(messageId)
+            if (st) st.message.content = content
+          } catch {}
+          await this.messageManager.editMessage(messageId, JSON.stringify(content))
+          needsMorePermission = true
+          continue
+        }
 
-      if (approvalNonce) {
-        formattedMessages.push({
-          role: 'user',
-          content:
-            `Permission granted. Call the SAME function (${pendingToolCall.name}) with the SAME arguments as previously shown, and add \"approval_nonce\":\"${approvalNonce}\" into the JSON arguments you emit. This approval_nonce is SINGLE-USE and scoped ONLY to this resumed function call; do NOT reuse or persist it. Do not alter name or arguments.\n` +
-            `Use this pattern (merge with existing arguments without removing fields):\n` +
-            `{\n  \"...existing_fields\": \"...\",\n  \"approval_nonce\": \"${approvalNonce}\"\n}\n` +
-            `If you cannot include approval_nonce, reply: ABORT: MISSING_APPROVAL_NONCE.`
-        })
-      } else {
-        formattedMessages.push({
-          role: 'user',
-          content: `Permission granted. Call the SAME function (${pendingToolCall.name}) with the SAME arguments as previously shown. Do not alter name or arguments.`
-        })
+        // 更新/创建对应的 tool_call 块（正常成功/错误路径）
+        let toolBlock = content.find((b) => b.type === 'tool_call' && b.tool_call?.id === tc.id)
+        if (!toolBlock) {
+          toolBlock = {
+            type: 'tool_call',
+            content: '',
+            status: 'success',
+            timestamp: Date.now(),
+            tool_call: {
+              id: tc.id,
+              name: tc.name,
+              params: tc.params || '',
+              server_name: server.name,
+              server_icons: server.icons,
+              server_description: server.description,
+              response: ''
+            }
+          }
+          content.push(toolBlock)
+        }
+        const isErr = Boolean((result as any)?.isError || result.rawData?.isError)
+        toolBlock.status = isErr ? 'error' : 'success'
+        if (toolBlock.tool_call) {
+          const dataPayload = typeof result.content === 'string' ? result.content : result.content
+          const envelope = isErr
+            ? { ok: false, error: 'tool_execution_error', data: dataPayload }
+            : { ok: true, data: dataPayload }
+          toolBlock.tool_call.response = JSON.stringify(envelope)
+          // 确保服务信息完整
+          toolBlock.tool_call.server_name = server.name
+          toolBlock.tool_call.server_icons = server.icons
+          toolBlock.tool_call.server_description = server.description
+        }
+        // 标记对应授权块为已执行（consumed），避免后续重复执行
+        try {
+          ;(perm.extra as any) = perm.extra || {}
+          ;(perm.extra as any).executed = true
+          ;(perm.extra as any).executedAt = Date.now()
+        } catch {}
+      } catch (e) {
+        console.error('[ThreadPresenter] Tool execution failed:', e)
+        // 标记失败
+        let toolBlock = content.find((b) => b.type === 'tool_call' && b.tool_call?.id === tc?.id)
+        if (!toolBlock) {
+          toolBlock = {
+            type: 'tool_call',
+            content: '',
+            status: 'error',
+            timestamp: Date.now(),
+            tool_call: {
+              id: tc?.id,
+              name: tc?.name,
+              params: tc?.params || '',
+              server_name: serverName,
+              server_icons: '',
+              server_description: '',
+              response: JSON.stringify({
+                ok: false,
+                error: 'tool_execution_error',
+                data: String(e)
+              })
+            }
+          }
+          content.push(toolBlock)
+        } else {
+          toolBlock.status = 'error'
+          if (toolBlock.tool_call)
+            toolBlock.tool_call.response = JSON.stringify({
+              ok: false,
+              error: 'tool_execution_error',
+              data: String(e)
+            })
+        }
+        // 标记对应授权块为已执行（即使失败也不应重复执行）
+        try {
+          ;(perm.extra as any) = perm.extra || {}
+          ;(perm.extra as any).executed = true
+          ;(perm.extra as any).executedAt = Date.now()
+        } catch {}
       }
+      // 不记录执行签名
     }
 
-    return formattedMessages
+    // 持久化 tool_call 结果
+    // 先更新载体，再落库（核心顺序约束）
+    try {
+      const st = this.generatingMessages.get(messageId)
+      if (st) st.message.content = content
+    } catch {}
+    await this.messageManager.editMessage(messageId, JSON.stringify(content))
+    this.logPermissionSummary(content, 'EXECUTE.results', messageId)
+    const conversationId = message.conversationId
+
+    // 确保生成状态存在
+    if (!this.generatingMessages.get(messageId)) {
+      this.generatingMessages.set(messageId, {
+        message: message as AssistantMessage,
+        conversationId,
+        startTime: Date.now(),
+        firstTokenTime: null,
+        promptTokens: 0,
+        reasoningStartTime: null,
+        reasoningEndTime: null,
+        lastReasoningTime: null,
+        __id: ++this.genStateSeq
+      })
+      // ensure state (quiet)
+    }
+    if (needsMorePermission) {
+      // 等待用户处理新的权限请求，不进入 R2
+      return
+    }
+    // 触发继续作答
+    console.log('[ThreadPresenter] Starting continue stream', {
+      conversationId,
+      messageId
+    })
+    {
+      const cur = this.generatingMessages.get(messageId)
+      if (cur) {
+        cur.continuationInProgress = true
+        const stateId = (cur as any)?.__id
+        console.log('[Continue/State]', { messageId, stateId, set: true })
+      }
+    }
+    try {
+      await this.startStreamCompletion(conversationId, messageId, undefined, 'toolcall_continue')
+    } finally {
+      {
+        const cur = this.generatingMessages.get(messageId)
+        if (cur) {
+          cur.continuationInProgress = false
+          const stateId = (cur as any)?.__id
+          console.log('[Continue/State]', { messageId, stateId, set: false })
+        }
+      }
+      if (this.pendingContinuation.has(messageId)) {
+        this.pendingContinuation.delete(messageId)
+        console.log('[Continue/Dequeue]', { messageId })
+        await this.executeGrantedToolsAndContinue(messageId)
+      }
+    }
+  }
+
+  // 调试：打印权限块摘要
+  private logPermissionSummary(
+    content: AssistantMessageBlock[] | undefined,
+    where: string,
+    messageId: string
+  ) {
+    if (!content) return
+    try {
+      const perms = content.filter(
+        (b) => b.type === 'action' && (b as any).action_type === 'tool_call_permission'
+      )
+      const pending = perms.filter((b) => b.status === 'pending').length
+      const granted = perms.filter((b) => b.status === 'granted').length
+      const denied = perms.filter((b) => b.status === 'denied').length
+      const error = perms.filter((b) => b.status === 'error').length
+      console.log('[Permission/Summary]', { where, messageId, pending, granted, denied, error })
+    } catch {}
   }
 
   /**

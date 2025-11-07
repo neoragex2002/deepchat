@@ -30,4 +30,11 @@ export interface LLMAgentEventData {
 export type LLMAgentEvent =
   | { type: 'response'; data: LLMAgentEventData }
   | { type: 'error'; data: { eventId: string; error: string } }
-  | { type: 'end'; data: { eventId: string; userStop: boolean } }
+  | {
+      type: 'end'
+      data: {
+        eventId: string
+        userStop: boolean
+        planned_tool_calls?: Array<{ id: string; name: string; arguments: string }>
+      }
+    }

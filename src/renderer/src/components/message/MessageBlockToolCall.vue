@@ -1,7 +1,7 @@
 <template>
   <div class="my-1">
     <div
-      class="flex flex-col h-min-[40px] hover:bg-muted select-none cursor-pointer pt-3 overflow-hidden w-[380px] break-all shadow-sm my-2 items-start gap-3 rounded-lg border bg-card text-card-foreground"
+      class="flex flex-col min-h-[40px] hover:bg-muted select-none cursor-pointer pt-3 overflow-hidden w-[380px] break-all shadow-sm my-2 items-start gap-3 rounded-lg border bg-card text-card-foreground"
       @click="toggleExpanded"
     >
       <div class="flex flex-row items-center gap-2 w-full">
@@ -103,6 +103,15 @@
             </h5>
             <div class="text-sm rounded-md p-3">
               <JsonObject :data="parseJson(block.tool_call.response)" />
+            </div>
+          </div>
+          <div v-else-if="block.status === 'success'" class="space-y-2">
+            <h5 class="text-xs font-medium text-accent-foreground flex flex-row gap-2 items-center">
+              <Icon icon="lucide:arrow-down-to-dot" class="w-4 h-4 text-muted-foreground" />
+              {{ t('toolCall.responseData') }}
+            </h5>
+            <div class="text-xs text-muted-foreground px-2">
+              (no output)
             </div>
           </div>
         </div>

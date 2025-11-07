@@ -24,7 +24,10 @@
         {{ t('chat.messages.thinking') }}
       </div>
       <div v-else class="flex flex-col w-full space-y-2">
-        <template v-for="(block, idx) in currentContent" :key="`${message.id}-${idx}`">
+        <template
+          v-for="(block, idx) in currentContent"
+          :key="`${message.id}-${block.tool_call?.id || idx}-${block.type}`"
+        >
           <MessageBlockContent
             v-if="block.type === 'content'"
             :block="block"

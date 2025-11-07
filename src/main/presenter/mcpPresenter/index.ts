@@ -181,6 +181,18 @@ export class McpPresenter implements IMCPPresenter {
     }
   }
 
+  // Expose auth decision for planned tool calls
+  public async decideToolCallPermission(
+    serverName: string,
+    toolName: string,
+    args: string | undefined | null
+  ): Promise<{
+    decision: 'AUTO_GRANT' | 'AUTO_DENY' | 'REQUIRE_USER_PERMISSION'
+    required: 'read' | 'write' | 'all'
+  }> {
+    return await this.toolManager.decidePermission(serverName, toolName, args)
+  }
+
   // =============== McpRouter marketplace APIs ===============
   async listMcpRouterServers(
     page: number,
@@ -1173,20 +1185,13 @@ export class McpPresenter implements IMCPPresenter {
     serverName: string,
     permissionType: 'read' | 'write' | 'all',
     remember: boolean = false,
-    toolName?: string,
-    approvalNonce?: string
+    toolName?: string
   ): Promise<void> {
     try {
       console.log(
-        `[MCP] Granting ${permissionType} permission for server: ${serverName}, remember: ${remember}, toolName: ${toolName || 'n/a'}, nonce: ${approvalNonce ? 'provided' : 'none'}`
+        `[MCP] Granting ${permissionType} permission for server: ${serverName}, remember: ${remember}, toolName: ${toolName || 'n/a'}`
       )
-      await this.toolManager.grantPermission(
-        serverName,
-        permissionType,
-        remember,
-        toolName,
-        approvalNonce
-      )
+      await this.toolManager.grantPermission(serverName, permissionType, remember, toolName)
       console.log(
         `[MCP] Successfully granted ${permissionType} permission for server: ${serverName}`
       )

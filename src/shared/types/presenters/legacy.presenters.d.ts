@@ -788,7 +788,8 @@ export interface IThreadPresenter {
   startStreamCompletion(
     conversationId: string,
     queryMsgId?: string,
-    selectedVariantsMap?: Record<string, string>
+    selectedVariantsMap?: Record<string, string>,
+    contextMode?: 'msg_retry' | 'toolcall_continue'
   ): Promise<void>
   regenerateFromUserMessage(
     conversationId: string,
@@ -1103,6 +1104,7 @@ export interface MCPServerConfig {
   descriptions: string
   icons: string
   autoApprove: string[]
+  toolsAutoApprove?: { [toolName: string]: Array<'read' | 'write' | 'all'> }
   disable?: boolean
   baseUrl?: string
   customHeaders?: Record<string, string>
@@ -1240,8 +1242,7 @@ export interface IMCPPresenter {
     serverName: string,
     permissionType: 'read' | 'write' | 'all',
     remember?: boolean,
-    toolName?: string,
-    approvalNonce?: string
+    toolName?: string
   ): Promise<void>
   // NPM Registry management methods
   getNpmRegistryStatus?(): Promise<{
