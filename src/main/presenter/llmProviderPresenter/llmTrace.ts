@@ -72,7 +72,21 @@ export class LLMTraceWriter {
       modelId: this.modelId,
       timestamp: Date.now()
     }
-    this.cachedRequest = { meta, body }
+    // Important: deep-clone the body to avoid later in-process mutations (e.g. appending
+    // assistant messages after the LLM call) polluting the snapshot of the original request.
+    // Prefer structuredClone when available; fallback to JSON round-trip.
+    const deepClone = (obj: unknown) => {
+      try {
+        const sc = (globalThis as any).structuredClone
+        if (typeof sc === 'function') return sc(obj)
+      } catch {}
+      try {
+        return JSON.parse(JSON.stringify(obj))
+      } catch {
+        return obj
+      }
+    }
+    this.cachedRequest = { meta, body: deepClone(body) }
   }
 
   addRawSse(line: string) {

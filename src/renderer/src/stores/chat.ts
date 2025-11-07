@@ -13,6 +13,7 @@ import { CONVERSATION_EVENTS, DEEPLINK_EVENTS, MEETING_EVENTS } from '@/events'
 import router from '@/router'
 import { useI18n } from 'vue-i18n'
 import { useSoundStore } from './sound'
+import { DEBUG_ROLLBACK_MIN } from '@shared/debug'
 import sfxfcMp3 from '/sounds/sfx-fc.mp3?url'
 import sfxtyMp3 from '/sounds/sfx-typing.mp3?url'
 
@@ -55,6 +56,9 @@ export const useChatStore = defineStore('chat', () => {
   const generatingMessagesCacheMap = ref<
     Map<number, Map<string, { message: AssistantMessage | UserMessage; threadId: string }>>
   >(new Map())
+
+  // track max observed revision per message to prevent rollback merges
+  const messageRevisions = ref<Map<string, number>>(new Map())
 
   // 对话配置状态
   const chatConfig = ref<CONVERSATION_SETTINGS>({
@@ -313,9 +317,14 @@ export const useChatStore = defineStore('chat', () => {
     if (!Array.isArray(cur.content) || !Array.isArray(nxt.content)) return updatedMsg
 
     const keyOf = (b: AssistantMessageBlock) => {
-      if (b.type === 'tool_call' && b.tool_call) return `tool:${b.tool_call.id || b.tool_call.name}`
-      if (b.type === 'action' && (b as any).action_type === 'tool_call_permission' && b.tool_call)
-        return `perm:${b.tool_call.id || b.tool_call.name}`
+      if (b.type === 'tool_call' && b.tool_call) {
+        if (b.tool_call.id) return `tool:${b.tool_call.id}`
+        return `tool-legacy:${b.tool_call.name || 'unknown'}:${b.timestamp}`
+      }
+      if (b.type === 'action' && (b as any).action_type === 'tool_call_permission' && b.tool_call) {
+        if (b.tool_call.id) return `perm:${b.tool_call.id}`
+        return `perm-legacy:${b.tool_call.name || 'unknown'}:${b.timestamp}`
+      }
       return `other:${b.type}:${b.timestamp}`
     }
 
@@ -323,6 +332,11 @@ export const useChatStore = defineStore('chat', () => {
     for (const b of cur.content) curMap.set(keyOf(b), b)
 
     const mergedBlocks: AssistantMessageBlock[] = []
+    const lastAcceptedMap = (messageRevisions as any).value as Map<string, number>
+    const lastAcceptedRevision = lastAcceptedMap.get((currentMsg as any).id) || 0
+    // Source markers for minimal rollback diagnostics
+    const incomingEvent = (window as any).__incomingEvent || 'UNKNOWN'
+    const incomingRevision = (window as any).__incomingRevision ?? null
     for (const nb of nxt.content as AssistantMessageBlock[]) {
       const k = keyOf(nb)
       const ob = curMap.get(k)
@@ -332,8 +346,25 @@ export const useChatStore = defineStore('chat', () => {
       }
       if (nb.type === 'tool_call' && nb.tool_call && ob.type === 'tool_call' && ob.tool_call) {
         const merged: AssistantMessageBlock = JSON.parse(JSON.stringify(nb))
-        // 若旧块已完成/失败，优先采用旧状态，避免回退
-        if (ob.status === 'success' || ob.status === 'error') merged.status = ob.status
+        // 防回退：若旧块已完成/失败，且新块状态更低（loading），保持旧状态
+        const from = ob.status
+        const to = nb.status
+        const isDowngrade = (from === 'success' || from === 'error') && to === 'loading'
+        if (isDowngrade) {
+          merged.status = ob.status
+          if (DEBUG_ROLLBACK_MIN)
+            window.api?.debugLog?.('UI.Downgrade', {
+              messageId: (currentMsg as any).id,
+              toolCallId: ob.tool_call.id,
+              block: 'tool',
+              from,
+              to,
+              lastAcceptedRevision,
+              incomingEvent,
+              incomingRevision,
+              decision: 'drop'
+            })
+        }
         // 若新块缺少响应而旧块已有，保留旧响应
         if (!nb.tool_call.response && ob.tool_call.response) {
           merged.tool_call!.response = ob.tool_call.response
@@ -354,8 +385,25 @@ export const useChatStore = defineStore('chat', () => {
       ) {
         const merged: AssistantMessageBlock = JSON.parse(JSON.stringify(nb))
         const score = (s?: string) =>
-          s === 'granted' || s === 'denied' ? 2 : s === 'error' ? 1 : 0
-        if (score(ob.status) > score(nb.status)) merged.status = ob.status
+          s === 'granted' || s === 'denied' ? 3 : s === 'error' ? 2 : s === 'pending' ? 1 : 0
+        const from = ob.status
+        const to = nb.status
+        const isDowngrade = score(from) > score(to)
+        if (isDowngrade) {
+          merged.status = ob.status
+          if (DEBUG_ROLLBACK_MIN)
+            window.api?.debugLog?.('UI.Downgrade', {
+              messageId: (currentMsg as any).id,
+              toolCallId: ob.tool_call?.id,
+              block: 'perm',
+              from,
+              to,
+              lastAcceptedRevision,
+              incomingEvent,
+              incomingRevision,
+              decision: 'drop'
+            })
+        }
         if (merged.extra) {
           merged.extra.needsUserAction =
             Boolean(merged.extra.needsUserAction) && merged.status === 'pending'
@@ -607,8 +655,8 @@ export const useChatStore = defineStore('chat', () => {
             const existingToolCallBlock = curMsg.content.find(
               (block) =>
                 block.type === 'tool_call' &&
-                ((msg.tool_call_id && block.tool_call?.id === msg.tool_call_id) ||
-                  block.tool_call?.name === msg.tool_call_name) &&
+                msg.tool_call_id &&
+                block.tool_call?.id === msg.tool_call_id &&
                 block.status === 'loading'
             )
             try {
@@ -631,8 +679,8 @@ export const useChatStore = defineStore('chat', () => {
             const existingToolCallBlock = curMsg.content.find(
               (block) =>
                 block.type === 'tool_call' &&
-                ((msg.tool_call_id && block.tool_call?.id === msg.tool_call_id) ||
-                  block.tool_call?.name === msg.tool_call_name) &&
+                msg.tool_call_id &&
+                block.tool_call?.id === msg.tool_call_id &&
                 block.status === 'loading'
             )
             try {
@@ -656,8 +704,8 @@ export const useChatStore = defineStore('chat', () => {
               const alreadyDone = curMsg.content.find(
                 (block) =>
                   block.type === 'tool_call' &&
-                  ((msg.tool_call_id && block.tool_call?.id === msg.tool_call_id) ||
-                    block.tool_call?.name === msg.tool_call_name) &&
+                  msg.tool_call_id &&
+                  block.tool_call?.id === msg.tool_call_id &&
                   (block.status === 'success' || block.status === 'error')
               )
               if (!alreadyDone) {
@@ -682,8 +730,8 @@ export const useChatStore = defineStore('chat', () => {
             let existingToolCallBlock = curMsg.content.find(
               (block) =>
                 block.type === 'tool_call' &&
-                ((msg.tool_call_id && block.tool_call?.id === msg.tool_call_id) ||
-                  block.tool_call?.name === msg.tool_call_name) &&
+                msg.tool_call_id &&
+                block.tool_call?.id === msg.tool_call_id &&
                 block.status === 'loading'
             )
             try {
@@ -695,12 +743,11 @@ export const useChatStore = defineStore('chat', () => {
               })
             } catch {}
             // 如果未找到 loading 块，但存在同 id/name 的已完成块，也允许补写响应（容错）
-            if (!existingToolCallBlock) {
+            if (!existingToolCallBlock && msg.tool_call_id) {
               existingToolCallBlock = curMsg.content.find(
                 (block) =>
                   block.type === 'tool_call' &&
-                  ((msg.tool_call_id && block.tool_call?.id === msg.tool_call_id) ||
-                    block.tool_call?.name === msg.tool_call_name) &&
+                  block.tool_call?.id === msg.tool_call_id &&
                   (block.status === 'success' || block.status === 'error')
               )
             }
@@ -808,156 +855,51 @@ export const useChatStore = defineStore('chat', () => {
   }
 
   const handleStreamEnd = async (msg: { eventId: string }) => {
-    // 从缓存中移除消息
+    // Do not merge content on END. Only clear caches + working status.
     const cached = getGeneratingMessagesCache().get(msg.eventId)
-    if (cached) {
-      // 获取最新的消息并处理 extra 信息
-      const updatedMessage = await threadP.getMessage(msg.eventId)
-      const enrichedMessage = await enrichMessageWithExtra(updatedMessage)
+    if (!cached) return
 
-      getGeneratingMessagesCache().delete(msg.eventId)
-      generatingThreadIds.value.delete(cached.threadId)
-      // 设置会话的workingStatus为completed
-      // 如果是当前活跃的会话，则直接从Map中移除
-      if (getActiveThreadId() === cached.threadId) {
-        getThreadsWorkingStatus().delete(cached.threadId)
-      } else {
-        updateThreadWorkingStatus(cached.threadId, 'completed')
-      }
+    // Clear generating state for this message/thread
+    getGeneratingMessagesCache().delete(msg.eventId)
+    generatingThreadIds.value.delete(cached.threadId)
 
-      // 检查窗口是否聚焦，如果未聚焦则发送通知
-      // const isFocused = await windowP.isMainWindowFocused(windowP.mainWindow?.id)
-      // if (!isFocused) {
-      //   // 获取生成内容的前20个字符作为通知内容
-      //   let notificationContent = ''
-      //   if (enrichedMessage && (enrichedMessage as AssistantMessage).content) {
-      //     const assistantMsg = enrichedMessage as AssistantMessage
-      //     // 从content中提取文本内容
-      //     for (const block of assistantMsg.content) {
-      //       if (block.type === 'content' && block.content) {
-      //         notificationContent = block.content.substring(0, 20)
-      //         if (block.content.length > 20) notificationContent += '...'
-      //         break
-      //       }
-      //     }
-      //   }
-
-      //   // 发送通知
-      //   await notificationP.showNotification({
-      //     id: `chat/${cached.threadId}/${msg.eventId}`,
-      //     title: t('chat.notify.generationComplete'),
-      //     body: notificationContent || t('chat.notify.generationComplete')
-      //   })
-      // }
-
-      // 如果是变体消息，需要更新主消息
-      if (enrichedMessage.is_variant && enrichedMessage.parentId) {
-        // 获取主消息
-        const mainMessage = await threadP.getMainMessageByParentId(
-          cached.threadId,
-          enrichedMessage.parentId
-        )
-
-        if (mainMessage) {
-          const enrichedMainMessage = await enrichMessageWithExtra(mainMessage)
-          // 如果是当前激活的会话，更新显示
-          if (getActiveThreadId() === getActiveThreadId()) {
-            const mainMsgIndex = getMessages().findIndex((m) => m.id === mainMessage.id)
-            if (mainMsgIndex !== -1) {
-              const merged = mergeAssistantMessage(
-                getMessages()[mainMsgIndex] as AssistantMessage | UserMessage,
-                enrichedMainMessage as AssistantMessage | UserMessage
-              )
-              getMessages()[mainMsgIndex] = merged
-            }
-          }
-        }
-      } else {
-        // 如果是当前激活的会话，更新显示
-        if (getActiveThreadId() === getActiveThreadId()) {
-          const msgIndex = getMessages().findIndex((m) => m.id === msg.eventId)
-          if (msgIndex !== -1) {
-            const merged = mergeAssistantMessage(
-              getMessages()[msgIndex] as AssistantMessage | UserMessage,
-              enrichedMessage as AssistantMessage | UserMessage
-            )
-            getMessages()[msgIndex] = merged
-          }
-        }
-      }
+    // Update working status without touching message content
+    if (getActiveThreadId() === cached.threadId) {
+      getThreadsWorkingStatus().delete(cached.threadId)
+    } else {
+      updateThreadWorkingStatus(cached.threadId, 'completed')
     }
   }
 
   const handleStreamError = async (msg: { eventId: string }) => {
-    // 从缓存中获取消息
+    // Do not merge content on ERROR. Only clear caches + working status.
     const cached = getGeneratingMessagesCache().get(msg.eventId)
-    if (cached) {
-      if (getActiveThreadId() === getActiveThreadId()) {
-        try {
-          const updatedMessage = await threadP.getMessage(msg.eventId)
-          const enrichedMessage = await enrichMessageWithExtra(updatedMessage)
+    if (!cached) return
 
-          if (enrichedMessage.is_variant && enrichedMessage.parentId) {
-            // 处理变体消息的错误状态
-            const parentMsgIndex = getMessages().findIndex((m) => m.id === enrichedMessage.parentId)
-            if (parentMsgIndex !== -1) {
-              const parentMsg = getMessages()[parentMsgIndex] as AssistantMessage
-              if (!parentMsg.variants) {
-                parentMsg.variants = []
-              }
-              const variantIndex = parentMsg.variants.findIndex((v) => v.id === enrichedMessage.id)
-              if (variantIndex !== -1) {
-                parentMsg.variants[variantIndex] = enrichedMessage
-              } else {
-                parentMsg.variants.push(enrichedMessage)
-              }
-              getMessages()[parentMsgIndex] = { ...parentMsg }
-            }
-          } else {
-            // 非变体消息的原有错误处理逻辑
-            const messageIndex = getMessages().findIndex((m) => m.id === msg.eventId)
-            if (messageIndex !== -1) {
-              getMessages()[messageIndex] = enrichedMessage as AssistantMessage | UserMessage
-            }
-          }
-          const wid = window.api.getWindowId() || 0
-          // 检查窗口是否聚焦，如果未聚焦则发送错误通知
-          const isFocused = await windowP.isMainWindowFocused(wid)
-          if (!isFocused) {
-            // 获取错误信息
-            let errorMessage = t('chat.notify.generationError')
-            if (enrichedMessage && (enrichedMessage as AssistantMessage).content) {
-              const assistantMsg = enrichedMessage as AssistantMessage
-              // 查找错误信息块
-              for (const block of assistantMsg.content) {
-                if (block.status === 'error' && block.content) {
-                  errorMessage = block.content.substring(0, 20)
-                  if (block.content.length > 20) errorMessage += '...'
-                  break
-                }
-              }
-            }
+    // Optional: lightweight user notification without DB reads
+    try {
+      const wid = window.api.getWindowId() || 0
+      const isFocused = await windowP.isMainWindowFocused(wid)
+      if (!isFocused) {
+        await notificationP.showNotification({
+          id: `error-${msg.eventId}`,
+          title: t('chat.notify.generationError'),
+          body: t('chat.notify.generationError')
+        })
+      }
+    } catch (e) {
+      console.error('Failed to send error notification:', e)
+    }
 
-            // 发送错误通知
-            await notificationP.showNotification({
-              id: `error-${msg.eventId}`,
-              title: t('chat.notify.generationError'),
-              body: errorMessage
-            })
-          }
-        } catch (error) {
-          console.error('Failed to load error message:', error)
-        }
-      }
-      getGeneratingMessagesCache().delete(msg.eventId)
-      generatingThreadIds.value.delete(cached.threadId)
-      // 设置会话的workingStatus为error
-      // 如果是当前活跃的会话，则直接从Map中移除
-      if (getActiveThreadId() === cached.threadId) {
-        getThreadsWorkingStatus().delete(cached.threadId)
-      } else {
-        updateThreadWorkingStatus(cached.threadId, 'error')
-      }
+    // Clear generating state for this message/thread
+    getGeneratingMessagesCache().delete(msg.eventId)
+    generatingThreadIds.value.delete(cached.threadId)
+
+    // Update working status without touching message content
+    if (getActiveThreadId() === cached.threadId) {
+      getThreadsWorkingStatus().delete(cached.threadId)
+    } else {
+      updateThreadWorkingStatus(cached.threadId, 'error')
     }
   }
 
@@ -1436,8 +1378,30 @@ export const useChatStore = defineStore('chat', () => {
       tabP.onRendererTabActivated(msg.conversationId)
     })
 
-    window.electron.ipcRenderer.on(CONVERSATION_EVENTS.MESSAGE_EDITED, (_, msgId: string) => {
-      handleMessageEdited(msgId)
+    window.electron.ipcRenderer.on(CONVERSATION_EVENTS.MESSAGE_EDITED, (_, payload: any) => {
+      try {
+        if (typeof payload === 'string') {
+          // 始终处理字符串载荷（用于父消息刷新 variants[] 等场景）
+          handleMessageEdited(payload)
+          return
+        }
+        const { messageId, revision } = payload || {}
+        if (!messageId) return // 标注来源（用于最小回退打点）
+        ;(window as any).__incomingEvent = 'MESSAGE_EDITED'
+        ;(window as any).__incomingRevision = revision ?? null
+        // 对象载荷仅接受更高 revision（去重/防乱序）
+        const map = (messageRevisions as any).value as Map<string, number>
+        const prev = map.get(messageId) || 0
+        if (typeof revision === 'number') {
+          if (revision <= prev) {
+            return
+          }
+          map.set(messageId, revision)
+        }
+        handleMessageEdited(messageId)
+      } catch (e) {
+        console.error('Failed to handle MESSAGE_EDITED payload:', e)
+      }
     })
 
     window.electron.ipcRenderer.on(CONVERSATION_EVENTS.DEACTIVATED, (_, msg) => {

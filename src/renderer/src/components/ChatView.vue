@@ -80,7 +80,9 @@ const handleFileUpload = () => {
 // 监听流式响应
 onMounted(async () => {
   window.electron.ipcRenderer.on(STREAM_EVENTS.RESPONSE, (_, msg) => {
-    // console.log('stream-response', msg)
+    // 标注来源（用于最小回退打点）
+    ;(window as any).__incomingEvent = 'STREAM_RESPONSE'
+    ;(window as any).__incomingRevision = null
     chatStore.handleStreamResponse(msg)
   })
 

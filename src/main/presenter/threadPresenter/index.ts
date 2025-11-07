@@ -767,26 +767,19 @@ export class ThreadPresenter implements IThreadPresenter {
     } = msg
     const state = this.generatingMessages.get(eventId)
     if (state) {
-      // 使用保护逻辑
+      // 使用保护逻辑：不触碰权限块；不触碰进行中的工具块
       const finalizeLastBlock = () => {
         const lastBlock =
           state.message.content.length > 0
             ? state.message.content[state.message.content.length - 1]
             : undefined
-        if (lastBlock) {
-          if (
-            lastBlock.type === 'action' &&
-            lastBlock.action_type === 'tool_call_permission' &&
-            lastBlock.status === 'pending'
-          ) {
-            lastBlock.status = 'granted'
-            return
-          }
-          // 只有当上一个块不是一个正在等待结果的工具调用时，才将其标记为成功
-          if (!(lastBlock.type === 'tool_call' && lastBlock.status === 'loading')) {
-            lastBlock.status = 'success'
-          }
-        }
+        if (!lastBlock) return
+        // 永远不要在流式过程中修改权限块状态（pending/granted/denied 仅由用户/总闸驱动）
+        if (lastBlock.type === 'action' && lastBlock.action_type === 'tool_call_permission') return
+        // 不修改进行中的工具调用
+        if (lastBlock.type === 'tool_call' && lastBlock.status === 'loading') return
+        // 其他块可以安全标记为 success
+        lastBlock.status = 'success'
       }
 
       // 记录第一个token的时间
@@ -986,12 +979,12 @@ export class ThreadPresenter implements IThreadPresenter {
             }
           }
         } else if (tool_call === 'end' || tool_call === 'error') {
-          // 查找对应的工具调用块
+          // 查找对应的工具调用块（严格按 id 匹配，避免 name 兜底导致错配）
           const toolCallBlock = state.message.content.find(
             (block) =>
               block.type === 'tool_call' &&
-              ((tool_call_id && block.tool_call?.id === tool_call_id) ||
-                block.tool_call?.name === tool_call_name) &&
+              tool_call_id &&
+              block.tool_call?.id === tool_call_id &&
               block.status === 'loading'
           )
 
@@ -4547,6 +4540,10 @@ export class ThreadPresenter implements IThreadPresenter {
     for (const perm of grantedBlocks) {
       const tc = perm.tool_call
       if (!tc || !tc.id || !tc.name) continue
+      // 防御性：显式将对应的权限块标记为已授予，避免任何异步合并导致的状态回退
+      try {
+        if (perm.status !== 'granted') perm.status = 'granted'
+      } catch {}
       let serverName = (perm.extra?.serverName as string) || tc.server_name || ''
       let serverCfg = servers[serverName]
       if (!serverName || !serverCfg) {

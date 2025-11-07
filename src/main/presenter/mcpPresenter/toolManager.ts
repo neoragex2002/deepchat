@@ -43,7 +43,7 @@ export class ToolManager {
   }
 
   // Lightweight Auth Decider within ToolManager
-  // Priority: LLM suggested permission (args.required_permission/required_privilege) -> toolsAutoApprove (server+tool) -> server.autoApprove -> heuristic fallback
+  // Priority: LLM suggested permission (args.required_permission/required_privilege) -> server.autoApprove -> heuristic fallback
   public async decidePermission(
     serverName: string,
     toolName: string,
@@ -78,27 +78,41 @@ export class ToolManager {
         ? rawReq
         : this.determinePermissionType(toolName, args)
 
-    // 2) toolsAutoApprove (server + tool) or server.autoApprove
+    // 2) server.autoApprove ∪ per-tool toolsAutoApprove（与执行期一致）
     try {
       const servers = await this.configPresenter.getMcpServers()
       const serverCfg = servers[serverName]
-      const toolsAutoApprove = (serverCfg as any)?.toolsAutoApprove as
-        | Record<string, Array<'read' | 'write' | 'all'>>
-        | undefined
-      const taa = toolsAutoApprove && toolsAutoApprove[toolName]
-      const perToolCovers = this.coversList(taa, required)
       const serverAuto = serverCfg?.autoApprove || []
       const serverCovers = this.coversList(serverAuto, required)
+      // per-tool grants (consider both final and original names)
+      let perToolCovers = false
+      try {
+        const toolsAutoApprove = (serverCfg as any)?.toolsAutoApprove as
+          | Record<string, Array<'read' | 'write' | 'all'>>
+          | undefined
+        let lists: Array<'read' | 'write' | 'all'> = []
+        if (toolsAutoApprove) {
+          // ensure mapping is loaded (best-effort)
+          try {
+            await this.getAllToolDefinitions()
+          } catch {}
+          const original = this.toolNameToTargetMap?.get(toolName)?.originalName || toolName
+          const listFinal = toolsAutoApprove[toolName] || []
+          const listOrig = toolsAutoApprove[original] || []
+          lists = [...listFinal, ...listOrig]
+        }
+        perToolCovers = this.coversList(lists, required)
+      } catch {}
 
       console.log('[ToolManager/AuthDecider]', {
         server: serverName,
         tool: toolName,
         required,
-        perToolCovers,
-        serverCovers
+        serverCovers,
+        perToolCovers
       })
 
-      if (perToolCovers || serverCovers) {
+      if (serverCovers || perToolCovers) {
         return { decision: 'AUTO_GRANT', required }
       }
     } catch {}
@@ -569,15 +583,36 @@ export class ToolManager {
       // 一次性授权：server|tool 维度消费
       let hasPermission = false
       const otKey = `${toolServerName}|${originalName}`
-      const oneTime = this.oneTimeGrantsByServerTool.get(otKey)
+      const altKey = `${toolServerName}|${finalName}`
+      let oneTime = this.oneTimeGrantsByServerTool.get(otKey)
+      if (!oneTime) oneTime = this.oneTimeGrantsByServerTool.get(altKey)
       if (oneTime && this.covers(oneTime, requiredPermission)) {
         hasPermission = true
+        // 消费时两把键同时删除，保证“一次性授权只能用一次”
         this.oneTimeGrantsByServerTool.delete(otKey)
-        console.log('[ToolManager] One-time grant consumed (server/tool).')
+        this.oneTimeGrantsByServerTool.delete(altKey)
+        console.log('[ToolManager] One-time grant consumed (server/tool).', {
+          consumedKeys: [otKey, altKey]
+        })
       }
       if (!hasPermission) {
-        // Use originalName for permission check (silent)
+        // Use originalName for permission check (silent) against server.autoApprove
         hasPermission = this.checkToolPermission(originalName, autoApprove, args)
+      }
+
+      // Also honor per-tool remembered grants to stay consistent with decidePermission()
+      if (!hasPermission) {
+        try {
+          const toolsAutoApprove = (serverConfig as any)?.toolsAutoApprove as
+            | Record<string, Array<'read' | 'write' | 'all'>>
+            | undefined
+          if (toolsAutoApprove) {
+            const listFinal = toolsAutoApprove[finalName] || []
+            const listOrig = toolsAutoApprove[originalName] || []
+            const perToolCovers = this.coversList([...listFinal, ...listOrig], requiredPermission)
+            if (perToolCovers) hasPermission = true
+          }
+        } catch {}
       }
 
       if (!hasPermission) {
@@ -838,14 +873,21 @@ export class ToolManager {
       const effective: 'read' | 'write' = permissionType === 'all' ? 'write' : permissionType
       if (toolName) {
         let resolvedToolName = toolName
+        let finalName = toolName
         try {
           await this.getAllToolDefinitions()
           const entry = this.toolNameToTargetMap?.get(toolName)
           if (entry?.originalName) resolvedToolName = entry.originalName
         } catch {}
-        const key = `${serverName}|${resolvedToolName}`
-        this.oneTimeGrantsByServerTool.set(key, effective)
-        console.log('[ToolManager] Temporary one-time grant recorded (server/tool).')
+        // 同时写入 originalName 与 finalName 两把钥匙，避免瞬时映射未就绪导致未命中
+        const keyOriginal = `${serverName}|${resolvedToolName}`
+        const keyFinal = `${serverName}|${finalName}`
+        this.oneTimeGrantsByServerTool.set(keyOriginal, effective)
+        this.oneTimeGrantsByServerTool.set(keyFinal, effective)
+        console.log('[ToolManager] Temporary one-time grant recorded (server/tool).', {
+          keyOriginal,
+          keyFinal
+        })
       }
     }
   }

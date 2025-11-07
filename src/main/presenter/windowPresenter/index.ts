@@ -12,6 +12,7 @@ import windowStateManager from 'electron-window-state' // Window state manager
 import { SHORTCUT_EVENTS } from '@/events' // Shortcut event constants
 // TrayPresenter is globally managed in main/index.ts, this Presenter is not responsible for its lifecycle
 import { TabPresenter } from '../tabPresenter' // TabPresenter type
+import { DEBUG_ROLLBACK_MIN } from '@shared/debug'
 import { FloatingChatWindow } from './FloatingChatWindow' // Floating chat window
 
 /**
@@ -52,6 +53,18 @@ export class WindowPresenter implements IWindowPresenter {
 
     ipcMain.on('get-web-contents-id', (event) => {
       event.returnValue = event.sender.id
+    })
+
+    // Minimal UI->Main debug logging channel (guarded by DEBUG_ROLLBACK_MIN)
+    ipcMain.on('debug:ui-log', (_event, data: { label: string; payload: any }) => {
+      try {
+        if (DEBUG_ROLLBACK_MIN) {
+          const safe = JSON.stringify(data?.payload ?? {})
+          console.log(`[${data?.label || 'UI.Log'}]`, safe)
+        }
+      } catch (e) {
+        console.warn('Failed to print UI debug log:', e)
+      }
     })
 
     ipcMain.on('close-floating-window', (event) => {

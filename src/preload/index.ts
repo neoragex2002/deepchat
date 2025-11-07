@@ -30,6 +30,13 @@ const api = {
     }
     cachedWebContentsId = ipcRenderer.sendSync('get-web-contents-id')
     return cachedWebContentsId
+  },
+  debugLog: (label: string, payload: any) => {
+    try {
+      ipcRenderer.send('debug:ui-log', { label, payload })
+    } catch (e) {
+      console.error('Preload: debugLog failed:', e)
+    }
   }
 }
 exposeElectronAPI()

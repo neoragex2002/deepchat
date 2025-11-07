@@ -40,3 +40,7 @@
 - Patterns: Presenter pattern in main; EventBus for inter-process events; two-layer LLM provider (Agent Loop + Provider); integrated MCP tools.
 - Secrets: use `.env` (see `.env.example`); never commit keys.
 - Toolchains: Node ≥ 20.19, pnpm ≥ 10.11 (pnpm only). Windows: enable Developer Mode for symlinks.
+
+## 当前工作任务、工作背景
+- 目前的工作任务是实施一项系统重构工作，旨在实现一套全新的、**“工具调用收集 → 授权总闸 → 被调用工具统一执行 → 模型继续作答”**的工作流范式。其核心在于将工具调用的**执行与权限决策的职责**从底层 `LLMProviderPresenter` **彻底下沉**至上层协调者 `ThreadPresenter`。这一结构性调整，辅以授权策略的集中管理和一次性批量处理，将彻底改变 DeepChat 处理函数调用方式。
+- 开展工作前，请先阅读docs_luy/terminology.md和progress.md两个文档，了解术语体系、以及前期工作背景。

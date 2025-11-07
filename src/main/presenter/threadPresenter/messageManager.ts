@@ -19,6 +19,8 @@ import { CONVERSATION_EVENTS } from '@/events'
 
 export class MessageManager implements IMessageManager {
   private sqlitePresenter: ISQLitePresenter
+  // message-level revision map (in-memory, monotonic per messageId)
+  private revisionMap: Map<string, number> = new Map()
 
   constructor(sqlitePresenter: ISQLitePresenter) {
     this.sqlitePresenter = sqlitePresenter
@@ -116,8 +118,16 @@ export class MessageManager implements IMessageManager {
       throw new Error(`Message ${messageId} not found`)
     }
     const msg = this.convertToMessage(message)
-    eventBus.sendToRenderer(CONVERSATION_EVENTS.MESSAGE_EDITED, SendTarget.ALL_WINDOWS, messageId)
+    // Increase and emit message revision
+    const cur = this.revisionMap.get(messageId) || 0
+    const next = cur + 1
+    this.revisionMap.set(messageId, next)
+    eventBus.sendToRenderer(CONVERSATION_EVENTS.MESSAGE_EDITED, SendTarget.ALL_WINDOWS, {
+      messageId,
+      revision: next
+    })
     if (msg.parentId) {
+      // Parent update notification (no revision attached)
       eventBus.sendToRenderer(
         CONVERSATION_EVENTS.MESSAGE_EDITED,
         SendTarget.ALL_WINDOWS,
