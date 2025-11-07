@@ -164,27 +164,6 @@ describe('Message Block Data Structure Snapshot Tests', () => {
       expect(block).toMatchSnapshot()
     })
 
-    it('should map permission required event consistently', () => {
-      const event: LLMAgentEvent = {
-        type: 'response',
-        data: {
-          eventId: 'test-123',
-          tool_call: 'permission-required',
-          tool_call_id: 'tool-789',
-          tool_call_name: 'writeFile',
-          permission_request: {
-            toolName: 'writeFile',
-            serverName: 'filesystem',
-            permissionType: 'write',
-            description: 'Write to local file system'
-          }
-        }
-      }
-
-      const block = mapEventToBlock(event)
-      expect(block).toMatchSnapshot()
-    })
-
     it('should map rate limit event consistently', () => {
       const event: LLMAgentEvent = {
         type: 'response',
@@ -279,19 +258,6 @@ function mapEventToBlock(event: LLMAgentEvent): AssistantMessageBlock {
             id: data.tool_call_id,
             name: data.tool_call_name,
             params: data.tool_call_params
-          }
-        }
-      }
-
-      if (data.tool_call === 'permission-required') {
-        return {
-          type: 'action',
-          action_type: 'tool_call_permission',
-          status: 'pending',
-          timestamp,
-          tool_call: {
-            id: data.tool_call_id,
-            name: data.tool_call_name
           }
         }
       }

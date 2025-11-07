@@ -985,11 +985,6 @@ export class ThreadPresenter implements IThreadPresenter {
               toolCallBlock.tool_call.server_description = tool_call_server_description
             }
           }
-        } else if (tool_call === 'permission-required') {
-          // legacy path (provider-side permission interception) is no longer used in collect-only mode
-          console.warn(
-            '[ThreadPresenter] Ignoring legacy permission-required event in collect-only mode'
-          )
         } else if (tool_call === 'end' || tool_call === 'error') {
           // 查找对应的工具调用块
           const toolCallBlock = state.message.content.find(

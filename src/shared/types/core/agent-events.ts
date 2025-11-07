@@ -13,13 +13,7 @@ export interface LLMAgentEventData {
   tool_call_server_icons?: string
   tool_call_server_description?: string
   tool_call_response_raw?: unknown
-  tool_call?: 'start' | 'running' | 'end' | 'error' | 'update' | 'permission-required'
-  permission_request?: {
-    toolName: string
-    serverName: string
-    permissionType: 'read' | 'write' | 'all'
-    description: string
-  }
+  tool_call?: 'start' | 'running' | 'end' | 'error' | 'update'
   totalUsage?: UsageStats
   image_data?: { data: string; mimeType: string }
   rate_limit?: RateLimitInfo

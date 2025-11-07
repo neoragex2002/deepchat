@@ -102,37 +102,6 @@ describe('Renderer Contract Tests', () => {
       expect(mapEventToBlock(agentEvent)).toEqual(expectedBlock)
     })
 
-    it('should map permission request correctly', () => {
-      const agentEvent: LLMAgentEvent = {
-        type: 'response',
-        data: {
-          eventId: 'test-123',
-          tool_call: 'permission-required',
-          tool_call_id: 'tool-789',
-          tool_call_name: 'writeFile',
-          permission_request: {
-            toolName: 'writeFile',
-            serverName: 'filesystem',
-            permissionType: 'write',
-            description: 'Write to local file system'
-          }
-        }
-      }
-
-      const expectedBlock: AssistantMessageBlock = {
-        type: 'action',
-        action_type: 'tool_call_permission',
-        status: 'pending',
-        timestamp: expect.any(Number),
-        tool_call: {
-          id: 'tool-789',
-          name: 'writeFile'
-        }
-      }
-
-      expect(mapEventToBlock(agentEvent)).toEqual(expectedBlock)
-    })
-
     it('should map rate limit correctly', () => {
       const agentEvent: LLMAgentEvent = {
         type: 'response',
@@ -487,19 +456,6 @@ function mapEventToBlock(event: LLMAgentEvent): AssistantMessageBlock {
           tool_call: {
             id: data.tool_call_id,
             response: data.tool_call_response
-          }
-        }
-      }
-
-      if (data.tool_call === 'permission-required') {
-        return {
-          type: 'action',
-          action_type: 'tool_call_permission',
-          status: 'pending',
-          timestamp,
-          tool_call: {
-            id: data.tool_call_id,
-            name: data.tool_call_name
           }
         }
       }
