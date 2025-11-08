@@ -37,6 +37,8 @@ export abstract class BaseLLMProvider {
   protected customModels: MODEL_META[] = []
   protected isInitialized: boolean = false
   protected configPresenter: IConfigPresenter
+  // Current stream eventId for generating stable synthetic IDs in non-native FC
+  protected currentEventId?: string
 
   protected defaultHeaders: Record<string, string> = {
     'HTTP-Referer': 'https://deepchatai.cn',
@@ -50,6 +52,14 @@ export abstract class BaseLLMProvider {
 
     // Initialize models and customModels from cached config data
     this.loadCachedModels()
+  }
+
+  /**
+   * Set current stream eventId so providers can include it in synthetic IDs
+   * for non-native function calls.
+   */
+  public setCurrentEventId(eventId: string) {
+    this.currentEventId = eventId
   }
 
   /**

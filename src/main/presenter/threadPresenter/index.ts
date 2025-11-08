@@ -10,7 +10,6 @@ import {
   ISQLitePresenter,
   IConfigPresenter,
   ILlmProviderPresenter,
-  MCPToolResponse,
   ChatMessage,
   ChatMessageContent,
   LLMAgentEventData
@@ -37,6 +36,7 @@ import { getFileContext } from './fileContext'
 import { ContentEnricher } from './contentEnricher'
 import { CONVERSATION_EVENTS, STREAM_EVENTS, TAB_EVENTS } from '@/events'
 import { DEFAULT_SETTINGS } from './const'
+import { DEBUG } from '@shared/debug'
 
 interface GeneratingMessageState {
   message: AssistantMessage
@@ -124,6 +124,49 @@ export class ThreadPresenter implements IThreadPresenter {
     this.messageManager.initializeUnfinishedMessages()
   }
 
+  private audit(tag: string, msgId: string, where: string, extra?: Record<string, unknown>) {
+    if (!DEBUG.TP_AUDIT_LOG) return
+    try {
+      const payload: Record<string, unknown> = { ts: Date.now(), tag, msgId, where }
+      if (extra && typeof extra === 'object') {
+        for (const [k, v] of Object.entries(extra)) payload[k] = v
+      }
+      console.log(JSON.stringify(payload))
+    } catch {}
+  }
+
+  // 在错误落库前，先把内存中的部分生成内容持久化，避免丢失用户已看到的文本
+  private async persistInMemoryContentBeforeError(messageId: string): Promise<void> {
+    const st = this.generatingMessages.get(messageId)
+    if (!st) return
+    try {
+      const { message, revision } = await this.messageManager.editMessageSilently(
+        messageId,
+        JSON.stringify(st.message.content)
+      )
+      this.emitMessageEdited(messageId, revision, message.parentId)
+    } catch (e) {
+      console.warn('[ErrorGuard] Failed to persist partial content before error:', e)
+    }
+  }
+
+  private emitMessageEdited(messageId: string, revision: number, parentId?: string | null) {
+    try {
+      eventBus.sendToRenderer(CONVERSATION_EVENTS.MESSAGE_EDITED, SendTarget.ALL_WINDOWS, {
+        messageId,
+        revision
+      })
+      if (parentId) {
+        eventBus.sendToRenderer(
+          CONVERSATION_EVENTS.MESSAGE_EDITED,
+          SendTarget.ALL_WINDOWS,
+          parentId
+        )
+      }
+      this.audit('ME.emit', messageId, 'TP', { rev: revision })
+    } catch {}
+  }
+
   /**
    * 新增：查找指定会话ID所在的Tab ID
    * @param conversationId 会话ID
@@ -168,10 +211,20 @@ export class ThreadPresenter implements IThreadPresenter {
       // 清理缓冲相关资源
       this.cleanupContentBuffer(state)
 
-      await this.messageManager.handleMessageError(eventId, String(error))
+      // 先持久化内存中的部分生成内容，避免错误覆盖掉用户已看到的文本
+      await this.persistInMemoryContentBeforeError(eventId)
+
+      try {
+        const { message, revision } = await this.messageManager.handleMessageError(
+          eventId,
+          String(error)
+        )
+        this.emitMessageEdited(eventId, revision, message.parentId)
+      } catch {}
       this.generatingMessages.delete(eventId)
     }
     eventBus.sendToRenderer(STREAM_EVENTS.ERROR, SendTarget.ALL_WINDOWS, msg)
+    this.audit('ERR', eventId, 'S1')
   }
 
   async handleLLMAgentEnd(msg: LLMAgentEventData) {
@@ -184,10 +237,7 @@ export class ThreadPresenter implements IThreadPresenter {
 
       // 统一准则：以 DB 为准。先刷新当前助手消息的最新内容，避免使用过期的内存态覆盖最新内容
       try {
-        const latest = await this.messageManager.getMessage(eventId)
-        if (latest && latest.role === 'assistant') {
-          state.message.content = latest.content as AssistantMessageBlock[]
-        }
+        /* no-op: keep in-memory content; do not refresh from DB at END */
       } catch (e) {
         console.warn('[ThreadPresenter] Failed to refresh latest message before END handling:', e)
       }
@@ -288,10 +338,17 @@ export class ThreadPresenter implements IThreadPresenter {
             else if (block.status === 'granted') grantedCount++
             else if (block.status === 'denied') deniedCount++
           }
-          await this.messageManager.editMessage(eventId, JSON.stringify(content))
+          {
+            const { message, revision } = await this.messageManager.editMessageSilently(
+              eventId,
+              JSON.stringify(content)
+            )
+            this.emitMessageEdited(eventId, revision, message.parentId)
+          }
           try {
             state.message.content = content
           } catch {}
+          this.audit('ME', eventId, 'END.inject')
           this.logPermissionSummary(state.message.content, `END.inject`, eventId)
           console.log(
             `[Permission] Injected ${planned.length} blocks (pending=${pendingCount}, granted=${grantedCount}, denied=${deniedCount}) for message ${eventId}`
@@ -301,10 +358,12 @@ export class ThreadPresenter implements IThreadPresenter {
             if (grantedCount >= 1) {
               // 通知渲染层本轮 Provider 流已结束（确保 UI 刷新并展示已注入的块）
               eventBus.sendToRenderer(STREAM_EVENTS.END, SendTarget.ALL_WINDOWS, msg)
+              this.audit('END', eventId, 'S1')
               await this.executeGrantedToolsAndContinue(eventId)
             } else {
               // 通知渲染层 END，再继续作答流程
               eventBus.sendToRenderer(STREAM_EVENTS.END, SendTarget.ALL_WINDOWS, msg)
+              this.audit('END', eventId, 'S1')
               await this.continueAfterAllDenied(eventId)
             }
             return
@@ -312,6 +371,7 @@ export class ThreadPresenter implements IThreadPresenter {
           // Otherwise keep message in generating state, waiting for user actions
           // 即便等待用户授权，也需要向渲染层发送 END，触发前端解除“生成中”并刷新消息内容
           eventBus.sendToRenderer(STREAM_EVENTS.END, SendTarget.ALL_WINDOWS, msg)
+          this.audit('END', eventId, 'S1')
           return
         }
       } catch (e) {
@@ -340,7 +400,13 @@ export class ThreadPresenter implements IThreadPresenter {
             block.status = 'success'
           }
         })
-        await this.messageManager.editMessage(eventId, JSON.stringify(content))
+        {
+          const { message, revision } = await this.messageManager.editMessageSilently(
+            eventId,
+            JSON.stringify(content)
+          )
+          this.emitMessageEdited(eventId, revision, message.parentId)
+        }
         try {
           state.message.content = content
         } catch {}
@@ -357,6 +423,7 @@ export class ThreadPresenter implements IThreadPresenter {
     }
 
     eventBus.sendToRenderer(STREAM_EVENTS.END, SendTarget.ALL_WINDOWS, msg)
+    this.audit('END', eventId, 'S1')
   }
 
   // 清理所有缓冲相关资源
@@ -467,7 +534,20 @@ export class ThreadPresenter implements IThreadPresenter {
     // 更新消息的usage信息
     await this.messageManager.updateMessageMetadata(eventId, metadata)
     await this.messageManager.updateMessageStatus(eventId, 'sent')
-    await this.messageManager.editMessage(eventId, JSON.stringify(state.message.content))
+    try {
+      const { message, revision } = await this.messageManager.editMessageSilently(
+        eventId,
+        JSON.stringify(state.message.content)
+      )
+      this.emitMessageEdited(eventId, revision, message.parentId)
+      this.audit('ME', eventId, 'FINALIZE')
+    } catch (e) {
+      console.warn('[ThreadPresenter] SKIP.finalize: message not found, abort finalize', {
+        messageId: eventId
+      })
+      this.generatingMessages.delete(eventId)
+      return
+    }
     this.generatingMessages.delete(eventId)
 
     if (ThreadPresenter.DEBUG_STEP_LOG) {
@@ -483,12 +563,17 @@ export class ThreadPresenter implements IThreadPresenter {
     await this.handleConversationUpdates(state)
 
     // 广播消息生成完成事件
-    const finalMessage = await this.messageManager.getMessage(eventId)
-    if (finalMessage) {
-      eventBus.sendToMain(CONVERSATION_EVENTS.MESSAGE_GENERATED, {
-        conversationId: finalMessage.conversationId,
-        message: finalMessage
-      })
+    try {
+      const finalMessage = await this.messageManager.getMessage(eventId)
+      if (finalMessage) {
+        eventBus.sendToMain(CONVERSATION_EVENTS.MESSAGE_GENERATED, {
+          conversationId: finalMessage.conversationId,
+          message: finalMessage
+        })
+      }
+    } catch {
+      // swallow missing message at broadcast stage
+      this.audit('SKIP.broadcast', eventId, 'FINALIZE')
     }
   }
 
@@ -664,7 +749,7 @@ export class ThreadPresenter implements IThreadPresenter {
         contentBlock.content += batchContent
 
         // 更新数据库
-        await this.messageManager.editMessage(eventId, JSON.stringify(state.message.content))
+        // 流式阶段不落库，仅通过 RESPONSE 提示 UI
 
         // 发送渲染器事件
         const eventData: any = {
@@ -719,7 +804,7 @@ export class ThreadPresenter implements IThreadPresenter {
     }
 
     // 只更新数据库，不额外发送到渲染器（避免重复发送）
-    await this.messageManager.editMessage(eventId, JSON.stringify(state.message.content))
+    // 流式阶段不落库，仅通过 RESPONSE 提示 UI
   }
 
   // 完成最后一个块的状态
@@ -755,12 +840,10 @@ export class ThreadPresenter implements IThreadPresenter {
       tool_call_id,
       tool_call_name,
       tool_call_params,
-      tool_call_response,
       maximum_tool_calls_reached,
       tool_call_server_name,
       tool_call_server_icons,
       tool_call_server_description,
-      tool_call_response_raw,
       tool_call,
       totalUsage,
       image_data
@@ -815,7 +898,7 @@ export class ThreadPresenter implements IThreadPresenter {
             needContinue: true
           }
         })
-        await this.messageManager.editMessage(eventId, JSON.stringify(state.message.content))
+        // 流式阶段不落库，仅通过 RESPONSE 提示 UI
         return
       }
 
@@ -832,102 +915,7 @@ export class ThreadPresenter implements IThreadPresenter {
 
       const lastBlock = state.message.content[state.message.content.length - 1]
 
-      // 检查tool_call_response_raw中是否包含搜索结果
-      if (tool_call_response_raw && tool_call === 'end') {
-        try {
-          // 检查返回的内容中是否有deepchat-webpage类型的资源
-          // 确保content是数组才调用some方法
-          const hasSearchResults =
-            Array.isArray(tool_call_response_raw.content) &&
-            tool_call_response_raw.content.some(
-              (item: { type: string; resource?: { mimeType: string } }) =>
-                item?.type === 'resource' &&
-                item?.resource?.mimeType === 'application/deepchat-webpage'
-            )
-
-          if (hasSearchResults && Array.isArray(tool_call_response_raw.content)) {
-            // 解析搜索结果
-            const searchResults = tool_call_response_raw.content
-              .filter(
-                (item: {
-                  type: string
-                  resource?: { mimeType: string; text: string; uri?: string }
-                }) =>
-                  item.type === 'resource' &&
-                  item.resource?.mimeType === 'application/deepchat-webpage'
-              )
-              .map((item: { resource: { text: string; uri?: string } }) => {
-                try {
-                  const blobContent = JSON.parse(item.resource.text) as {
-                    title?: string
-                    url?: string
-                    content?: string
-                    icon?: string
-                  }
-                  return {
-                    title: blobContent.title || '',
-                    url: blobContent.url || item.resource.uri || '',
-                    content: blobContent.content || '',
-                    description: blobContent.content || '',
-                    icon: blobContent.icon || ''
-                  }
-                } catch (e) {
-                  console.error('解析搜索结果失败:', e)
-                  return null
-                }
-              })
-              .filter(Boolean)
-
-            if (searchResults.length > 0) {
-              // 检查是否已经存在搜索块
-              const existingSearchBlock =
-                state.message.content.length > 0 && state.message.content[0].type === 'search'
-                  ? state.message.content[0]
-                  : null
-
-              if (existingSearchBlock) {
-                // 如果已经存在搜索块，更新其状态和总数
-                existingSearchBlock.status = 'success'
-                existingSearchBlock.timestamp = currentTime
-                if (existingSearchBlock.extra) {
-                  // 累加搜索结果数量
-                  existingSearchBlock.extra.total =
-                    (existingSearchBlock.extra.total || 0) + searchResults.length
-                } else {
-                  existingSearchBlock.extra = {
-                    total: searchResults.length
-                  }
-                }
-              } else {
-                // 如果不存在搜索块，创建新的并添加到内容的最前面
-                const searchBlock: AssistantMessageBlock = {
-                  type: 'search',
-                  content: '',
-                  status: 'success',
-                  timestamp: currentTime,
-                  extra: {
-                    total: searchResults.length
-                  }
-                }
-                state.message.content.unshift(searchBlock)
-              }
-
-              // 保存搜索结果
-              for (const result of searchResults) {
-                await this.sqlitePresenter.addMessageAttachment(
-                  eventId,
-                  'search_result',
-                  JSON.stringify(result)
-                )
-              }
-
-              await this.messageManager.editMessage(eventId, JSON.stringify(state.message.content))
-            }
-          }
-        } catch (error) {
-          console.error('处理搜索结果时出错:', error)
-        }
-      }
+      // Collect-only: ignore any tool_call_response_raw based search result injections during stream
 
       // 处理工具调用
       if (tool_call) {
@@ -989,23 +977,8 @@ export class ThreadPresenter implements IThreadPresenter {
           )
 
           if (toolCallBlock && toolCallBlock.type === 'tool_call') {
-            if (tool_call === 'error') {
-              toolCallBlock.status = 'error'
-              if (toolCallBlock.tool_call) {
-                const env = {
-                  ok: false,
-                  error: 'tool_execution_error',
-                  data: tool_call_response ?? null
-                }
-                toolCallBlock.tool_call.response = JSON.stringify(env)
-              }
-            } else {
-              toolCallBlock.status = 'success'
-              if (toolCallBlock.tool_call) {
-                const env = { ok: true, data: tool_call_response ?? null }
-                toolCallBlock.tool_call.response = JSON.stringify(env)
-              }
-            }
+            // Collect-only: mark parsing lifecycle for UI hints only, do not attach execution results
+            toolCallBlock.status = tool_call === 'error' ? 'error' : 'success'
           }
         }
       } else if (image_data) {
@@ -1046,7 +1019,7 @@ export class ThreadPresenter implements IThreadPresenter {
       }
 
       // 更新消息内容
-      await this.messageManager.editMessage(eventId, JSON.stringify(state.message.content))
+      // 流式阶段不落库，仅通过 RESPONSE 提示 UI
       if (ThreadPresenter.DEBUG_STEP_LOG && tool_call) {
         this.logPermissionSummary(state.message.content, `STREAM.${tool_call}`, eventId)
       }
@@ -1678,7 +1651,13 @@ export class ThreadPresenter implements IThreadPresenter {
       }
     }
     state.message.content.unshift(searchBlock)
-    await this.messageManager.editMessage(messageId, JSON.stringify(state.message.content))
+    {
+      const { message, revision } = await this.messageManager.editMessageSilently(
+        messageId,
+        JSON.stringify(state.message.content)
+      )
+      this.emitMessageEdited(messageId, revision, message.parentId)
+    }
     // 标记消息为搜索状态
     state.isSearching = true
     this.searchingMessages.add(messageId)
@@ -1722,7 +1701,13 @@ export class ThreadPresenter implements IThreadPresenter {
 
       // 重写搜索查询
       searchBlock.status = 'optimizing'
-      await this.messageManager.editMessage(messageId, JSON.stringify(state.message.content))
+      {
+        const { message, revision } = await this.messageManager.editMessageSilently(
+          messageId,
+          JSON.stringify(state.message.content)
+        )
+        this.emitMessageEdited(messageId, revision, message.parentId)
+      }
 
       const optimizedQuery = await this.rewriteUserSearchQuery(
         query,
@@ -1738,7 +1723,13 @@ export class ThreadPresenter implements IThreadPresenter {
       if (optimizedQuery.includes('无须搜索')) {
         searchBlock.status = 'success'
         searchBlock.content = ''
-        await this.messageManager.editMessage(messageId, JSON.stringify(state.message.content))
+        {
+          const { message, revision } = await this.messageManager.editMessageSilently(
+            messageId,
+            JSON.stringify(state.message.content)
+          )
+          this.emitMessageEdited(messageId, revision, message.parentId)
+        }
         state.isSearching = false
         this.searchingMessages.delete(messageId)
         return []
@@ -1749,7 +1740,13 @@ export class ThreadPresenter implements IThreadPresenter {
 
       // 更新搜索状态为阅读中
       searchBlock.status = 'reading'
-      await this.messageManager.editMessage(messageId, JSON.stringify(state.message.content))
+      {
+        const { message, revision } = await this.messageManager.editMessageSilently(
+          messageId,
+          JSON.stringify(state.message.content)
+        )
+        this.emitMessageEdited(messageId, revision, message.parentId)
+      }
 
       // 开始搜索
       const results = await this.searchManager.search(conversationId, optimizedQuery)
@@ -1761,7 +1758,13 @@ export class ThreadPresenter implements IThreadPresenter {
       searchBlock.extra = {
         total: results.length
       }
-      await this.messageManager.editMessage(messageId, JSON.stringify(state.message.content))
+      {
+        const { message, revision } = await this.messageManager.editMessageSilently(
+          messageId,
+          JSON.stringify(state.message.content)
+        )
+        this.emitMessageEdited(messageId, revision, message.parentId)
+      }
 
       // 保存搜索结果
       for (const result of results) {
@@ -1786,7 +1789,13 @@ export class ThreadPresenter implements IThreadPresenter {
 
       // 更新搜索状态为成功
       searchBlock.status = 'success'
-      await this.messageManager.editMessage(messageId, JSON.stringify(state.message.content))
+      {
+        const { message, revision } = await this.messageManager.editMessageSilently(
+          messageId,
+          JSON.stringify(state.message.content)
+        )
+        this.emitMessageEdited(messageId, revision, message.parentId)
+      }
 
       // 标记消息搜索完成
       state.isSearching = false
@@ -1801,7 +1810,13 @@ export class ThreadPresenter implements IThreadPresenter {
       // 更新搜索状态为错误
       searchBlock.status = 'error'
       searchBlock.content = String(error)
-      await this.messageManager.editMessage(messageId, JSON.stringify(state.message.content))
+      {
+        const { message, revision } = await this.messageManager.editMessageSilently(
+          messageId,
+          JSON.stringify(state.message.content)
+        )
+        this.emitMessageEdited(messageId, revision, message.parentId)
+      }
 
       if (String(error).includes('userCanceledGeneration')) {
         // 如果是取消操作导致的错误，确保搜索窗口关闭
@@ -1954,7 +1969,15 @@ export class ThreadPresenter implements IThreadPresenter {
       }
 
       console.error('流式生成过程中出错:', error)
-      await this.messageManager.handleMessageError(state.message.id, String(error))
+      // 先持久化内存中的部分生成内容
+      await this.persistInMemoryContentBeforeError(state.message.id)
+      try {
+        const { message, revision } = await this.messageManager.handleMessageError(
+          state.message.id,
+          String(error)
+        )
+        this.emitMessageEdited(state.message.id, revision, message.parentId)
+      } catch {}
       throw error
     }
   }
@@ -1988,10 +2011,10 @@ export class ThreadPresenter implements IThreadPresenter {
       }
 
       // 3. 检查是否是 maximum_tool_calls_reached
-      let toolCallResponse: { content: string; rawData: MCPToolResponse } | null = null
-      const toolCall = lastActionBlock.tool_call
-
-      if (lastActionBlock.action_type === 'maximum_tool_calls_reached' && toolCall) {
+      if (
+        lastActionBlock.action_type === 'maximum_tool_calls_reached' &&
+        lastActionBlock.tool_call
+      ) {
         // 设置 needContinue 为 0（false）
         if (lastActionBlock.extra) {
           lastActionBlock.extra = {
@@ -1999,27 +2022,12 @@ export class ThreadPresenter implements IThreadPresenter {
             needContinue: false
           }
         }
-        await this.messageManager.editMessage(queryMsgId, JSON.stringify(content))
-
-        // 4. 检查工具调用参数
-        if (!toolCall.id || !toolCall.name || !toolCall.params) {
-          // 参数不完整就跳过，然后继续执行即可
-          console.warn('工具调用参数不完整')
-        } else {
-          // 5. 调用工具获取结果
-          toolCallResponse = await presenter.mcpPresenter.callTool({
-            id: toolCall.id,
-            type: 'function',
-            function: {
-              name: toolCall.name,
-              arguments: toolCall.params
-            },
-            server: {
-              name: toolCall.server_name || '',
-              icons: toolCall.server_icons || '',
-              description: toolCall.server_description || ''
-            }
-          })
+        {
+          const { message, revision } = await this.messageManager.editMessageSilently(
+            queryMsgId,
+            JSON.stringify(content)
+          )
+          this.emitMessageEdited(queryMsgId, revision, message.parentId)
         }
       }
 
@@ -2068,47 +2076,7 @@ export class ThreadPresenter implements IThreadPresenter {
       // 8. 更新生成状态
       await this.updateGenerationState(state, promptTokens)
 
-      // 9. 如果有工具调用结果，发送工具调用结果事件
-      if (toolCallResponse && toolCall) {
-        // console.log('toolCallResponse', toolCallResponse)
-        eventBus.sendToRenderer(STREAM_EVENTS.RESPONSE, SendTarget.ALL_WINDOWS, {
-          eventId: state.message.id,
-          content: '',
-          tool_call: 'start',
-          tool_call_id: toolCall.id,
-          tool_call_name: toolCall.name,
-          tool_call_params: toolCall.params,
-          tool_call_response: toolCallResponse.content,
-          tool_call_server_name: toolCall.server_name,
-          tool_call_server_icons: toolCall.server_icons,
-          tool_call_server_description: toolCall.server_description
-        })
-        eventBus.sendToRenderer(STREAM_EVENTS.RESPONSE, SendTarget.ALL_WINDOWS, {
-          eventId: state.message.id,
-          content: '',
-          tool_call: 'running',
-          tool_call_id: toolCall.id,
-          tool_call_name: toolCall.name,
-          tool_call_params: toolCall.params,
-          tool_call_response: toolCallResponse.content,
-          tool_call_server_name: toolCall.server_name,
-          tool_call_server_icons: toolCall.server_icons,
-          tool_call_server_description: toolCall.server_description
-        })
-        eventBus.sendToRenderer(STREAM_EVENTS.RESPONSE, SendTarget.ALL_WINDOWS, {
-          eventId: state.message.id,
-          content: '',
-          tool_call: 'end',
-          tool_call_id: toolCall.id,
-          tool_call_response: toolCallResponse.content,
-          tool_call_name: toolCall.name,
-          tool_call_params: toolCall.params,
-          tool_call_server_name: toolCall.server_name,
-          tool_call_server_icons: toolCall.server_icons,
-          tool_call_server_description: toolCall.server_description,
-          tool_call_response_raw: toolCallResponse.rawData
-        })
-      }
+      // 9. 不再通过流事件回注工具执行结果（collect-only 模式）
 
       // 10. 启动流式生成
       const stream = this.llmProviderPresenter.startStreamCompletion(
@@ -2144,7 +2112,15 @@ export class ThreadPresenter implements IThreadPresenter {
       }
 
       console.error('继续生成过程中出错:', error)
-      await this.messageManager.handleMessageError(state.message.id, String(error))
+      // 先持久化内存中的部分生成内容
+      await this.persistInMemoryContentBeforeError(state.message.id)
+      try {
+        const { message, revision } = await this.messageManager.handleMessageError(
+          state.message.id,
+          String(error)
+        )
+        this.emitMessageEdited(state.message.id, revision, message.parentId)
+      } catch {}
       throw error
     }
   }
@@ -2971,7 +2947,9 @@ export class ThreadPresenter implements IThreadPresenter {
   }
 
   async editMessage(messageId: string, content: string): Promise<Message> {
-    return await this.messageManager.editMessage(messageId, content)
+    const { message, revision } = await this.messageManager.editMessageSilently(messageId, content)
+    this.emitMessageEdited(messageId, revision, message.parentId)
+    return message
   }
 
   async deleteMessage(messageId: string): Promise<void> {
@@ -3155,7 +3133,13 @@ export class ThreadPresenter implements IThreadPresenter {
 
       // 更新消息状态和内容
       await this.messageManager.updateMessageStatus(messageId, 'error')
-      await this.messageManager.editMessage(messageId, JSON.stringify(state.message.content))
+      {
+        const { message, revision } = await this.messageManager.editMessageSilently(
+          messageId,
+          JSON.stringify(state.message.content)
+        )
+        this.emitMessageEdited(messageId, revision, message.parentId)
+      }
 
       // 停止流式生成
       await this.llmProviderPresenter.stopStream(messageId)
@@ -4318,7 +4302,23 @@ export class ThreadPresenter implements IThreadPresenter {
       }
 
       // 3. 保存消息更新（以 DB 为准，合并写库）
-      await this.messageManager.editMessage(messageId, JSON.stringify(content))
+      {
+        const { message, revision } = await this.messageManager.editMessageSilently(
+          messageId,
+          JSON.stringify(content)
+        )
+        this.emitMessageEdited(messageId, revision, message.parentId)
+      }
+      try {
+        const perms = content.filter(
+          (b) => b.type === 'action' && (b as any).action_type === 'tool_call_permission'
+        )
+        const p = perms.filter((b) => b.status === 'pending').length
+        const g = perms.filter((b) => b.status === 'granted').length
+        const d = perms.filter((b) => b.status === 'denied').length
+        const e = perms.filter((b) => b.status === 'error').length
+        this.audit('PERM.update', messageId, 'S1', { perm: { p, g, d, e } })
+      } catch {}
       // 同步内存态：确保 resumeStreamCompletion 使用到最新的权限块与工具信息
       try {
         const st = this.generatingMessages.get(messageId)
@@ -4399,9 +4399,18 @@ export class ThreadPresenter implements IThreadPresenter {
 
       // 确保消息状态正确更新
       try {
-        const message = await this.messageManager.getMessage(messageId)
-        if (message) {
-          await this.messageManager.handleMessageError(messageId, String(error))
+        // 先持久化内存中的部分生成内容（若存在）
+        await this.persistInMemoryContentBeforeError(messageId)
+        let exists = false
+        try {
+          await this.messageManager.getMessage(messageId)
+          exists = true
+        } catch {}
+        if (exists) {
+          const res = await this.messageManager.handleMessageError(messageId, String(error))
+          this.emitMessageEdited(messageId, res.revision, res.message.parentId)
+        } else {
+          console.warn('[Permission] SKIP.updateError: message not found', { messageId })
         }
       } catch (updateError) {
         console.error(`[Permission] Failed to update message error status:`, updateError)
@@ -4413,7 +4422,15 @@ export class ThreadPresenter implements IThreadPresenter {
 
   // 在全部被拒绝时，注入说明并触发一次继续作答
   private async continueAfterAllDenied(messageId: string): Promise<void> {
-    const message = await this.messageManager.getMessage(messageId)
+    let message: Message | null = null
+    try {
+      message = await this.messageManager.getMessage(messageId)
+    } catch {
+      console.warn('[ThreadPresenter] SKIP.continueAfterAllDenied: message not found', {
+        messageId
+      })
+      return
+    }
     if (!message || message.role !== 'assistant') return
 
     const content = message.content as AssistantMessageBlock[]
@@ -4451,7 +4468,13 @@ export class ThreadPresenter implements IThreadPresenter {
       }
     }
 
-    await this.messageManager.editMessage(messageId, JSON.stringify(content))
+    {
+      const { message, revision } = await this.messageManager.editMessageSilently(
+        messageId,
+        JSON.stringify(content)
+      )
+      this.emitMessageEdited(messageId, revision, message.parentId)
+    }
 
     // 同步内存态，保持与 DB 一致
     try {
@@ -4474,15 +4497,28 @@ export class ThreadPresenter implements IThreadPresenter {
       })
       // ensure state (quiet)
     }
+    this.audit('CONT.start', messageId, 'R2')
     await this.startStreamCompletion(conversationId, messageId, undefined, 'toolcall_continue')
+    this.audit('CONT.end', messageId, 'R2')
   }
 
   // 统一执行 granted 的工具调用，并触发一次“继续作答”
   private async executeGrantedToolsAndContinue(messageId: string): Promise<void> {
     console.log(`[Permission] Executing granted tools and continuing: ${messageId}`)
-    const message = await this.messageManager.getMessage(messageId)
+    let message: Message | null = null
+    try {
+      message = await this.messageManager.getMessage(messageId)
+    } catch (e) {
+      console.warn('[ThreadPresenter] SKIP.executeGranted: message not found', {
+        messageId
+      })
+      return
+    }
     if (!message || message.role !== 'assistant') {
-      throw new Error('executeGrantedToolsAndContinue: message not found or not assistant')
+      console.warn('[ThreadPresenter] SKIP.executeGranted: not an assistant message', {
+        messageId
+      })
+      return
     }
 
     const content = message.content as AssistantMessageBlock[]
@@ -4717,7 +4753,13 @@ export class ThreadPresenter implements IThreadPresenter {
             const st = this.generatingMessages.get(messageId)
             if (st) st.message.content = content
           } catch {}
-          await this.messageManager.editMessage(messageId, JSON.stringify(content))
+          {
+            const { message, revision } = await this.messageManager.editMessageSilently(
+              messageId,
+              JSON.stringify(content)
+            )
+            this.emitMessageEdited(messageId, revision, message.parentId)
+          }
           needsMorePermission = true
           continue
         }
@@ -4755,6 +4797,11 @@ export class ThreadPresenter implements IThreadPresenter {
           toolBlock.tool_call.server_icons = server.icons
           toolBlock.tool_call.server_description = server.description
         }
+        try {
+          this.audit('TOOL.result', messageId, 'EXECUTE', {
+            tool: { id: tc?.id, ok: !isErr }
+          })
+        } catch {}
         // 标记对应授权块为已执行（consumed），避免后续重复执行
         try {
           ;(perm.extra as any) = perm.extra || {}
@@ -4811,7 +4858,13 @@ export class ThreadPresenter implements IThreadPresenter {
       const st = this.generatingMessages.get(messageId)
       if (st) st.message.content = content
     } catch {}
-    await this.messageManager.editMessage(messageId, JSON.stringify(content))
+    {
+      const { message, revision } = await this.messageManager.editMessageSilently(
+        messageId,
+        JSON.stringify(content)
+      )
+      this.emitMessageEdited(messageId, revision, message.parentId)
+    }
     this.logPermissionSummary(content, 'EXECUTE.results', messageId)
     const conversationId = message.conversationId
 
@@ -4848,6 +4901,7 @@ export class ThreadPresenter implements IThreadPresenter {
       }
     }
     try {
+      this.audit('CONT.start', messageId, 'R2')
       await this.startStreamCompletion(conversationId, messageId, undefined, 'toolcall_continue')
     } finally {
       {
@@ -4858,6 +4912,7 @@ export class ThreadPresenter implements IThreadPresenter {
           console.log('[Continue/State]', { messageId, stateId, set: false })
         }
       }
+      this.audit('CONT.end', messageId, 'R2')
       if (this.pendingContinuation.has(messageId)) {
         this.pendingContinuation.delete(messageId)
         console.log('[Continue/Dequeue]', { messageId })
@@ -4967,6 +5022,6 @@ export class ThreadPresenter implements IThreadPresenter {
     contentBlock.content += content
 
     // 只更新数据库，不额外发送到渲染器（避免重复发送）
-    await this.messageManager.editMessage(eventId, JSON.stringify(state.message.content))
+    // 流式阶段不落库，仅通过 RESPONSE 提示 UI
   }
 }

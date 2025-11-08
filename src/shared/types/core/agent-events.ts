@@ -12,7 +12,6 @@ export interface LLMAgentEventData {
   tool_call_server_name?: string
   tool_call_server_icons?: string
   tool_call_server_description?: string
-  tool_call_response_raw?: unknown
   tool_call?: 'start' | 'running' | 'end' | 'error' | 'update'
   totalUsage?: UsageStats
   image_data?: { data: string; mimeType: string }

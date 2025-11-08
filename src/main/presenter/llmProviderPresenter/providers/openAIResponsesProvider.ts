@@ -753,8 +753,10 @@ export class OpenAIResponsesProvider extends BaseLLMProvider {
                   `[handleChatCompletion] Non-native <function_call> end tag detected. Buffer to parse:`,
                   funcCallBuffer
                 )
+                const prefix = this.currentEventId ? `tc-${this.currentEventId}` : `tc-unknown`
                 const parsedCalls = this.parseFunctionCalls(
-                  `${funcStartMarker}${funcCallBuffer}${funcEndMarker}`
+                  `${funcStartMarker}${funcCallBuffer}${funcEndMarker}`,
+                  prefix
                 )
                 for (const parsedCall of parsedCalls) {
                   yield {
@@ -801,8 +803,10 @@ export class OpenAIResponsesProvider extends BaseLLMProvider {
                   `[handleChatCompletion] Non-native <function_call> end tag detected (from end state). Buffer to parse:`,
                   funcCallBuffer
                 )
+                const prefix2 = this.currentEventId ? `tc-${this.currentEventId}` : `tc-unknown`
                 const parsedCalls = this.parseFunctionCalls(
-                  `${funcStartMarker}${funcCallBuffer}${funcEndMarker}`
+                  `${funcStartMarker}${funcCallBuffer}${funcEndMarker}`,
+                  prefix2
                 )
                 for (const parsedCall of parsedCalls) {
                   yield {
@@ -952,7 +956,8 @@ export class OpenAIResponsesProvider extends BaseLLMProvider {
       // Attempt to parse what we have, might fail
       const potentialContent = `${funcStartMarker}${funcCallBuffer}`
       try {
-        const parsedCalls = this.parseFunctionCalls(potentialContent)
+        const prefix = this.currentEventId ? `tc-${this.currentEventId}` : `tc-unknown`
+        const parsedCalls = this.parseFunctionCalls(potentialContent, prefix)
         if (parsedCalls.length > 0) {
           toolUseDetected = true
           for (const parsedCall of parsedCalls) {
@@ -966,11 +971,7 @@ export class OpenAIResponsesProvider extends BaseLLMProvider {
               tool_call_id: parsedCall.id + '-incomplete',
               tool_call_arguments_chunk: parsedCall.function.arguments
             }
-            yield {
-              type: 'tool_call_end',
-              tool_call_id: parsedCall.id + '-incomplete',
-              tool_call_arguments_complete: parsedCall.function.arguments
-            }
+            // unify behavior: do not emit end for incomplete non-native calls
           }
         } else {
           console.log(
@@ -1272,7 +1273,7 @@ export class OpenAIResponsesProvider extends BaseLLMProvider {
             }
 
             // 生成唯一ID
-            const id = parsedCall.id || functionName || `${fallbackIdPrefix}-${index}-${Date.now()}`
+            const id = parsedCall.id || `${fallbackIdPrefix}-${index}-${Date.now()}`
 
             return {
               id: String(id),

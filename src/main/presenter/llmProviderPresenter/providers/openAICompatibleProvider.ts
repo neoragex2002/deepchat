@@ -811,7 +811,8 @@ export class OpenAICompatibleProvider extends BaseLLMProvider {
         toolUseDetected = true
         // console.log('[handleChatCompletion] Handling native tool_calls', JSON.stringify(delta.tool_calls))
         for (const toolCallDelta of delta.tool_calls) {
-          const id = toolCallDelta.id ? toolCallDelta.id : toolCallDelta.function?.name
+          const synthPrefix = this.currentEventId ? `tc-${this.currentEventId}` : `tc-unknown`
+          const id = toolCallDelta.id ? toolCallDelta.id : undefined
           const index = toolCallDelta.index
           const functionName = toolCallDelta.function?.name
           const argumentChunk = toolCallDelta.function?.arguments
@@ -821,11 +822,19 @@ export class OpenAICompatibleProvider extends BaseLLMProvider {
           if (id) {
             currentToolCallId = id
             if (index !== undefined) indexToIdMap[index] = id
-          } else if (index !== undefined && indexToIdMap[index]) {
-            currentToolCallId = indexToIdMap[index]
+          } else if (index !== undefined) {
+            // 如果缺少原生 id，则为该 index 合成一个稳定 id，并记录映射
+            if (indexToIdMap[index]) {
+              currentToolCallId = indexToIdMap[index]
+            } else {
+              const synthId = `${synthPrefix}-native-${index}-${Date.now()}`
+              indexToIdMap[index] = synthId
+              currentToolCallId = synthId
+            }
           } else {
+            // 既无 id 又无 index，无法安全配对，忽略该片段
             console.warn(
-              '[handleChatCompletion] Received tool call delta chunk without id/mapping:',
+              '[handleChatCompletion] Native tool_call delta missing id/index:',
               toolCallDelta
             )
             continue
@@ -932,9 +941,10 @@ export class OpenAICompatibleProvider extends BaseLLMProvider {
             ) {
               const content = pendingBuffer.slice(0, -funcEndMarker.length)
               // 解析非原生函数调用
+              const prefix = this.currentEventId ? `tc-${this.currentEventId}` : `tc-unknown`
               const parsedCalls = this.parseFunctionCalls(
                 `${funcStartMarker}${content}${funcEndMarker}`, // 确保完整标签以进行解析
-                `non-native-${this.provider.id}`
+                prefix
               )
               for (const parsedCall of parsedCalls) {
                 yield createStreamEvent.toolCallStart(parsedCall.id, parsedCall.function.name)
@@ -1011,9 +1021,10 @@ export class OpenAICompatibleProvider extends BaseLLMProvider {
         console.warn(
           `[handleChatCompletion] Stream ended while inside unclosed <function_call> tag. Content: "${pendingBuffer}"`
         )
+        const prefix2 = this.currentEventId ? `tc-${this.currentEventId}` : `tc-unknown`
         const parsedCalls = this.parseFunctionCalls(
           `${funcStartMarker}${pendingBuffer}`, // 只尝试解析已有的部分，即使不完整，并以incomplete标记，以便下游发现
-          `non-native-incomplete-${this.provider.id}`
+          prefix2
         )
         if (parsedCalls.length > 0) {
           for (const parsedCall of parsedCalls) {
@@ -1284,11 +1295,7 @@ export class OpenAICompatibleProvider extends BaseLLMProvider {
             }
 
             // Generate a unique ID if not provided in the parsed content
-            const id =
-              parsedCall.id ??
-              (functionName
-                ? `${functionName}-${index}-${Date.now()}`
-                : `${fallbackIdPrefix}-${index}-${Date.now()}`)
+            const id = parsedCall.id ?? `${fallbackIdPrefix}-${index}-${Date.now()}`
 
             // console.log(
             //   `[parseFunctionCalls] Finalizing tool call for match ${index}: ID='${id}', Name='${functionName}', Args='${functionArgs}'`

@@ -14,8 +14,7 @@ import {
   UserMessageMentionBlock,
   UserMessageCodeBlock
 } from '@shared/chat'
-import { eventBus, SendTarget } from '@/eventbus'
-import { CONVERSATION_EVENTS } from '@/events'
+// NOTE: Authoritative MESSAGE_EDITED emission is handled by ThreadPresenter.
 
 export class MessageManager implements IMessageManager {
   private sqlitePresenter: ISQLitePresenter
@@ -111,30 +110,28 @@ export class MessageManager implements IMessageManager {
     return message
   }
 
-  async editMessage(messageId: string, content: string): Promise<Message> {
+  async editMessageSilently(
+    messageId: string,
+    content: string
+  ): Promise<{ message: Message; revision: number }> {
     await this.sqlitePresenter.updateMessage(messageId, { content })
     const message = await this.sqlitePresenter.getMessage(messageId)
     if (!message) {
       throw new Error(`Message ${messageId} not found`)
     }
     const msg = this.convertToMessage(message)
-    // Increase and emit message revision
     const cur = this.revisionMap.get(messageId) || 0
     const next = cur + 1
     this.revisionMap.set(messageId, next)
-    eventBus.sendToRenderer(CONVERSATION_EVENTS.MESSAGE_EDITED, SendTarget.ALL_WINDOWS, {
-      messageId,
-      revision: next
-    })
-    if (msg.parentId) {
-      // Parent update notification (no revision attached)
-      eventBus.sendToRenderer(
-        CONVERSATION_EVENTS.MESSAGE_EDITED,
-        SendTarget.ALL_WINDOWS,
-        msg.parentId
-      )
-    }
-    return msg
+    return { message: msg, revision: next }
+  }
+
+  async editMessage(messageId: string, content: string): Promise<Message> {
+    // Deprecated: MESSAGE_EDITED emission has moved to ThreadPresenter.
+    // This method now only persists and returns the updated message to
+    // preserve API compatibility with existing call sites.
+    const { message } = await this.editMessageSilently(messageId, content)
+    return message
   }
 
   async deleteMessage(messageId: string): Promise<void> {
@@ -306,10 +303,10 @@ export class MessageManager implements IMessageManager {
   public async handleMessageError(
     messageId: string,
     errorMessage: string = 'common.error.requestFailed'
-  ): Promise<void> {
+  ): Promise<{ message: Message; revision: number }> {
     const message = await this.getMessage(messageId)
     if (!message) {
-      return
+      throw new Error('Message not found')
     }
 
     let content: AssistantMessageBlock[] = []
@@ -336,6 +333,7 @@ export class MessageManager implements IMessageManager {
 
     // 更新消息状态和内容
     await this.updateMessageStatus(messageId, 'error')
-    await this.editMessage(messageId, JSON.stringify(content))
+    const res = await this.editMessageSilently(messageId, JSON.stringify(content))
+    return res
   }
 }

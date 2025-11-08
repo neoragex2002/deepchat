@@ -316,14 +316,17 @@ export const useChatStore = defineStore('chat', () => {
     const nxt = updatedMsg as AssistantMessage
     if (!Array.isArray(cur.content) || !Array.isArray(nxt.content)) return updatedMsg
 
+    // Merge keys are strictly id-only for tool/permission blocks.
+    // If the model/provider did not produce an id, treat the block as
+    // non-mergeable (keyed by type+timestamp) to avoid wrong matches.
     const keyOf = (b: AssistantMessageBlock) => {
       if (b.type === 'tool_call' && b.tool_call) {
         if (b.tool_call.id) return `tool:${b.tool_call.id}`
-        return `tool-legacy:${b.tool_call.name || 'unknown'}:${b.timestamp}`
+        return `other:tool_call:${b.timestamp}`
       }
       if (b.type === 'action' && (b as any).action_type === 'tool_call_permission' && b.tool_call) {
         if (b.tool_call.id) return `perm:${b.tool_call.id}`
-        return `perm-legacy:${b.tool_call.name || 'unknown'}:${b.timestamp}`
+        return `other:perm:${b.timestamp}`
       }
       return `other:${b.type}:${b.timestamp}`
     }
@@ -413,12 +416,14 @@ export const useChatStore = defineStore('chat', () => {
       }
       mergedBlocks.push(nb)
     }
-    // 旧消息存在但新消息缺失的关键块，补入（仅 tool_call / permission），避免“闪现后消失”
+    // 旧消息存在但新消息缺失的关键块，补入（仅 tool_call / permission 且必须有 id），避免“闪现后消失”
     for (const [k, ob] of curMap.entries()) {
       if (!mergedBlocks.find((b) => keyOf(b) === k)) {
         if (
-          ob.type === 'tool_call' ||
-          (ob.type === 'action' && (ob as any).action_type === 'tool_call_permission')
+          (ob.type === 'tool_call' && (ob as any).tool_call?.id) ||
+          (ob.type === 'action' &&
+            (ob as any).action_type === 'tool_call_permission' &&
+            (ob as any).tool_call?.id)
         ) {
           mergedBlocks.push(ob)
         }
@@ -557,7 +562,6 @@ export const useChatStore = defineStore('chat', () => {
       completion_tokens: number
       total_tokens: number
     }
-    tool_call_response_raw?: unknown
     image_data?: {
       data: string
       mimeType: string
@@ -623,32 +627,34 @@ export const useChatStore = defineStore('chat', () => {
                 name: msg.tool_call_name
               })
             } catch {}
-            // 若已存在同 id/name 的已完成块，则忽略重复的 START（R2/回注场景去重）
-            const existingDone = curMsg.content.find(
-              (block) =>
-                block.type === 'tool_call' &&
-                ((msg.tool_call_id && block.tool_call?.id === msg.tool_call_id) ||
-                  block.tool_call?.name === msg.tool_call_name) &&
-                (block.status === 'success' || block.status === 'error')
-            )
-            if (!existingDone) {
-              // 工具调用开始解析参数 - 创建新的工具调用块
-              finalizeLastBlock() // 使用保护逻辑
-              playToolcallSound()
-              curMsg.content.push({
-                type: 'tool_call',
-                content: '',
-                status: 'loading', // 使用loading状态表示正在解析参数
-                timestamp: Date.now(),
-                tool_call: {
-                  id: msg.tool_call_id,
-                  name: msg.tool_call_name,
-                  params: msg.tool_call_params || '',
-                  server_name: msg.tool_call_server_name,
-                  server_icons: msg.tool_call_server_icons,
-                  server_description: msg.tool_call_server_description
-                }
-              })
+            // 严格依赖 id；无 id 不创建提示块，避免错配
+            if (msg.tool_call_id) {
+              // 若已存在同 id 的已完成块，则忽略重复 START（R2/回注场景去重）
+              const existingDone = curMsg.content.find(
+                (block) =>
+                  block.type === 'tool_call' &&
+                  block.tool_call?.id === msg.tool_call_id &&
+                  (block.status === 'success' || block.status === 'error')
+              )
+              if (!existingDone) {
+                // 工具调用开始解析参数 - 创建新的工具调用块
+                finalizeLastBlock() // 使用保护逻辑
+                playToolcallSound()
+                curMsg.content.push({
+                  type: 'tool_call',
+                  content: '',
+                  status: 'loading', // 使用loading状态表示正在解析参数
+                  timestamp: Date.now(),
+                  tool_call: {
+                    id: msg.tool_call_id,
+                    name: msg.tool_call_name,
+                    params: msg.tool_call_params || '',
+                    server_name: msg.tool_call_server_name,
+                    server_icons: msg.tool_call_server_icons,
+                    server_description: msg.tool_call_server_description
+                  }
+                })
+              }
             }
           } else if (msg.tool_call === 'update') {
             // 实时更新工具调用参数
@@ -699,31 +705,7 @@ export const useChatStore = defineStore('chat', () => {
                   msg.tool_call_params || existingToolCallBlock.tool_call.params
               }
             } else {
-              // 如果没有找到现有的工具调用块，创建一个新的（兼容旧逻辑）
-              finalizeLastBlock() // 使用保护逻辑
-              const alreadyDone = curMsg.content.find(
-                (block) =>
-                  block.type === 'tool_call' &&
-                  msg.tool_call_id &&
-                  block.tool_call?.id === msg.tool_call_id &&
-                  (block.status === 'success' || block.status === 'error')
-              )
-              if (!alreadyDone) {
-                curMsg.content.push({
-                  type: 'tool_call',
-                  content: '',
-                  status: 'loading',
-                  timestamp: Date.now(),
-                  tool_call: {
-                    id: msg.tool_call_id,
-                    name: msg.tool_call_name,
-                    params: msg.tool_call_params || '',
-                    server_name: msg.tool_call_server_name,
-                    server_icons: msg.tool_call_server_icons,
-                    server_description: msg.tool_call_server_description
-                  }
-                })
-              }
+              // 严格依赖 id；无 id 不创建新块，避免错配
             }
           } else if (msg.tool_call === 'end' || msg.tool_call === 'error') {
             // 查找对应的工具调用块
@@ -752,18 +734,10 @@ export const useChatStore = defineStore('chat', () => {
               )
             }
             if (existingToolCallBlock && existingToolCallBlock.type === 'tool_call') {
-              if (msg.tool_call === 'error') {
-                existingToolCallBlock.status = 'error'
-                if (existingToolCallBlock.tool_call) {
-                  existingToolCallBlock.tool_call.response =
-                    msg.tool_call_response || 'tool call failed'
-                }
-              } else {
-                existingToolCallBlock.status = 'success'
-                if (msg.tool_call_response && existingToolCallBlock.tool_call) {
-                  existingToolCallBlock.tool_call.response = msg.tool_call_response
-                }
-              }
+              // In collect-only mode, provider does not execute tools.
+              // We still mark the parsing lifecycle for UI hints but do not
+              // attach any execution response from stream.
+              existingToolCallBlock.status = msg.tool_call === 'error' ? 'error' : 'success'
             }
           }
         }

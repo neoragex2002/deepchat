@@ -785,9 +785,10 @@ export class OllamaProvider extends BaseLLMProvider {
                 pendingBuffer = ''
                 toolUseDetected = true
 
+                const prefix = this.currentEventId ? `tc-${this.currentEventId}` : `tc-unknown`
                 const parsedCalls = this.parseFunctionCalls(
                   `${funcStartMarker}${funcCallBuffer}${funcEndMarker}`,
-                  `non-native-${this.provider.id}`
+                  prefix
                 )
                 for (const parsedCall of parsedCalls) {
                   yield {
@@ -831,9 +832,10 @@ export class OllamaProvider extends BaseLLMProvider {
                 pendingBuffer = ''
                 toolUseDetected = true
 
+                const prefix2 = this.currentEventId ? `tc-${this.currentEventId}` : `tc-unknown`
                 const parsedCalls = this.parseFunctionCalls(
                   `${funcStartMarker}${funcCallBuffer}${funcEndMarker}`,
-                  `non-native-${this.provider.id}`
+                  prefix2
                 )
                 for (const parsedCall of parsedCalls) {
                   yield {
@@ -963,10 +965,8 @@ export class OllamaProvider extends BaseLLMProvider {
       if (funcCallBuffer) {
         const potentialContent = `${funcStartMarker}${funcCallBuffer}`
         try {
-          const parsedCalls = this.parseFunctionCalls(
-            potentialContent,
-            `non-native-incomplete-${this.provider.id}`
-          )
+          const prefix = this.currentEventId ? `tc-${this.currentEventId}` : `tc-unknown`
+          const parsedCalls = this.parseFunctionCalls(potentialContent, prefix)
           if (parsedCalls.length > 0) {
             toolUseDetected = true
             for (const parsedCall of parsedCalls) {
@@ -980,11 +980,7 @@ export class OllamaProvider extends BaseLLMProvider {
                 tool_call_id: parsedCall.id + '-incomplete',
                 tool_call_arguments_chunk: parsedCall.function.arguments
               }
-              yield {
-                type: 'tool_call_end',
-                tool_call_id: parsedCall.id + '-incomplete',
-                tool_call_arguments_complete: parsedCall.function.arguments
-              }
+              // unify behavior: do not emit end for incomplete non-native calls
             }
           } else {
             // 如果解析失败或没有结果，将缓冲区作为文本输出

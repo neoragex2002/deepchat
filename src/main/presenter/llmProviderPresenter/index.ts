@@ -883,6 +883,10 @@ export class LLMProviderPresenter implements ILlmProviderPresenter {
             console.warn('[LLMTrace] Failed to write request log:', e)
           }
 
+          // Provide current eventId to provider for synthetic ID generation in non-native FC
+          try {
+            ;(provider as any).setCurrentEventId?.(eventId)
+          } catch {}
           const stream = provider.coreStream(
             conversationMessages,
             modelId,
