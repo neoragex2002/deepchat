@@ -949,7 +949,6 @@ export type LLMResponse = {
   tool_call_server_name?: string
   tool_call_server_icons?: string
   tool_call_server_description?: string
-  tool_call_response_raw?: MCPToolResponse
   maximum_tool_calls_reached?: boolean
   totalUsage?: {
     prompt_tokens: number
@@ -972,7 +971,6 @@ export type LLMResponseStream = {
   tool_call_server_name?: string
   tool_call_server_icons?: string
   tool_call_server_description?: string
-  tool_call_response_raw?: MCPToolResponse
   maximum_tool_calls_reached?: boolean
   totalUsage?: {
     prompt_tokens: number

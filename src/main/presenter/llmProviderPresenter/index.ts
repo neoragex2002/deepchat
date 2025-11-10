@@ -94,9 +94,6 @@ export class LLMProviderPresenter implements ILlmProviderPresenter {
   private currentProviderId: string | null = null
   // Manage all streams by eventId
   private activeStreams: Map<string, StreamState> = new Map()
-  // Track cumulative tool-call counts across phases for the same eventId (R1/R2/...)
-  // This ensures MAX_TOOL_CALLS guard still applies in collect-only mode
-  private eventToolCallCounts: Map<string, number> = new Map()
   // Configuration
   private config: ProviderConfig = {
     maxConcurrentStreams: 10
@@ -764,8 +761,7 @@ export class LLMProviderPresenter implements ILlmProviderPresenter {
     const conversationMessages: ChatMessage[] = [...initialMessages]
     let needContinueConversation = true
     // Initialize with existing cumulative count (across phases) for this eventId
-    let toolCallCount = this.eventToolCallCounts.get(eventId) || 0
-    const MAX_TOOL_CALLS = BaseLLMProvider.getMaxToolCalls()
+    // Provider 不再做最大工具调用数门控，计数与策略统一交由 ThreadPresenter 决策
     const totalUsage: {
       prompt_tokens: number
       completion_tokens: number
@@ -799,18 +795,7 @@ export class LLMProviderPresenter implements ILlmProviderPresenter {
           break
         }
 
-        if (toolCallCount >= MAX_TOOL_CALLS) {
-          console.warn('Maximum tool call limit reached for event:', eventId)
-          yield {
-            type: 'response',
-            data: {
-              eventId,
-              maximum_tool_calls_reached: true
-            }
-          }
-
-          break
-        }
+        // 最大工具调用数门控由 ThreadPresenter 统一处理
 
         needContinueConversation = false
 
@@ -825,7 +810,7 @@ export class LLMProviderPresenter implements ILlmProviderPresenter {
         const currentToolChunks: Record<string, { name: string; arguments_chunk: string }> = {}
 
         try {
-          console.log(`[Agent Loop] Iteration ${toolCallCount + 1} for event: ${eventId}`)
+          console.log(`[Agent Loop] Iteration start for event: ${eventId}`)
           const mcpTools = await presenter.mcpPresenter.getAllToolDefinitions(enabledMcpTools)
           const canExecute = this.canExecuteImmediately(providerId)
           if (!canExecute) {
@@ -1096,20 +1081,7 @@ export class LLMProviderPresenter implements ILlmProviderPresenter {
                   }
 
                   if (currentToolCalls.length > 0) {
-                    // Advance cumulative tool-call counter so MAX_TOOL_CALLS remains enforced across phases.
-                    toolCallCount += currentToolCalls.length
-                    // Persist cumulative count for this eventId
-                    this.eventToolCallCounts.set(eventId, toolCallCount)
-                    if (toolCallCount >= MAX_TOOL_CALLS) {
-                      // Notify renderer/thread that maximum tool calls have been reached
-                      yield {
-                        type: 'response',
-                        data: {
-                          eventId,
-                          maximum_tool_calls_reached: true
-                        }
-                      }
-                    }
+                    // 最大工具调用数门控由 ThreadPresenter 统一处理
                     // Collect-only mode: do not auto-continue here. Thread handles permissions and execution.
                     needContinueConversation = false
                   } else {
@@ -1199,9 +1171,7 @@ export class LLMProviderPresenter implements ILlmProviderPresenter {
         }
       } // --- End of Agent Loop (while) ---
 
-      console.log(
-        `[Agent Loop] Agent loop completed for event: ${eventId}, iterations: ${toolCallCount}`
-      )
+      console.log(`[Agent Loop] Agent loop completed for event: ${eventId}`)
     } catch (error) {
       // Catch errors from the generator setup phase (before the loop)
       if (abortController.signal.aborted) {
@@ -1261,17 +1231,7 @@ export class LLMProviderPresenter implements ILlmProviderPresenter {
       }
 
       this.activeStreams.delete(eventId)
-      // Cleanup cumulative counter if no further tool plans are expected in this phase.
-      // When there is no planned_tool_calls at END, we assume this turn for the event is finalized.
-      // This avoids leaking counts across completely finished messages.
-      try {
-        if (!plannedToolCallsForEnd || plannedToolCallsForEnd.length === 0) {
-          this.eventToolCallCounts.delete(eventId)
-        } else {
-          // Persist the latest count for the next phase
-          this.eventToolCallCounts.set(eventId, toolCallCount)
-        }
-      } catch {}
+      // 无需清理 Provider 侧的计数器（交由 ThreadPresenter 管理）
       // agent loop finished (quiet)
     }
   }

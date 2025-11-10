@@ -178,20 +178,9 @@ function generatePart(content: string, status: AssistantMessageBlock['status']):
       name: 'tool_call_error',
       regex: /<tool_call_error(?:\s+([^>]*))?>/,
       process: null // 特殊处理
-    },
-    {
-      name: 'maximum_tool_calls_reached',
-      regex: /<maximum_tool_calls_reached(?:\s+([^>]*))?>/,
-      process: null // 特殊处理
     }
   ]
-  const toolRelatedPatterns = [
-    'tool_response',
-    'tool_call_end',
-    'tool_call_error',
-    'tool_call',
-    'maximum_tool_calls_reached'
-  ]
+  const toolRelatedPatterns = ['tool_response', 'tool_call_end', 'tool_call_error', 'tool_call']
 
   // 从头到尾扫描内容
   let currentPosition = 0
@@ -209,13 +198,7 @@ function generatePart(content: string, status: AssistantMessageBlock['status']):
       // 如果消息正在生成中且是toolcall相关标签，则跳过检测
       if (
         status === 'loading' &&
-        [
-          'tool_call',
-          'tool_response',
-          'tool_call_end',
-          'tool_call_error',
-          'maximum_tool_calls_reached'
-        ].includes(pattern.name)
+        ['tool_call', 'tool_response', 'tool_call_end', 'tool_call_error'].includes(pattern.name)
       ) {
         continue
       }
@@ -402,13 +385,6 @@ function generatePart(content: string, status: AssistantMessageBlock['status']):
         }
 
         // 移动到标签结束位置
-        currentPosition = content.indexOf('>', earliestMatch.index) + 1
-      } else if (pattern.name === 'maximum_tool_calls_reached') {
-        // 使用标签的处理函数
-        parts.push({
-          type: 'text',
-          content: 'Maximum tool calls reached'
-        })
         currentPosition = content.indexOf('>', earliestMatch.index) + 1
       } else if (pattern.process) {
         // 使用标签的处理函数

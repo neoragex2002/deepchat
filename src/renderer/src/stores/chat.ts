@@ -352,7 +352,10 @@ export const useChatStore = defineStore('chat', () => {
         // 防回退：若旧块已完成/失败，且新块状态更低（loading），保持旧状态
         const from = ob.status
         const to = nb.status
-        const isDowngrade = (from === 'success' || from === 'error') && to === 'loading'
+        const isDowngrade =
+          ((from === 'success' || from === 'error') && to === 'loading') ||
+          // 追加：若旧块为 error 而新块为 success，保持 error（如超限后不被流内 end 覆盖）
+          (from === 'error' && to === 'success')
         if (isDowngrade) {
           merged.status = ob.status
           if (DEBUG_ROLLBACK_MIN)
@@ -551,7 +554,6 @@ export const useChatStore = defineStore('chat', () => {
     tool_call_id?: string
     tool_call_name?: string
     tool_call_params?: string
-    tool_call_response?: string
     maximum_tool_calls_reached?: boolean
     tool_call_server_name?: string
     tool_call_server_icons?: string
@@ -599,25 +601,15 @@ export const useChatStore = defineStore('chat', () => {
 
         // 处理工具调用达到最大次数的情况
         if (msg.maximum_tool_calls_reached) {
-          finalizeLastBlock() // 使用保护逻辑
+          // 作为 STREAM UI hint：仅内存态提示，不带继续按钮
+          finalizeLastBlock()
           curMsg.content.push({
             type: 'action',
             content: 'common.error.maximumToolCallsReached',
             status: 'success',
             timestamp: Date.now(),
-            action_type: 'maximum_tool_calls_reached',
-            tool_call: {
-              id: msg.tool_call_id,
-              name: msg.tool_call_name,
-              params: msg.tool_call_params,
-              server_name: msg.tool_call_server_name,
-              server_icons: msg.tool_call_server_icons,
-              server_description: msg.tool_call_server_description
-            },
-            extra: {
-              needContinue: true
-            }
-          })
+            action_type: 'maximum_tool_calls_reached'
+          } as any)
         } else if (msg.tool_call) {
           if (msg.tool_call === 'start') {
             try {
@@ -735,9 +727,13 @@ export const useChatStore = defineStore('chat', () => {
             }
             if (existingToolCallBlock && existingToolCallBlock.type === 'tool_call') {
               // In collect-only mode, provider does not execute tools.
-              // We still mark the parsing lifecycle for UI hints but do not
-              // attach any execution response from stream.
-              existingToolCallBlock.status = msg.tool_call === 'error' ? 'error' : 'success'
+              // Do not override an existing error with a later 'end' success.
+              const incomingStatus = msg.tool_call === 'error' ? 'error' : 'success'
+              if (existingToolCallBlock.status === 'error' && incomingStatus === 'success') {
+                // keep error (e.g., limit reached authoritative result)
+              } else {
+                existingToolCallBlock.status = incomingStatus
+              }
             }
           }
         }

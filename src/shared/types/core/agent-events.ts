@@ -7,7 +7,6 @@ export interface LLMAgentEventData {
   tool_call_id?: string
   tool_call_name?: string
   tool_call_params?: string
-  tool_call_response?: string | Array<unknown>
   maximum_tool_calls_reached?: boolean
   tool_call_server_name?: string
   tool_call_server_icons?: string

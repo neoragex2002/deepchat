@@ -89,6 +89,10 @@ export class ThreadPresenter implements IThreadPresenter {
   private searchingMessages: Set<string> = new Set()
   private activeConversationIds: Map<number, string> = new Map()
   private fetchThreadLength: number = 300
+  // 工具调用限流：精简常量（后续如需配置化再扩展）
+  private static readonly TOOL_CALL_LIMIT_ENABLED = true
+  private static readonly TOOL_CALL_LIMIT_MAX = 2
+  private static readonly TOOL_CALL_LIMIT_MODE: 'hard_cut' | 'soft_degrade' = 'soft_degrade'
   // 调试：是否输出 Step/权限块摘要与内容快照
   private static readonly DEBUG_STEP_LOG = false
   // IO 日志：是否输出工具调用的完整请求与响应
@@ -122,6 +126,31 @@ export class ThreadPresenter implements IThreadPresenter {
 
     // 初始化时处理所有未完成的消息
     this.messageManager.initializeUnfinishedMessages()
+  }
+
+  // 读取已累计的 tool calls 总数（metadata 优先，内存兜底）
+  private getToolCallsTotal(
+    _message: Message | AssistantMessage | null,
+    st?: GeneratingMessageState
+  ): number {
+    const anySt: any = st
+    if (anySt && typeof anySt.__toolCallsPlannedTotal === 'number')
+      return anySt.__toolCallsPlannedTotal
+    return 0
+  }
+
+  // 写回累计总数到 metadata 与内存
+  private async setToolCallsTotal(
+    messageId: string,
+    st: GeneratingMessageState | undefined,
+    total: number
+  ) {
+    try {
+      await this.messageManager.updateMessageMetadata(messageId, { toolCallsTotal: total } as any)
+    } catch {}
+    try {
+      if (st) (st as any).__toolCallsPlannedTotal = total
+    } catch {}
   }
 
   private audit(tag: string, msgId: string, where: string, extra?: Record<string, unknown>) {
@@ -242,7 +271,7 @@ export class ThreadPresenter implements IThreadPresenter {
         console.warn('[ThreadPresenter] Failed to refresh latest message before END handling:', e)
       }
 
-      // NEW (collect-only): If provider sent planned_tool_calls at END, create permission blocks once
+      // 限流与权限：在 END 点统一裁决（先限流，再注入权限）
       try {
         let planned = (
           msg as unknown as {
@@ -254,6 +283,168 @@ export class ThreadPresenter implements IThreadPresenter {
             `[Permission] planned_tool_calls at END for message ${eventId}:`,
             planned.map((p) => p.name)
           )
+
+          // 简化累计：若当前累计 n 已达上限，则整批判定超限
+          if (ThreadPresenter.TOOL_CALL_LIMIT_ENABLED) {
+            const currentTotal = this.getToolCallsTotal(state.message, state)
+            const LIMIT = ThreadPresenter.TOOL_CALL_LIMIT_MAX
+            if (currentTotal >= LIMIT) {
+              // STREAM 提示（非权威、不落库）
+              eventBus.sendToRenderer(STREAM_EVENTS.RESPONSE, SendTarget.ALL_WINDOWS, {
+                eventId,
+                maximum_tool_calls_reached: true
+              })
+              this.audit('LIMIT', eventId, 'END', {
+                mode: ThreadPresenter.TOOL_CALL_LIMIT_MODE,
+                limit: LIMIT,
+                prev: currentTotal,
+                batch: planned.length
+              })
+              if (ThreadPresenter.TOOL_CALL_LIMIT_MODE === 'hard_cut') {
+                // 主动掐断：为本批 planned 写错误占位（不执行工具），追加一次终止 error 信息块，完成消息（统一设为 error），并发送 END
+                try {
+                  // 刷新缓冲并清理
+                  if (state.adaptiveBuffer) await this.flushAdaptiveBuffer(eventId)
+                } catch {}
+                this.cleanupContentBuffer(state)
+                try {
+                  // 将loading类块标记为success，保持内容完整
+                  state.message.content.forEach((block) => {
+                    if (
+                      !(block.type === 'action' && block.action_type === 'tool_call_permission') &&
+                      block.status === 'loading'
+                    )
+                      block.status = 'success'
+                  })
+                  // 为本批 planned 写入错误占位结果（hard_cut：终止）
+                  const now = Date.now()
+                  for (const call of planned) {
+                    let toolBlock = state.message.content.find(
+                      (b) => b.type === 'tool_call' && b.tool_call?.id === call.id
+                    ) as AssistantMessageBlock | undefined
+                    if (!toolBlock) {
+                      toolBlock = {
+                        type: 'tool_call',
+                        content: '',
+                        status: 'error',
+                        timestamp: now,
+                        tool_call: {
+                          id: call.id,
+                          name: call.name,
+                          params: call.arguments,
+                          response: JSON.stringify({
+                            ok: false,
+                            error: 'tool_call_limit_reached',
+                            message:
+                              '已超过工具调用上限，回合终止。请停止当前轮次工具调用，稍后重试。'
+                          })
+                        }
+                      }
+                      ;(state.message.content as AssistantMessageBlock[]).push(toolBlock)
+                    } else {
+                      toolBlock.status = 'error'
+                      if (toolBlock.tool_call) {
+                        toolBlock.tool_call.response = JSON.stringify({
+                          ok: false,
+                          error: 'tool_call_limit_reached',
+                          message:
+                            '已超过工具调用上限，回合终止。请停止当前轮次工具调用，稍后重试。'
+                        })
+                      }
+                    }
+                  }
+                  // 仅首次追加全局终止 error 信息块
+                  const hasCutError = (state.message.content as AssistantMessageBlock[]).some(
+                    (b) =>
+                      b.type === 'error' && b.content === 'common.error.toolCallLimitTurnTerminated'
+                  )
+                  if (!hasCutError) {
+                    ;(state.message.content as AssistantMessageBlock[]).push({
+                      type: 'error',
+                      content: 'common.error.toolCallLimitTurnTerminated',
+                      status: 'error',
+                      timestamp: Date.now()
+                    } as any)
+                  }
+                  await this.messageManager.updateMessageStatus(eventId, 'error')
+                  const { message, revision } = await this.messageManager.editMessageSilently(
+                    eventId,
+                    JSON.stringify(state.message.content)
+                  )
+                  this.emitMessageEdited(eventId, revision, message.parentId)
+                } catch {}
+                // 结束本轮
+                eventBus.sendToRenderer(STREAM_EVENTS.END, SendTarget.ALL_WINDOWS, msg)
+                this.generatingMessages.delete(eventId)
+                return
+              } else {
+                // soft_degrade：为本批每个 planned 写错误占位（不执行工具），并继续后续流程
+                const now = Date.now()
+                const content = state.message.content as AssistantMessageBlock[]
+                for (const call of planned) {
+                  let toolBlock = content.find(
+                    (b) => b.type === 'tool_call' && b.tool_call?.id === call.id
+                  )
+                  if (!toolBlock) {
+                    toolBlock = {
+                      type: 'tool_call',
+                      content: '',
+                      status: 'error',
+                      timestamp: now,
+                      tool_call: {
+                        id: call.id,
+                        name: call.name,
+                        params: call.arguments,
+                        response: JSON.stringify({
+                          ok: false,
+                          error: 'tool_call_limit_reached',
+                          message: '已超过工具调用上限。请停止当前轮次工具调用，稍后重试。'
+                        })
+                      }
+                    }
+                    content.push(toolBlock)
+                  } else {
+                    toolBlock.status = 'error'
+                    if (toolBlock.tool_call) {
+                      toolBlock.tool_call.response = JSON.stringify({
+                        ok: false,
+                        error: 'tool_call_limit_reached',
+                        message: '已超过工具调用上限。请停止当前轮次工具调用，稍后重试。'
+                      })
+                    }
+                  }
+                }
+                // 追加一个全局 error 信息块（不中断，但提示已超限）- 仅首次追加
+                const hasDegradeError = content.some(
+                  (b) => b.type === 'error' && b.content === 'common.error.toolCallLimitExceeded'
+                )
+                if (!hasDegradeError) {
+                  content.push({
+                    type: 'error',
+                    content: 'common.error.toolCallLimitExceeded',
+                    status: 'error',
+                    timestamp: now
+                  } as any)
+                }
+
+                {
+                  const { message, revision } = await this.messageManager.editMessageSilently(
+                    eventId,
+                    JSON.stringify(state.message.content)
+                  )
+                  this.emitMessageEdited(eventId, revision, message.parentId)
+                }
+                // 发送 END，并主动触发继续生成（不中断 TURN）
+                eventBus.sendToRenderer(STREAM_EVENTS.END, SendTarget.ALL_WINDOWS, msg)
+                try {
+                  await this.continueAfterAllDenied(eventId)
+                } catch (e) {
+                  console.warn('[SoftDegrade] continueAfterAllDenied failed:', e)
+                }
+                return
+              }
+            }
+          }
           // 不做 planned 去重过滤，保持最小流程，交由后续授权/执行阶段自然处理
           // Resolve server info by tool name
           let toolDefs: Array<{
@@ -344,6 +535,13 @@ export class ThreadPresenter implements IThreadPresenter {
               JSON.stringify(content)
             )
             this.emitMessageEdited(eventId, revision, message.parentId)
+          }
+          // 记录累计 tool calls（仅当执行本批计划时才累计）
+          if (ThreadPresenter.TOOL_CALL_LIMIT_ENABLED) {
+            try {
+              const prev = this.getToolCallsTotal(state.message, state)
+              await this.setToolCallsTotal(eventId, state, prev + planned.length)
+            } catch {}
           }
           try {
             state.message.content = content
@@ -877,28 +1075,9 @@ export class ThreadPresenter implements IThreadPresenter {
         state.promptTokens = totalUsage.prompt_tokens
       }
 
-      // 处理工具调用达到最大次数的情况
+      // 处理工具调用达到最大次数的情况（作为 STREAM 提示转发，不修改内存态与权威状态）
       if (maximum_tool_calls_reached) {
-        finalizeLastBlock() // 使用保护逻辑
-        state.message.content.push({
-          type: 'action',
-          content: 'common.error.maximumToolCallsReached',
-          status: 'success',
-          timestamp: currentTime,
-          action_type: 'maximum_tool_calls_reached',
-          tool_call: {
-            id: tool_call_id,
-            name: tool_call_name,
-            params: tool_call_params,
-            server_name: tool_call_server_name,
-            server_icons: tool_call_server_icons,
-            server_description: tool_call_server_description
-          },
-          extra: {
-            needContinue: true
-          }
-        })
-        // 流式阶段不落库，仅通过 RESPONSE 提示 UI
+        // 不改写 state.message.content，仅透传事件给渲染层作为 UI hint
         return
       }
 
@@ -2010,26 +2189,7 @@ export class ThreadPresenter implements IThreadPresenter {
         throw new Error('找不到最后的 action block')
       }
 
-      // 3. 检查是否是 maximum_tool_calls_reached
-      if (
-        lastActionBlock.action_type === 'maximum_tool_calls_reached' &&
-        lastActionBlock.tool_call
-      ) {
-        // 设置 needContinue 为 0（false）
-        if (lastActionBlock.extra) {
-          lastActionBlock.extra = {
-            ...lastActionBlock.extra,
-            needContinue: false
-          }
-        }
-        {
-          const { message, revision } = await this.messageManager.editMessageSilently(
-            queryMsgId,
-            JSON.stringify(content)
-          )
-          this.emitMessageEdited(queryMsgId, revision, message.parentId)
-        }
-      }
+      // 不再处理 maximum_tool_calls_reached 的 continue 卡落库补丁（已改为纯 STREAM UI hint）
 
       // 检查是否已被取消
       this.throwIfCancelled(state.message.id)

@@ -4,7 +4,7 @@
   >
     <div class="flex flex-row gap-2 items-center cursor-pointer">
       <Icon icon="lucide:info" class="w-4 h-4 text-red-700" />
-      <span class="flex-grow">{{ t('common.error.requestFailed') }}</span>
+      <span class="flex-grow">{{ t(titleKey) }}</span>
     </div>
     <div class="prose prose-sm max-w-full break-all whitespace-pre-wrap leading-7">
       {{ t(block.content || '') }}
@@ -25,6 +25,17 @@ const { t } = useI18n()
 const props = defineProps<{
   block: AssistantMessageBlock
 }>()
+
+const titleKey = computed(() => {
+  const key = props.block.content || ''
+  if (
+    key === 'common.error.toolCallLimitTurnTerminated' ||
+    key === 'common.error.toolCallLimitExceeded'
+  ) {
+    return 'common.error.toolCallLimitTitle'
+  }
+  return 'common.error.requestFailed'
+})
 
 const errorExplanation = computed(() => {
   const content = props.block.content || ''
