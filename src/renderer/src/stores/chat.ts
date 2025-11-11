@@ -59,6 +59,10 @@ export const useChatStore = defineStore('chat', () => {
 
   // track max observed revision per message to prevent rollback merges
   const messageRevisions = ref<Map<string, number>>(new Map())
+  // Track last received stream sequence per eventId for barrier ACK
+  const lastReceivedSeq = ref<Map<string, number>>(new Map())
+  // Barrier fence: after DRAIN, drop any subsequent sseq > sseqLast until END
+  const drainFenceSseqLast = ref<Map<string, number>>(new Map())
 
   // 对话配置状态
   const chatConfig = ref<CONVERSATION_SETTINGS>({
@@ -549,6 +553,7 @@ export const useChatStore = defineStore('chat', () => {
 
   const handleStreamResponse = (msg: {
     eventId: string
+    sseq?: number
     content?: string
     reasoning_content?: string
     tool_call_id?: string
@@ -576,8 +581,17 @@ export const useChatStore = defineStore('chat', () => {
       estimatedWaitTime?: number
     }
   }) => {
+    // Drop frames beyond fence (extra safety; normally shouldn't happen)
+    const fence = drainFenceSseqLast.value.get(msg.eventId)
+    if (typeof fence === 'number' && typeof msg.sseq === 'number' && msg.sseq > fence) {
+      return
+    }
     // 从缓存中查找消息
     const cached = getGeneratingMessagesCache().get(msg.eventId)
+    // update last received sequence for barrier accounting
+    try {
+      if (typeof msg.sseq === 'number') lastReceivedSeq.value.set(msg.eventId, msg.sseq)
+    } catch {}
     if (cached) {
       const curMsg = cached.message as AssistantMessage
       if (curMsg.content) {
@@ -700,41 +714,15 @@ export const useChatStore = defineStore('chat', () => {
               // 严格依赖 id；无 id 不创建新块，避免错配
             }
           } else if (msg.tool_call === 'end' || msg.tool_call === 'error') {
-            // 查找对应的工具调用块
-            let existingToolCallBlock = curMsg.content.find(
-              (block) =>
-                block.type === 'tool_call' &&
-                msg.tool_call_id &&
-                block.tool_call?.id === msg.tool_call_id &&
-                block.status === 'loading'
-            )
+            // STREAM 阶段仅提示，不设最终态；保持 loading，等待 ME 定音
             try {
-              console.log('[Renderer/ToolCallStream/END_OR_ERROR]', {
-                foundLoading: Boolean(existingToolCallBlock),
+              console.log('[Renderer/ToolCallStream/END_OR_ERROR_HINT]', {
                 toolCallId: msg.tool_call_id,
                 name: msg.tool_call_name,
                 status: msg.tool_call
               })
             } catch {}
-            // 如果未找到 loading 块，但存在同 id/name 的已完成块，也允许补写响应（容错）
-            if (!existingToolCallBlock && msg.tool_call_id) {
-              existingToolCallBlock = curMsg.content.find(
-                (block) =>
-                  block.type === 'tool_call' &&
-                  block.tool_call?.id === msg.tool_call_id &&
-                  (block.status === 'success' || block.status === 'error')
-              )
-            }
-            if (existingToolCallBlock && existingToolCallBlock.type === 'tool_call') {
-              // In collect-only mode, provider does not execute tools.
-              // Do not override an existing error with a later 'end' success.
-              const incomingStatus = msg.tool_call === 'error' ? 'error' : 'success'
-              if (existingToolCallBlock.status === 'error' && incomingStatus === 'success') {
-                // keep error (e.g., limit reached authoritative result)
-              } else {
-                existingToolCallBlock.status = incomingStatus
-              }
-            }
+            // 可选：此处不更改块状态，最多补齐参数在 update 分支中已处理
           }
         }
         // 处理图像数据
@@ -824,27 +812,70 @@ export const useChatStore = defineStore('chat', () => {
     }
   }
 
+  const handleStreamDrain = async (msg: { eventId: string; sseqLast: number }) => {
+    try {
+      // Echo back the requested barrier target so the main process can resolve immediately.
+      // This avoids depending on local lastReceivedSeq (which may lag or be 0 in other windows).
+      await threadP.ackStreamDrain(msg.eventId, msg.sseqLast)
+      // Set fence to the DRAIN target to drop any late frames until END.
+      drainFenceSseqLast.value.set(msg.eventId, msg.sseqLast)
+    } catch (e) {
+      console.error('Failed to ack stream drain:', e)
+    }
+  }
+
   const handleStreamEnd = async (msg: { eventId: string }) => {
-    // Do not merge content on END. Only clear caches + working status.
+    // Do not merge content on END. Clear barriers. Only clear generating state on final end.
+    const anyMsg = msg as any
+    const cached = getGeneratingMessagesCache().get(msg.eventId)
+    // Clear barrier fence for this eventId
+    drainFenceSseqLast.value.delete(msg.eventId)
+    lastReceivedSeq.value.delete(msg.eventId)
+
+    // For barrier END (final=false), keep generating state to allow cancel during pure ME
+    const isFinal = Boolean(anyMsg?.final)
+    if (!cached) return
+    if (isFinal) {
+      // Clear generating state for this message/thread
+      getGeneratingMessagesCache().delete(msg.eventId)
+      generatingThreadIds.value.delete(cached.threadId)
+
+      // Update working status without touching message content
+      if (getActiveThreadId() === cached.threadId) {
+        getThreadsWorkingStatus().delete(cached.threadId)
+      } else {
+        updateThreadWorkingStatus(cached.threadId, 'completed')
+      }
+    }
+  }
+
+  const handleStreamStart = async (msg: { eventId: string }) => {
     const cached = getGeneratingMessagesCache().get(msg.eventId)
     if (!cached) return
-
-    // Clear generating state for this message/thread
-    getGeneratingMessagesCache().delete(msg.eventId)
-    generatingThreadIds.value.delete(cached.threadId)
-
-    // Update working status without touching message content
-    if (getActiveThreadId() === cached.threadId) {
-      getThreadsWorkingStatus().delete(cached.threadId)
-    } else {
-      updateThreadWorkingStatus(cached.threadId, 'completed')
-    }
+    // 兜底：如存在上一次阶段残留的围栏/序列缓存，这里清理以确保新阶段帧不被拦截
+    try {
+      const hadFence = drainFenceSseqLast.value.has(msg.eventId)
+      const hadSeq = lastReceivedSeq.value.has(msg.eventId)
+      if (hadFence || hadSeq) {
+        console.warn('[StreamFence] START with stale fence/seq → cleared', {
+          eventId: msg.eventId,
+          hadFence,
+          hadSeq
+        })
+      }
+      drainFenceSseqLast.value.delete(msg.eventId)
+      lastReceivedSeq.value.delete(msg.eventId)
+    } catch {}
+    generatingThreadIds.value.add(cached.threadId)
   }
 
   const handleStreamError = async (msg: { eventId: string }) => {
     // Do not merge content on ERROR. Only clear caches + working status.
     const cached = getGeneratingMessagesCache().get(msg.eventId)
     if (!cached) return
+    // Clear barrier fence for this eventId
+    drainFenceSseqLast.value.delete(msg.eventId)
+    lastReceivedSeq.value.delete(msg.eventId)
 
     // Optional: lightweight user notification without DB reads
     try {
@@ -1477,6 +1508,8 @@ export const useChatStore = defineStore('chat', () => {
     loadMessages,
     sendMessage,
     handleStreamResponse,
+    handleStreamStart,
+    handleStreamDrain,
     handleStreamEnd,
     handleStreamError,
     handleMessageEdited,

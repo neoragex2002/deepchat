@@ -832,6 +832,8 @@ export interface IThreadPresenter {
   ): Promise<AssistantMessage>
   toggleConversationPinned(conversationId: string, isPinned: boolean): Promise<void>
   findTabForConversation(conversationId: string): Promise<number | null>
+  // Stream barrier ACK from renderer (for DRAIN/ACK)
+  ackStreamDrain(eventId: string, sseqLast: number): Promise<void>
 
   // Permission handling
   handlePermissionResponse(
@@ -845,6 +847,15 @@ export interface IThreadPresenter {
     conversationId: string,
     format: 'markdown' | 'html' | 'txt'
   ): Promise<{ filename: string; content: string }>
+
+  // Unified cancel API (ACE): returns fences and hints
+  cancelTurn(messageId: string): Promise<{
+    ok: boolean
+    phase?: string
+    revFence?: number
+    sseqFence?: number
+    endFallbackUsed?: boolean
+  }>
 }
 
 export type MESSAGE_STATUS = 'sent' | 'pending' | 'error'

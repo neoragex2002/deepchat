@@ -40,6 +40,9 @@ export const CONVERSATION_EVENTS = {
 // 通信相关事件
 export const STREAM_EVENTS = {
   RESPONSE: 'stream:response', // 替代 stream-response
+  START: 'stream:start', // 新增：S 阶段开始（调试可观测，非门控）
+  DRAIN: 'stream:drain', // 新增：屏障排干请求（携带 sseqLast）
+  DRAIN_ACK: 'stream:drain-ack', // 新增：屏障排干确认（通常通过 presenter 方法回传）
   END: 'stream:end', // 替代 stream-end
   ERROR: 'stream:error' // 替代 stream-error
 }

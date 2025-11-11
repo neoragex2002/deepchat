@@ -86,6 +86,16 @@ onMounted(async () => {
     chatStore.handleStreamResponse(msg)
   })
 
+  // S phase start: mark thread as generating (also for R2)
+  window.electron.ipcRenderer.on(STREAM_EVENTS.START, (_, msg) => {
+    chatStore.handleStreamStart(msg)
+  })
+
+  // 屏障排干：收到 DRAIN 后尽快回 ACK（由 store 维护 sseq）
+  window.electron.ipcRenderer.on(STREAM_EVENTS.DRAIN, (_, msg) => {
+    chatStore.handleStreamDrain(msg)
+  })
+
   window.electron.ipcRenderer.on(STREAM_EVENTS.END, (_, msg) => {
     chatStore.handleStreamEnd(msg)
     // 当用户没有主动向上滚动时才自动滚动到底部
@@ -134,6 +144,8 @@ watch(
 // 清理事件监听
 onUnmounted(async () => {
   window.electron.ipcRenderer.removeAllListeners(STREAM_EVENTS.RESPONSE)
+  window.electron.ipcRenderer.removeAllListeners(STREAM_EVENTS.START)
+  window.electron.ipcRenderer.removeAllListeners(STREAM_EVENTS.DRAIN)
   window.electron.ipcRenderer.removeAllListeners(STREAM_EVENTS.END)
   window.electron.ipcRenderer.removeAllListeners(STREAM_EVENTS.ERROR)
 })

@@ -35,6 +35,7 @@
     "toolCallLimitTitle": "已达工具调用上限",
     "toolCallLimitTurnTerminated": "已达到工具调用上限，回合终止。",
     "toolCallLimitExceeded": "已超过工具调用上限，回合继续，但后续调用将返回超限错误。",
+    "userCanceledTitle": "用户取消了生成",
     "causeOfError": "错误可能原因：",
     "error400": "请求错误，参数或者兼容问题",
     "error401": "身份验证失败，配置了错误的 API Key或者域名",

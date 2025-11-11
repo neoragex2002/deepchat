@@ -616,10 +616,8 @@ export class ToolManager {
       }
 
       if (!hasPermission) {
-        // Single, concise permission-required log
+        // No second-confirmation path: treat as execution error and let LLM adjust.
         const permissionType = requiredPermission
-
-        // Return permission request instead of error
         try {
           const previewArgs = (() => {
             try {
@@ -628,7 +626,7 @@ export class ToolManager {
               return String(args).slice(0, 500)
             }
           })()
-          console.info('[MCP] Perm.require', {
+          console.info('[MCP] Perm.denied', {
             toolCallId: toolCall.id,
             tool: originalName,
             server: toolServerName,
@@ -638,15 +636,9 @@ export class ToolManager {
         } catch {}
         return {
           toolCallId: toolCall.id,
-          content: `components.messageBlockPermissionRequest.description.${permissionType}`,
-          isError: false,
-          requiresPermission: true,
-          permissionRequest: {
-            toolName: originalName,
-            serverName: toolServerName,
-            permissionType,
-            description: `Allow ${originalName} to perform ${permissionType} operations on ${toolServerName}?`
-          }
+          content: `Permission denied: ${originalName} requires ${permissionType}`,
+          isError: true,
+          _meta: { errorCode: 'permission_denied', permissionType }
         }
       }
 

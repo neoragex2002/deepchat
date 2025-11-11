@@ -266,6 +266,22 @@ export class SearchManager {
   }
 
   /**
+   * 检查窗口及其 webContents 是否仍然有效
+   */
+  private isWindowAlive(win: BrowserWindow | null | undefined): boolean {
+    try {
+      if (!win) return false
+      if (typeof win.isDestroyed === 'function' && win.isDestroyed()) return false
+      const wc: any = (win as any).webContents
+      if (!wc) return false
+      if (typeof wc.isDestroyed === 'function' && wc.isDestroyed()) return false
+      return true
+    } catch {
+      return false
+    }
+  }
+
+  /**
    * 设置事件监听器，监听搜索引擎更新事件
    */
   private setupEventListeners(): void {
@@ -1059,7 +1075,11 @@ export class SearchManager {
   private async extractSearchResults(window: BrowserWindow): Promise<SearchResult[]> {
     try {
       // 0. 模拟页面滚动，模拟真实阅读体验
-      this.simulatePageScrolling(window)
+      try {
+        await this.simulatePageScrolling(window)
+      } catch (e) {
+        console.warn('simulatePageScrolling skipped:', String(e))
+      }
       console.log('extraing', this.activeEngine.id)
       const results = await window.webContents.executeJavaScript(`
         (function() {
@@ -1256,12 +1276,14 @@ export class SearchManager {
    */
   private async simulatePageScrolling(window: BrowserWindow): Promise<void> {
     try {
+      if (!this.isWindowAlive(window)) return
       // 获取页面高度
       const pageHeight = await window.webContents.executeJavaScript(`
         document.body.scrollHeight
       `)
 
       // 获取视窗高度
+      if (!this.isWindowAlive(window)) return
       const viewportHeight = await window.webContents.executeJavaScript(`
         window.innerHeight
       `)
@@ -1275,6 +1297,7 @@ export class SearchManager {
 
       // 平滑滚动
       for (let i = 0; i < scrollIterations; i++) {
+        if (!this.isWindowAlive(window)) return
         await window.webContents.executeJavaScript(`
           new Promise((resolve) => {
             // 获取当前滚动位置
@@ -1295,15 +1318,17 @@ export class SearchManager {
 
         // 给浏览器一点时间来加载潜在的懒加载内容
         await new Promise((resolve) => setTimeout(resolve, 500))
+        if (!this.isWindowAlive(window)) return
       }
 
       // 等待一下，让页面完全加载
       await new Promise((resolve) => setTimeout(resolve, 500))
+      if (!this.isWindowAlive(window)) return
 
       console.log('页面滚动完成')
     } catch (error) {
-      console.error('模拟页面滚动失败:', error)
-      // 失败也继续处理
+      // 窗口销毁等异常不应影响主流程
+      console.warn('模拟页面滚动失败(忽略):', String(error))
     }
   }
 

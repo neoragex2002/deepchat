@@ -67,7 +67,7 @@
           variant="outline"
           size="sm"
           class="flex-1 h-7 text-xs"
-          :disabled="isProcessing"
+          :disabled="isProcessing || props.messageStatus === 'error'"
           @click="denyPermission"
         >
           <Icon icon="lucide:x" class="w-3 h-3 mr-1" />
@@ -76,7 +76,7 @@
         <Button
           size="sm"
           class="flex-1 h-7 text-xs"
-          :disabled="isProcessing"
+          :disabled="isProcessing || props.messageStatus === 'error'"
           @click="grantPermission"
         >
           <Icon v-if="isProcessing" icon="lucide:loader-2" class="w-3 h-3 mr-1 animate-spin" />
@@ -103,6 +103,7 @@ const props = defineProps<{
   block: AssistantMessageBlock
   messageId: string
   conversationId: string
+  messageStatus?: 'sent' | 'pending' | 'error'
 }>()
 
 const isProcessing = ref(false)

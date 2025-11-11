@@ -28,12 +28,15 @@ const props = defineProps<{
 
 const titleKey = computed(() => {
   const key = props.block.content || ''
-  if (
-    key === 'common.error.toolCallLimitTurnTerminated' ||
-    key === 'common.error.toolCallLimitExceeded'
-  ) {
+  // Tool call limit titles
+  if (key === 'common.error.toolCallLimitTurnTerminated' || key === 'common.error.toolCallLimitExceeded') {
     return 'common.error.toolCallLimitTitle'
   }
+  // User canceled title
+  if (key === 'common.error.userCanceledGeneration' || props.block.status === 'cancel') {
+    return 'common.error.userCanceledTitle'
+  }
+  // Default
   return 'common.error.requestFailed'
 })
 

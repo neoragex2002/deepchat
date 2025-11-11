@@ -55,6 +55,7 @@
             v-else-if="block.type === 'action' && block.action_type === 'tool_call_permission'"
             :block="block"
             :message-id="currentMessage.id"
+            :message-status="currentMessage.status"
             :conversation-id="currentThreadId"
           />
           <MessageBlockAction

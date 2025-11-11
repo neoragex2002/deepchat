@@ -17,6 +17,8 @@ import {
 import { presenter } from '@/presenter'
 import { MessageManager } from './messageManager'
 import { eventBus, SendTarget } from '@/eventbus'
+import fs from 'fs'
+import path from 'path'
 import {
   AssistantMessage,
   Message,
@@ -91,16 +93,98 @@ export class ThreadPresenter implements IThreadPresenter {
   private fetchThreadLength: number = 300
   // 工具调用限流：精简常量（后续如需配置化再扩展）
   private static readonly TOOL_CALL_LIMIT_ENABLED = true
-  private static readonly TOOL_CALL_LIMIT_MAX = 2
+  private static readonly TOOL_CALL_LIMIT_MAX = 100
   private static readonly TOOL_CALL_LIMIT_MODE: 'hard_cut' | 'soft_degrade' = 'soft_degrade'
   // 调试：是否输出 Step/权限块摘要与内容快照
   private static readonly DEBUG_STEP_LOG = false
   // IO 日志：是否输出工具调用的完整请求与响应
-  private static readonly DEBUG_TOOL_IO_LOG = true
+  private static readonly DEBUG_TOOL_LOG = false
   // 生成状态对象自增ID
   private genStateSeq: number = 0
   // 待执行的 continuation（单位排队，coalesce）
   private pendingContinuation: Set<string> = new Set()
+  // per-event stream sequence no. (sseq) for RESPONSE frames
+  private streamSeqMap: Map<string, number> = new Map()
+  // barrier drain ACK waiters
+  private drainWaiters: Map<
+    string,
+    { sseqLast: number; resolve: () => void; timer?: NodeJS.Timeout }
+  > = new Map()
+  // Track last applied message revision per messageId (for revFence diagnostics)
+  private lastRevisionMap: Map<string, number> = new Map()
+
+  // Cancel/Barrier config (defaults; TODO: read from configPresenter if needed)
+  private cancelConfig = {
+    endFallbackMs: 300,
+    shortCircuitOnUserStop: true,
+    toolResultDiscard: true,
+    barrierAckTimeoutMs: 300
+  }
+
+  // Metrics clocks
+  private barrierSentAt: Map<string, number> = new Map()
+  private streamStartAt: Map<string, number> = new Map()
+  private cancelStartAt: Map<string, number> = new Map()
+  private submittedOnce: Set<string> = new Set()
+  // Gate STREAM frames during submit window (after DRAIN until END)
+  private submitWindow: Set<string> = new Set()
+
+  // Runtime events logging (append JSON lines per eventId)
+  private runtimeLogDir(): string {
+    return path.resolve(process.cwd(), 'logs', 'runtime-events')
+  }
+  private ensureRuntimeLogDir(): void {
+    try {
+      fs.mkdirSync(this.runtimeLogDir(), { recursive: true })
+    } catch {}
+  }
+  private writeRuntimeEvent(eventId: string, entry: Record<string, unknown>) {
+    try {
+      // Ensure minimal required fields
+      if (!('kind' in entry)) entry.kind = 'misc'
+      if (!('action' in entry)) entry.action = 'emit'
+      this.ensureRuntimeLogDir()
+      const line = JSON.stringify({ ts: Date.now(), eventId, ...entry }) + '\n'
+      fs.appendFileSync(path.join(this.runtimeLogDir(), `${eventId}.jsonl`), line, 'utf8')
+    } catch (e) {
+      try {
+        console.log('[RT]', { eventId, ...entry })
+      } catch {}
+    }
+  }
+
+  // Increment and return next sseq for given eventId
+  private nextSseq(eventId: string): number {
+    const cur = this.streamSeqMap.get(eventId) || 0
+    const nxt = cur + 1
+    this.streamSeqMap.set(eventId, nxt)
+    return nxt
+  }
+
+  // Centralized sender for stream RESPONSE with sseq attached
+  private sendStreamResponse(eventId: string, data: any): void {
+    const sseq = this.nextSseq(eventId)
+    const payload = { ...data, eventId, sseq }
+    // Gate frames during submit window
+    if (!this.submitWindow.has(eventId)) {
+      eventBus.sendToRenderer(STREAM_EVENTS.RESPONSE, SendTarget.ALL_WINDOWS, payload)
+    }
+  }
+
+  // Renderer ACK for stream drain barrier
+  async ackStreamDrain(eventId: string, sseqLast: number): Promise<void> {
+    const waiter = this.drainWaiters.get(eventId)
+    if (waiter && sseqLast >= waiter.sseqLast) {
+      try {
+        if (waiter.timer) clearTimeout(waiter.timer)
+      } catch {}
+      this.drainWaiters.delete(eventId)
+      const sentAt = this.barrierSentAt.get(eventId)
+      const waitedMs = typeof sentAt === 'number' ? Date.now() - sentAt : undefined
+      this.writeRuntimeEvent(eventId, { kind: 'BARRIER', action: 'ack', sseqLast, waitedMs })
+      waiter.resolve()
+    }
+  }
 
   constructor(
     sqlitePresenter: ISQLitePresenter,
@@ -112,6 +196,27 @@ export class ThreadPresenter implements IThreadPresenter {
     this.llmProviderPresenter = llmProviderPresenter
     this.searchManager = new SearchManager()
     this.configPresenter = configPresenter
+    // Load cancel/barrier related configs (if provided)
+    try {
+      const endFallback = this.configPresenter.getSetting('cancel.endFallbackMs') as
+        | number
+        | undefined
+      const shortCircuit = this.configPresenter.getSetting('cancel.shortCircuitOnUserStop') as
+        | boolean
+        | undefined
+      const discard = this.configPresenter.getSetting('cancel.toolResultDiscard') as
+        | boolean
+        | undefined
+      const ackTimeout = this.configPresenter.getSetting('cancel.barrierAckTimeoutMs') as
+        | number
+        | undefined
+      if (typeof endFallback === 'number' && endFallback >= 0)
+        this.cancelConfig.endFallbackMs = endFallback
+      if (typeof shortCircuit === 'boolean') this.cancelConfig.shortCircuitOnUserStop = shortCircuit
+      if (typeof discard === 'boolean') this.cancelConfig.toolResultDiscard = discard
+      if (typeof ackTimeout === 'number' && ackTimeout >= 50)
+        this.cancelConfig.barrierAckTimeoutMs = ackTimeout
+    } catch {}
 
     // 监听Tab关闭事件，清理绑定关系
     eventBus.on(TAB_EVENTS.CLOSED, (tabId: number) => {
@@ -192,6 +297,28 @@ export class ThreadPresenter implements IThreadPresenter {
           parentId
         )
       }
+      // Track last revision for revFence diagnostics
+      try {
+        this.lastRevisionMap.set(messageId, revision)
+      } catch {}
+      // Metrics: s_to_submit_latency_ms (first ME since START)
+      if (!this.submittedOnce.has(messageId)) {
+        const start = this.streamStartAt.get(messageId)
+        if (typeof start === 'number') {
+          const latency = Date.now() - start
+          this.writeRuntimeEvent(messageId, {
+            kind: 'ME',
+            action: 'emit',
+            revision,
+            s_to_submit_latency_ms: latency
+          })
+        } else {
+          this.writeRuntimeEvent(messageId, { kind: 'ME', action: 'emit', revision })
+        }
+        this.submittedOnce.add(messageId)
+      } else {
+        this.writeRuntimeEvent(messageId, { kind: 'ME', action: 'emit', revision })
+      }
       this.audit('ME.emit', messageId, 'TP', { rev: revision })
     } catch {}
   }
@@ -257,6 +384,14 @@ export class ThreadPresenter implements IThreadPresenter {
   }
 
   async handleLLMAgentEnd(msg: LLMAgentEventData) {
+    /**
+     * STREAM.START/END final 语义一致性说明：
+     * - END(final === false)：仅表示阶段性屏障或内部阶段切换（如 barrier END），不应解除前端“生成中”。
+     * - END(final === true)：当前流式阶段结束，前端应解除“生成中”。
+     *
+     * 待授权（tool_call_permission, pending）属于“用户交互阶段”的开始，应立刻以 END(final=true) 收束本阶段，
+     * 让前端稳定展示授权卡片并解除生成中；用户响应后再通过新的 START 进入下一阶段。
+     */
     const { eventId, userStop } = msg
     const state = this.generatingMessages.get(eventId)
     if (state) {
@@ -264,11 +399,62 @@ export class ThreadPresenter implements IThreadPresenter {
         `[ThreadPresenter] Handling LLM agent end for message: ${eventId}, userStop: ${userStop}`
       )
 
+      // Gate stream frames during the submit window (stop -> drain/ack -> pure ME -> END)
+      // Any late RESPONSE frames will be dropped by sendStreamResponse
+      this.submitWindow.add(eventId)
+      try {
+        this.writeRuntimeEvent(eventId, { kind: 'BARRIER', action: 'gate_on' })
+      } catch {}
+
+      // Short-circuit finalize on user cancel: clear hint layer only
+      if (userStop && (state as any)?.isCancelled) {
+        console.log('[Barrier] short-circuit finalize due to userStop & isCancelled')
+        try {
+          this.writeRuntimeEvent(eventId, { kind: 'BARRIER', action: 'gate_off' })
+          console.log('[Barrier] gate_off before END (cancel)', { eventId })
+        } catch {}
+        this.submitWindow.delete(eventId)
+        eventBus.sendToRenderer(STREAM_EVENTS.END, SendTarget.ALL_WINDOWS, {
+          eventId,
+          userStop,
+          final: true
+        })
+        this.submitWindow.delete(eventId)
+        return
+      }
+
       // 统一准则：以 DB 为准。先刷新当前助手消息的最新内容，避免使用过期的内存态覆盖最新内容
       try {
         /* no-op: keep in-memory content; do not refresh from DB at END */
       } catch (e) {
         console.warn('[ThreadPresenter] Failed to refresh latest message before END handling:', e)
+      }
+
+      // Barrier: STREAM.DRAIN + await ACK (short timeout)
+      try {
+        const sseqLast = this.streamSeqMap.get(eventId) || 0
+        eventBus.sendToRenderer(STREAM_EVENTS.DRAIN, SendTarget.ALL_WINDOWS, {
+          eventId,
+          sseqLast
+        })
+        this.writeRuntimeEvent(eventId, { kind: 'BARRIER', action: 'sent', sseqLast })
+        this.barrierSentAt.set(eventId, Date.now())
+        await new Promise<void>((resolve) => {
+          const timer = setTimeout(() => {
+            console.warn('[Barrier] ACK timeout, continue to ME window', { eventId, sseqLast })
+            this.writeRuntimeEvent(eventId, {
+              kind: 'BARRIER',
+              action: 'timeout',
+              sseqLast,
+              waitedMs: this.cancelConfig.barrierAckTimeoutMs
+            })
+            this.drainWaiters.delete(eventId)
+            resolve()
+          }, this.cancelConfig.barrierAckTimeoutMs)
+          this.drainWaiters.set(eventId, { sseqLast, resolve, timer })
+        })
+      } catch (e) {
+        console.warn('[Barrier] Unexpected error during drain/ack, continue:', e)
       }
 
       // 限流与权限：在 END 点统一裁决（先限流，再注入权限）
@@ -290,10 +476,7 @@ export class ThreadPresenter implements IThreadPresenter {
             const LIMIT = ThreadPresenter.TOOL_CALL_LIMIT_MAX
             if (currentTotal >= LIMIT) {
               // STREAM 提示（非权威、不落库）
-              eventBus.sendToRenderer(STREAM_EVENTS.RESPONSE, SendTarget.ALL_WINDOWS, {
-                eventId,
-                maximum_tool_calls_reached: true
-              })
+              this.sendStreamResponse(eventId, { maximum_tool_calls_reached: true })
               this.audit('LIMIT', eventId, 'END', {
                 mode: ThreadPresenter.TOOL_CALL_LIMIT_MODE,
                 limit: LIMIT,
@@ -346,7 +529,7 @@ export class ThreadPresenter implements IThreadPresenter {
                       if (toolBlock.tool_call) {
                         toolBlock.tool_call.response = JSON.stringify({
                           ok: false,
-                          error: 'tool_call_limit_reached',
+                          error: 'tool_call_limit_exceeded',
                           message:
                             '已超过工具调用上限，回合终止。请停止当前轮次工具调用，稍后重试。'
                         })
@@ -374,7 +557,15 @@ export class ThreadPresenter implements IThreadPresenter {
                   this.emitMessageEdited(eventId, revision, message.parentId)
                 } catch {}
                 // 结束本轮
-                eventBus.sendToRenderer(STREAM_EVENTS.END, SendTarget.ALL_WINDOWS, msg)
+                try {
+                  this.writeRuntimeEvent(eventId, { kind: 'BARRIER', action: 'gate_off' })
+                  console.log('[Barrier] gate_off before END (hard_cut)', { eventId })
+                } catch {}
+                this.submitWindow.delete(eventId)
+                eventBus.sendToRenderer(STREAM_EVENTS.END, SendTarget.ALL_WINDOWS, {
+                  eventId,
+                  final: true
+                })
                 this.generatingMessages.delete(eventId)
                 return
               } else {
@@ -397,7 +588,7 @@ export class ThreadPresenter implements IThreadPresenter {
                         params: call.arguments,
                         response: JSON.stringify({
                           ok: false,
-                          error: 'tool_call_limit_reached',
+                          error: 'tool_call_limit_exceeded',
                           message: '已超过工具调用上限。请停止当前轮次工具调用，稍后重试。'
                         })
                       }
@@ -408,7 +599,7 @@ export class ThreadPresenter implements IThreadPresenter {
                     if (toolBlock.tool_call) {
                       toolBlock.tool_call.response = JSON.stringify({
                         ok: false,
-                        error: 'tool_call_limit_reached',
+                        error: 'tool_call_limit_exceeded',
                         message: '已超过工具调用上限。请停止当前轮次工具调用，稍后重试。'
                       })
                     }
@@ -435,7 +626,15 @@ export class ThreadPresenter implements IThreadPresenter {
                   this.emitMessageEdited(eventId, revision, message.parentId)
                 }
                 // 发送 END，并主动触发继续生成（不中断 TURN）
-                eventBus.sendToRenderer(STREAM_EVENTS.END, SendTarget.ALL_WINDOWS, msg)
+                try {
+                  this.writeRuntimeEvent(eventId, { kind: 'BARRIER', action: 'gate_off' })
+                  console.log('[Barrier] gate_off before END (soft_degrade)', { eventId })
+                } catch {}
+                this.submitWindow.delete(eventId)
+                eventBus.sendToRenderer(STREAM_EVENTS.END, SendTarget.ALL_WINDOWS, {
+                  eventId,
+                  final: false
+                })
                 try {
                   await this.continueAfterAllDenied(eventId)
                 } catch (e) {
@@ -555,20 +754,44 @@ export class ThreadPresenter implements IThreadPresenter {
           if (pendingCount === 0) {
             if (grantedCount >= 1) {
               // 通知渲染层本轮 Provider 流已结束（确保 UI 刷新并展示已注入的块）
-              eventBus.sendToRenderer(STREAM_EVENTS.END, SendTarget.ALL_WINDOWS, msg)
+              try {
+                this.writeRuntimeEvent(eventId, { kind: 'BARRIER', action: 'gate_off' })
+                console.log('[Barrier] gate_off before END (granted_exec)', { eventId })
+              } catch {}
+              this.submitWindow.delete(eventId)
+              eventBus.sendToRenderer(STREAM_EVENTS.END, SendTarget.ALL_WINDOWS, {
+                eventId,
+                final: false
+              })
               this.audit('END', eventId, 'S1')
               await this.executeGrantedToolsAndContinue(eventId)
             } else {
               // 通知渲染层 END，再继续作答流程
-              eventBus.sendToRenderer(STREAM_EVENTS.END, SendTarget.ALL_WINDOWS, msg)
+              try {
+                this.writeRuntimeEvent(eventId, { kind: 'BARRIER', action: 'gate_off' })
+                console.log('[Barrier] gate_off before END (all_denied)', { eventId })
+              } catch {}
+              this.submitWindow.delete(eventId)
+              eventBus.sendToRenderer(STREAM_EVENTS.END, SendTarget.ALL_WINDOWS, {
+                eventId,
+                final: false
+              })
               this.audit('END', eventId, 'S1')
               await this.continueAfterAllDenied(eventId)
             }
             return
           }
-          // Otherwise keep message in generating state, waiting for user actions
-          // 即便等待用户授权，也需要向渲染层发送 END，触发前端解除“生成中”并刷新消息内容
-          eventBus.sendToRenderer(STREAM_EVENTS.END, SendTarget.ALL_WINDOWS, msg)
+          // Otherwise: waiting for user actions (permissions)
+          // 语义一致性：进入“等待授权”阶段应结束当前流阶段，让前端解除“生成中”并稳定展示授权块
+          try {
+            this.writeRuntimeEvent(eventId, { kind: 'BARRIER', action: 'gate_off' })
+            console.log('[Barrier] gate_off before END (pending)', { eventId })
+          } catch {}
+          this.submitWindow.delete(eventId)
+          eventBus.sendToRenderer(STREAM_EVENTS.END, SendTarget.ALL_WINDOWS, {
+            eventId,
+            final: true
+          })
           this.audit('END', eventId, 'S1')
           return
         }
@@ -609,8 +832,12 @@ export class ThreadPresenter implements IThreadPresenter {
           state.message.content = content
         } catch {}
         this.logPermissionSummary(state.message.content, `END.pending`, eventId)
-        // 处于 pending 状态同样需要向渲染层发送 END，让前端显示授权块并解除“生成中”
-        eventBus.sendToRenderer(STREAM_EVENTS.END, SendTarget.ALL_WINDOWS, msg)
+        // 处于 pending 状态同样需要向渲染层发送 END(final=true)，让前端显示授权块并解除“生成中”
+        this.submitWindow.delete(eventId)
+        eventBus.sendToRenderer(STREAM_EVENTS.END, SendTarget.ALL_WINDOWS, {
+          eventId,
+          final: true
+        })
         return
       }
 
@@ -620,7 +847,15 @@ export class ThreadPresenter implements IThreadPresenter {
       await this.finalizeMessage(state, eventId, userStop || false)
     }
 
-    eventBus.sendToRenderer(STREAM_EVENTS.END, SendTarget.ALL_WINDOWS, msg)
+    try {
+      this.writeRuntimeEvent(eventId, { kind: 'BARRIER', action: 'gate_off' })
+      console.log('[Barrier] gate_off before END (finalize)', { eventId })
+    } catch {}
+    this.submitWindow.delete(eventId)
+    eventBus.sendToRenderer(STREAM_EVENTS.END, SendTarget.ALL_WINDOWS, {
+      eventId,
+      final: true
+    })
     this.audit('END', eventId, 'S1')
   }
 
@@ -782,28 +1017,30 @@ export class ThreadPresenter implements IThreadPresenter {
 
     if (conversation.is_new === 1) {
       try {
-        this.summaryTitles(undefined, state.conversationId).then((title) => {
-          if (title) {
-            this.renameConversation(state.conversationId, title).then(() => {
-              titleUpdated = true
-            })
+        const title = await this.summaryTitles(undefined, state.conversationId)
+        if (title) {
+          try {
+            await this.renameConversation(state.conversationId, title)
+            titleUpdated = true
+          } catch (e) {
+            console.error('Failed to rename conversation title:', e)
           }
-        })
+        }
       } catch (e) {
         console.error('Failed to summarize title in main process:', e)
       }
     }
 
     if (!titleUpdated) {
-      this.sqlitePresenter
-        .updateConversation(state.conversationId, {
+      try {
+        await this.sqlitePresenter.updateConversation(state.conversationId, {
           updatedAt: Date.now()
         })
-        .then(() => {
-          // updated conv time (quiet)
-        })
-      await this.broadcastThreadListUpdate()
+      } catch (e) {
+        console.warn('Failed to update conversation updatedAt:', e)
+      }
     }
+    await this.broadcastThreadListUpdate()
 
     // 无跨会话去重签名清理（已移除去重机制）
   }
@@ -961,7 +1198,7 @@ export class ThreadPresenter implements IThreadPresenter {
           }
         }
 
-        eventBus.sendToRenderer(STREAM_EVENTS.RESPONSE, SendTarget.ALL_WINDOWS, eventData)
+        this.sendStreamResponse(eventId, eventData)
 
         // 每批次之间的延迟，让出event loop
         if (batchEnd < chunks.length) {
@@ -1147,18 +1384,8 @@ export class ThreadPresenter implements IThreadPresenter {
           }
         } else if (tool_call === 'end' || tool_call === 'error') {
           // 查找对应的工具调用块（严格按 id 匹配，避免 name 兜底导致错配）
-          const toolCallBlock = state.message.content.find(
-            (block) =>
-              block.type === 'tool_call' &&
-              tool_call_id &&
-              block.tool_call?.id === tool_call_id &&
-              block.status === 'loading'
-          )
-
-          if (toolCallBlock && toolCallBlock.type === 'tool_call') {
-            // Collect-only: mark parsing lifecycle for UI hints only, do not attach execution results
-            toolCallBlock.status = tool_call === 'error' ? 'error' : 'success'
-          }
+          // STREAM 阶段不设成功/失败最终态；保持 loading，仅更新参数提示（已在 update 分支处理）
+          // 最终态由 ME 提交落库（权限/执行/结果）
         }
       } else if (image_data) {
         // 处理图像数据
@@ -1203,7 +1430,7 @@ export class ThreadPresenter implements IThreadPresenter {
         this.logPermissionSummary(state.message.content, `STREAM.${tool_call}`, eventId)
       }
     }
-    eventBus.sendToRenderer(STREAM_EVENTS.RESPONSE, SendTarget.ALL_WINDOWS, msg)
+    this.sendStreamResponse(eventId, { ...msg })
   }
 
   setSearchAssistantModel(model: MODEL_META, providerId: string) {
@@ -1809,7 +2036,12 @@ export class ThreadPresenter implements IThreadPresenter {
   private async startStreamSearch(
     conversationId: string,
     messageId: string,
-    query: string
+    query: string,
+    options?: {
+      omitPrevSearchInRewrite?: boolean
+      boundaryUserMessageId?: string
+      contextLimit?: number
+    }
   ): Promise<SearchResult[]> {
     const state = this.generatingMessages.get(messageId)
     if (!state) {
@@ -1819,23 +2051,50 @@ export class ThreadPresenter implements IThreadPresenter {
     // 检查是否已被取消
     this.throwIfCancelled(messageId)
 
-    // 添加搜索加载状态
-    const searchBlock: AssistantMessageBlock = {
-      type: 'search',
-      content: '',
-      status: 'loading',
-      timestamp: Date.now(),
-      extra: {
-        total: 0
-      }
+    // 若已处于搜索中，直接返回空结果，避免重复插入 UI 与重复打开窗口
+    if (this.searchingMessages.has(messageId)) {
+      return []
     }
-    state.message.content.unshift(searchBlock)
+
+    // 添加搜索加载状态（去重：若已存在 search 块，则复用，不再新增）
+    const existedSearchBlock = state.message.content.find((b) => b.type === 'search') as
+      | AssistantMessageBlock
+      | undefined
+    let searchBlock = existedSearchBlock as AssistantMessageBlock | undefined
+    if (!searchBlock) {
+      searchBlock = {
+        type: 'search',
+        content: '',
+        status: 'loading',
+        timestamp: Date.now(),
+        extra: {
+          total: 0
+        }
+      }
+      state.message.content.unshift(searchBlock)
+    } else {
+      searchBlock.status = 'loading'
+    }
+    try {
+      console.log('[Search/Begin]', {
+        eventId: messageId,
+        hasExistingSearchBlock: Boolean(existedSearchBlock),
+        alreadySearching: this.searchingMessages.has(messageId)
+      })
+    } catch {}
     {
       const { message, revision } = await this.messageManager.editMessageSilently(
         messageId,
         JSON.stringify(state.message.content)
       )
       this.emitMessageEdited(messageId, revision, message.parentId)
+      try {
+        console.log('[Search/MessageEdited]', {
+          messageId,
+          revision,
+          status: searchBlock.status
+        })
+      } catch {}
     }
     // 标记消息为搜索状态
     state.isSearching = true
@@ -1845,32 +2104,41 @@ export class ThreadPresenter implements IThreadPresenter {
       const contextMessages = await this.getContextMessages(conversationId)
       // 检查是否已被取消
       this.throwIfCancelled(messageId)
+      // 依据“用户边界”确定用于重写的上下文（仅在提供 boundaryUserMessageId 时生效）
+      const useBoundary = Boolean(options?.boundaryUserMessageId)
+      const contextLimit = typeof options?.contextLimit === 'number' ? options!.contextLimit! : 100
+      const contextMessagesForRewrite = useBoundary
+        ? await this.getMessageHistory(options!.boundaryUserMessageId!, contextLimit)
+        : contextMessages
+      try {
+        console.log('[Search/RewriteScope]', {
+          eventId: messageId,
+          useBoundary,
+          boundaryUserId: options?.boundaryUserMessageId || null,
+          contextLimit
+        })
+      } catch {}
 
-      const formattedContext = contextMessages
+      const omitPrevSearchInRewrite = Boolean(options?.omitPrevSearchInRewrite)
+      try {
+        if (omitPrevSearchInRewrite) {
+          console.log('[Search/RewriteCtx]', {
+            eventId: messageId,
+            droppedPrevSearch: true
+          })
+        }
+      } catch {}
+
+      const formattedContext = contextMessagesForRewrite
         .map((msg) => {
           if (msg.role === 'user') {
             const content = msg.content as UserMessageContent
             return `user: ${content.text}${getFileContext(content.files)}`
           } else if (msg.role === 'assistant') {
-            let finalContent = 'assistant: '
-            const content = msg.content as AssistantMessageBlock[]
-            content.forEach((block) => {
-              if (block.type === 'content') {
-                finalContent += block.content + '\n'
-              }
-              if (block.type === 'search') {
-                finalContent += `search-result: ${JSON.stringify(block.extra)}`
-              }
-              if (block.type === 'tool_call') {
-                finalContent += `tool_call: ${JSON.stringify(block.tool_call)}`
-              }
-              if (block.type === 'image') {
-                finalContent += `image: ${block.image_data?.data}`
-              }
-            })
-            return finalContent
+            // 重写上下文中跳过助手侧内容，避免影响“是否需要搜索”的判断
+            return ''
           } else {
-            return JSON.stringify(msg.content)
+            return ''
           }
         })
         .join('\n')
@@ -1886,6 +2154,13 @@ export class ThreadPresenter implements IThreadPresenter {
           JSON.stringify(state.message.content)
         )
         this.emitMessageEdited(messageId, revision, message.parentId)
+        try {
+          console.log('[Search/MessageEdited]', {
+            messageId,
+            revision,
+            status: searchBlock.status
+          })
+        } catch {}
       }
 
       const optimizedQuery = await this.rewriteUserSearchQuery(
@@ -1897,6 +2172,13 @@ export class ThreadPresenter implements IThreadPresenter {
         console.error('重写搜索查询失败:', err)
         return query
       })
+      try {
+        console.log('[Search/RewriteResult]', {
+          eventId: messageId,
+          optimizedQuery,
+          noSearch: optimizedQuery.includes('无须搜索')
+        })
+      } catch {}
 
       // 如果不需要搜索，直接返回空结果
       if (optimizedQuery.includes('无须搜索')) {
@@ -1908,9 +2190,22 @@ export class ThreadPresenter implements IThreadPresenter {
             JSON.stringify(state.message.content)
           )
           this.emitMessageEdited(messageId, revision, message.parentId)
+          try {
+            console.log('[Search/MessageEdited]', {
+              messageId,
+              revision,
+              status: searchBlock.status
+            })
+          } catch {}
         }
         state.isSearching = false
         this.searchingMessages.delete(messageId)
+        try {
+          console.log('[Search/Skip]', {
+            eventId: messageId,
+            reason: 'no_search_returned_by_rewrite'
+          })
+        } catch {}
         return []
       }
 
@@ -1925,6 +2220,13 @@ export class ThreadPresenter implements IThreadPresenter {
           JSON.stringify(state.message.content)
         )
         this.emitMessageEdited(messageId, revision, message.parentId)
+        try {
+          console.log('[Search/MessageEdited]', {
+            messageId,
+            revision,
+            status: searchBlock.status
+          })
+        } catch {}
       }
 
       // 开始搜索
@@ -1943,6 +2245,14 @@ export class ThreadPresenter implements IThreadPresenter {
           JSON.stringify(state.message.content)
         )
         this.emitMessageEdited(messageId, revision, message.parentId)
+        try {
+          console.log('[Search/MessageEdited]', {
+            messageId,
+            revision,
+            status: searchBlock.status,
+            total: (searchBlock as any)?.extra?.total
+          })
+        } catch {}
       }
 
       // 保存搜索结果
@@ -1974,6 +2284,13 @@ export class ThreadPresenter implements IThreadPresenter {
           JSON.stringify(state.message.content)
         )
         this.emitMessageEdited(messageId, revision, message.parentId)
+        try {
+          console.log('[Search/MessageEdited]', {
+            messageId,
+            revision,
+            status: searchBlock.status
+          })
+        } catch {}
       }
 
       // 标记消息搜索完成
@@ -2054,13 +2371,32 @@ export class ThreadPresenter implements IThreadPresenter {
       this.throwIfCancelled(state.message.id)
 
       // 3. 处理搜索（如果需要）
+      // 仅在“首轮 R（R‑prepare）”或明确的 msg_retry 场景下执行搜索；
+      // R2/工具继续（contextMode='toolcall_continue'）不再搜索。
       let searchResults: SearchResult[] | null = null
-      if ((userMessage.content as UserMessageContent).search) {
+      const isRPrepare = (!queryMsgId && !contextMode) || contextMode === 'msg_retry'
+      const allowSearch = !contextMode || contextMode === 'msg_retry'
+      try {
+        console.log('[Search/Gate]', {
+          eventId: state.message.id,
+          contextMode: contextMode || 'default',
+          isRPrepare,
+          allowSearch,
+          injectedSearchFlag: (userMessage.content as UserMessageContent).search,
+          webSearchCfg: this.configPresenter.getSetting('input_webSearch')
+        })
+      } catch {}
+      if (allowSearch && (userMessage.content as UserMessageContent).search) {
         try {
           searchResults = await this.startStreamSearch(
             conversationId,
             state.message.id,
-            userContent
+            userContent,
+            {
+              omitPrevSearchInRewrite: contextMode === 'msg_retry',
+              boundaryUserMessageId: (userMessage as Message).id,
+              contextLimit: conversation.settings.contextLength
+            }
           )
           // 检查是否已被取消
           this.throwIfCancelled(state.message.id)
@@ -2072,6 +2408,14 @@ export class ThreadPresenter implements IThreadPresenter {
           // 其他错误继续处理（搜索失败不应影响生成）
           console.error('搜索过程中出错:', error)
         }
+      } else {
+        try {
+          console.log('[Search/GateDecision]', {
+            eventId: state.message.id,
+            allowSearch,
+            userSearchFlag: (userMessage.content as UserMessageContent).search
+          })
+        } catch {}
       }
 
       // 检查是否已被取消
@@ -2130,6 +2474,11 @@ export class ThreadPresenter implements IThreadPresenter {
         currentForcedSearch,
         currentSearchStrategy
       )
+      // Emit START for observability (non-gating)
+      eventBus.sendToRenderer(STREAM_EVENTS.START, SendTarget.ALL_WINDOWS, {
+        eventId: state.message.id
+      })
+      this.streamStartAt.set(state.message.id, Date.now())
       for await (const event of stream) {
         const msg = event.data
         if (event.type === 'response') {
@@ -2165,6 +2514,9 @@ export class ThreadPresenter implements IThreadPresenter {
     queryMsgId: string,
     selectedVariantsMap?: Record<string, string>
   ) {
+    // 预留/备用：UI 侧“手动继续”入口的后端实现。
+    // 当前主流程中，R2 由 executeGrantedToolsAndContinue 内部自动调用 startStreamCompletion 拉起，
+    // 因此该方法暂未挂接在现有 UI 操作链路上。
     const state = this.findGeneratingState(conversationId)
     if (!state) {
       console.warn('未找到状态，conversationId:', conversationId)
@@ -2254,6 +2606,11 @@ export class ThreadPresenter implements IThreadPresenter {
         forcedSearch,
         searchStrategy
       )
+      // Emit START for observability (non-gating)
+      eventBus.sendToRenderer(STREAM_EVENTS.START, SendTarget.ALL_WINDOWS, {
+        eventId: state.message.id
+      })
+      this.streamStartAt.set(state.message.id, Date.now())
       for await (const event of stream) {
         const msg = event.data
         if (event.type === 'response') {
@@ -2441,11 +2798,14 @@ export class ThreadPresenter implements IThreadPresenter {
       }
     }
 
-    // 任何情况都使用最新配置
-    const webSearchEnabled = this.configPresenter.getSetting('input_webSearch') as boolean
-    const thinkEnabled = this.configPresenter.getSetting('input_deepThinking') as boolean
-    ;(userMessage.content as UserMessageContent).search = webSearchEnabled
-    ;(userMessage.content as UserMessageContent).think = thinkEnabled
+    // 仅在“R-prepare（首轮 R 或 msg_retry）”时应用输入层配置；后续 R2 不覆盖原始 userMessage 标志
+    const isRPrepare = (!queryMsgId && !contextMode) || contextMode === 'msg_retry'
+    if (isRPrepare) {
+      const webSearchEnabled = this.configPresenter.getSetting('input_webSearch') as boolean
+      const thinkEnabled = this.configPresenter.getSetting('input_deepThinking') as boolean
+      ;(userMessage.content as UserMessageContent).search = webSearchEnabled
+      ;(userMessage.content as UserMessageContent).think = thinkEnabled
+    }
     return { conversation, userMessage, contextMessages }
   }
 
@@ -3257,6 +3617,8 @@ export class ThreadPresenter implements IThreadPresenter {
     if (state) {
       // 设置统一的取消标志
       state.isCancelled = true
+      this.cancelStartAt.set(messageId, Date.now())
+      this.writeRuntimeEvent(messageId, { kind: 'CANCEL', action: 'start' })
 
       // 刷新剩余缓冲内容
       if (state.adaptiveBuffer) {
@@ -3284,6 +3646,25 @@ export class ThreadPresenter implements IThreadPresenter {
           block.status = 'success'
         }
       })
+      // X 阶段保底：为进行中/未完成的工具写入用户取消占位
+      try {
+        const content = state.message.content as AssistantMessageBlock[]
+        for (const b of content) {
+          if (b.type === 'tool_call') {
+            const needsPlaceholder = b.status === 'loading' || !b.tool_call?.response
+            if (needsPlaceholder && b.tool_call) {
+              b.status = 'error'
+              const envelope: any = {
+                ok: false,
+                error: 'user_cancelled',
+                message: '用户已取消本轮生成。'
+              }
+              if (b.content && b.content.length > 0) envelope.partial = true
+              b.tool_call.response = JSON.stringify(envelope)
+            }
+          }
+        }
+      } catch {}
       state.message.content.push({
         type: 'error',
         content: 'common.error.userCanceledGeneration',
@@ -3299,13 +3680,63 @@ export class ThreadPresenter implements IThreadPresenter {
           JSON.stringify(state.message.content)
         )
         this.emitMessageEdited(messageId, revision, message.parentId)
+        const started = this.cancelStartAt.get(messageId)
+        const cancelLatency = typeof started === 'number' ? Date.now() - started : undefined
+        this.writeRuntimeEvent(messageId, {
+          kind: 'CANCEL',
+          action: 'done',
+          revision,
+          cancel_to_submit_latency_ms: cancelLatency
+        })
       }
 
       // 停止流式生成
       await this.llmProviderPresenter.stopStream(messageId)
 
+      // 屏障期取消：若存在 waiter，输出 BARRIER.cancelled 并清理
+      if (this.drainWaiters.has(messageId)) {
+        this.writeRuntimeEvent(messageId, { kind: 'BARRIER', action: 'cancelled' })
+        this.drainWaiters.delete(messageId)
+      }
+
+      // END 兜底（S 期）：在超时后发送 END 清层（技术 END），避免提示层残留
+      setTimeout(() => {
+        try {
+          // If submit window gating was active, log gate_off for completeness
+          if (this.submitWindow.has(messageId)) {
+            this.writeRuntimeEvent(messageId, { kind: 'BARRIER', action: 'gate_off' })
+            console.log('[Barrier] gate_off before END (cancel-fallback)', { eventId: messageId })
+            this.submitWindow.delete(messageId)
+          }
+          this.writeRuntimeEvent(messageId, { kind: 'END', action: 'sent', technical: true })
+          eventBus.sendToRenderer(STREAM_EVENTS.END, SendTarget.ALL_WINDOWS, {
+            eventId: messageId,
+            final: true
+          })
+        } catch {}
+      }, this.cancelConfig.endFallbackMs)
+
       // 清理生成状态
       this.generatingMessages.delete(messageId)
+    }
+  }
+
+  // Unified cancel API (ACE): wrap stopMessageGeneration and report fences
+  async cancelTurn(messageId: string): Promise<{
+    ok: boolean
+    phase?: string
+    revFence?: number
+    sseqFence?: number
+    endFallbackUsed?: boolean
+  }> {
+    const sseqFence = this.streamSeqMap.get(messageId) || 0
+    const revFence = this.lastRevisionMap.get(messageId)
+    try {
+      await this.stopMessageGeneration(messageId)
+      // NOTE: revision fence is not tracked explicitly; renderer enforces revision monotonicity.
+      return { ok: true, phase: 'any', revFence, sseqFence, endFallbackUsed: true }
+    } catch {
+      return { ok: false, revFence, sseqFence }
     }
   }
 
@@ -4664,6 +5095,12 @@ export class ThreadPresenter implements IThreadPresenter {
 
   // 统一执行 granted 的工具调用，并触发一次“继续作答”
   private async executeGrantedToolsAndContinue(messageId: string): Promise<void> {
+    // If cancelled, do not proceed
+    const st0 = this.generatingMessages.get(messageId)
+    if (st0 && (st0 as any).isCancelled) {
+      this.audit('SKIP.exec', messageId, 'EXECUTE', { reason: 'cancelled-before-exec' })
+      return
+    }
     console.log(`[Permission] Executing granted tools and continuing: ${messageId}`)
     let message: Message | null = null
     try {
@@ -4684,7 +5121,7 @@ export class ThreadPresenter implements IThreadPresenter {
     const content = message.content as AssistantMessageBlock[]
     // 收集已“消耗”的 tool_call：
     // 仅当该调用已经真实执行过（成功或硬错误）才视为已消耗；
-    // 对于 permission_denied / permission_required 的占位结果，不视为已执行，允许后续授权后再执行。
+    // 任何错误结果均视为一次有效执行，避免重复执行（已移除二次确认机制）。
     const respondedIds = new Set(
       content
         .filter((b) => b.type === 'tool_call' && b.tool_call?.id?.trim() && b.tool_call?.response)
@@ -4692,11 +5129,8 @@ export class ThreadPresenter implements IThreadPresenter {
           try {
             const env = JSON.parse(b.tool_call!.response as string)
             const ok = env && typeof env === 'object' ? env.ok : undefined
-            const err = env && typeof env === 'object' ? env.error : undefined
             if (ok === true) return true
-            if (ok === false && typeof err === 'string') {
-              return err !== 'permission_denied' && err !== 'permission_required'
-            }
+            if (ok === false) return true // 所有错误均视为已执行，避免重复执行
             return false
           } catch {
             // 无法解析时不据此判定为已执行，留给 executed 标志兜底
@@ -4734,6 +5168,11 @@ export class ThreadPresenter implements IThreadPresenter {
 
     let needsMorePermission = false
     for (const perm of grantedBlocks) {
+      const st = this.generatingMessages.get(messageId)
+      if (st && (st as any).isCancelled) {
+        this.audit('SKIP.exec', messageId, 'EXECUTE', { reason: 'cancelled-during-exec' })
+        break
+      }
       const tc = perm.tool_call
       if (!tc || !tc.id || !tc.name) continue
       // 防御性：显式将对应的权限块标记为已授予，避免任何异步合并导致的状态回退
@@ -4797,7 +5236,7 @@ export class ThreadPresenter implements IThreadPresenter {
           },
           server
         }
-        if (ThreadPresenter.DEBUG_TOOL_IO_LOG) {
+        if (ThreadPresenter.DEBUG_TOOL_LOG) {
           try {
             console.log('[IO/Tool/Request]', {
               messageId,
@@ -4809,7 +5248,7 @@ export class ThreadPresenter implements IThreadPresenter {
           } catch {}
         }
         const result = await presenter.mcpPresenter.callTool(toolRequest)
-        if (ThreadPresenter.DEBUG_TOOL_IO_LOG) {
+        if (ThreadPresenter.DEBUG_TOOL_LOG) {
           try {
             const respStr =
               typeof result.content === 'string' ? result.content : JSON.stringify(result.content)
@@ -4824,105 +5263,7 @@ export class ThreadPresenter implements IThreadPresenter {
           } catch {}
         }
 
-        // 若仍需权限（如权限级别不足或一次性授权未命中），回退为 pending 授权并写入错误结果，不进入 R2
-        const anyRes: any = result as any
-        const requiresPerm = Boolean(
-          anyRes?.requiresPermission || anyRes?.rawData?.requiresPermission
-        )
-        if (requiresPerm) {
-          const req = anyRes?.permissionRequest || anyRes?.rawData?.permissionRequest || {}
-          const need: 'read' | 'write' | 'all' = (req.permissionType as any) || 'write'
-
-          // 回退授权块为 pending，并升级权限类型
-          const permBlock = content.find(
-            (b) =>
-              b.type === 'action' &&
-              b.action_type === 'tool_call_permission' &&
-              b.tool_call?.id === tc.id
-          )
-          if (permBlock) {
-            permBlock.status = 'pending'
-            permBlock.extra = permBlock.extra || {}
-            ;(permBlock.extra as any).permissionType = need
-            ;(permBlock.extra as any).needsUserAction = true
-            if (req.serverName) (permBlock.extra as any).serverName = req.serverName
-            if (req.toolName) (permBlock.extra as any).toolName = req.toolName
-          } else {
-            // 兜底：若未找到授权块，创建一条新的 pending 授权块
-            content.push({
-              type: 'action',
-              action_type: 'tool_call_permission',
-              content: 'Permission required for this operation',
-              status: 'pending',
-              timestamp: Date.now(),
-              tool_call: {
-                id: tc.id,
-                name: tc.name,
-                params: tc.params || '',
-                server_name: server.name,
-                server_icons: server.icons,
-                server_description: server.description
-              },
-              extra: {
-                permissionType: need,
-                serverName: server.name,
-                toolName: tc.name,
-                needsUserAction: true,
-                permissionRequest: JSON.stringify({
-                  toolName: tc.name,
-                  serverName: server.name,
-                  permissionType: need,
-                  description: `Allow ${tc.name} to perform ${need} operations on ${server.name}?`
-                })
-              }
-            } as AssistantMessageBlock)
-          }
-
-          // 为该调用写入/更新错误结果（permission_required）
-          let toolBlock = content.find((b) => b.type === 'tool_call' && b.tool_call?.id === tc.id)
-          if (!toolBlock) {
-            toolBlock = {
-              type: 'tool_call',
-              content: '',
-              status: 'error',
-              timestamp: Date.now(),
-              tool_call: {
-                id: tc.id,
-                name: tc.name,
-                params: tc.params || '',
-                server_name: server.name,
-                server_icons: server.icons,
-                server_description: server.description,
-                response: JSON.stringify({ ok: false, error: 'permission_required', need })
-              }
-            }
-            content.push(toolBlock)
-          } else {
-            toolBlock.status = 'error'
-            if (toolBlock.tool_call) {
-              toolBlock.tool_call.response = JSON.stringify({
-                ok: false,
-                error: 'permission_required',
-                need
-              })
-            }
-          }
-
-          // 持久化并标记需要等待授权，暂不进入 R2
-          try {
-            const st = this.generatingMessages.get(messageId)
-            if (st) st.message.content = content
-          } catch {}
-          {
-            const { message, revision } = await this.messageManager.editMessageSilently(
-              messageId,
-              JSON.stringify(content)
-            )
-            this.emitMessageEdited(messageId, revision, message.parentId)
-          }
-          needsMorePermission = true
-          continue
-        }
+        // 去除二次确认：若底层返回权限不足（已在 ToolManager 映射为错误），按普通错误处理
 
         // 更新/创建对应的 tool_call 块（正常成功/错误路径）
         let toolBlock = content.find((b) => b.type === 'tool_call' && b.tool_call?.id === tc.id)
@@ -4944,12 +5285,16 @@ export class ThreadPresenter implements IThreadPresenter {
           }
           content.push(toolBlock)
         }
-        const isErr = Boolean((result as any)?.isError || result.rawData?.isError)
+        const isErr = Boolean((result as any)?.isError || (result as any)?.rawData?.isError)
         toolBlock.status = isErr ? 'error' : 'success'
         if (toolBlock.tool_call) {
           const dataPayload = typeof result.content === 'string' ? result.content : result.content
+          const errorCode =
+            isErr && (result as any)?.rawData?._meta?.errorCode === 'permission_denied'
+              ? 'permission_denied'
+              : 'tool_execution_error'
           const envelope = isErr
-            ? { ok: false, error: 'tool_execution_error', data: dataPayload }
+            ? { ok: false, error: errorCode, data: dataPayload }
             : { ok: true, data: dataPayload }
           toolBlock.tool_call.response = JSON.stringify(envelope)
           // 确保服务信息完整
