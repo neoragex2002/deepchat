@@ -9,11 +9,10 @@ import type {
 } from '@shared/chat'
 import type { CONVERSATION, CONVERSATION_SETTINGS } from '@shared/presenter'
 import { usePresenter } from '@/composables/usePresenter'
-import { CONVERSATION_EVENTS, DEEPLINK_EVENTS, MEETING_EVENTS } from '@/events'
+import { CONVERSATION_EVENTS, DEEPLINK_EVENTS, MEETING_EVENTS, LOGGER_EVENTS } from '@/events'
 import router from '@/router'
 import { useI18n } from 'vue-i18n'
 import { useSoundStore } from './sound'
-import { DEBUG_ROLLBACK_MIN } from '@shared/debug'
 import sfxfcMp3 from '/sounds/sfx-fc.mp3?url'
 import sfxtyMp3 from '/sounds/sfx-typing.mp3?url'
 
@@ -339,11 +338,7 @@ export const useChatStore = defineStore('chat', () => {
     for (const b of cur.content) curMap.set(keyOf(b), b)
 
     const mergedBlocks: AssistantMessageBlock[] = []
-    const lastAcceptedMap = (messageRevisions as any).value as Map<string, number>
-    const lastAcceptedRevision = lastAcceptedMap.get((currentMsg as any).id) || 0
-    // Source markers for minimal rollback diagnostics
-    const incomingEvent = (window as any).__incomingEvent || 'UNKNOWN'
-    const incomingRevision = (window as any).__incomingRevision ?? null
+    // note: messageRevisions retained for potential future diagnostics
     for (const nb of nxt.content as AssistantMessageBlock[]) {
       const k = keyOf(nb)
       const ob = curMap.get(k)
@@ -362,18 +357,15 @@ export const useChatStore = defineStore('chat', () => {
           (from === 'error' && to === 'success')
         if (isDowngrade) {
           merged.status = ob.status
-          if (DEBUG_ROLLBACK_MIN)
-            window.api?.debugLog?.('UI.Downgrade', {
-              messageId: (currentMsg as any).id,
-              toolCallId: ob.tool_call.id,
+          try {
+            window.electron.ipcRenderer.send(LOGGER_EVENTS.AUDIT_UI, {
+              eventId: (currentMsg as any).id,
+              action: 'downgrade_drop',
               block: 'tool',
               from,
-              to,
-              lastAcceptedRevision,
-              incomingEvent,
-              incomingRevision,
-              decision: 'drop'
+              to
             })
+          } catch {}
         }
         // 若新块缺少响应而旧块已有，保留旧响应
         if (!nb.tool_call.response && ob.tool_call.response) {
@@ -401,18 +393,15 @@ export const useChatStore = defineStore('chat', () => {
         const isDowngrade = score(from) > score(to)
         if (isDowngrade) {
           merged.status = ob.status
-          if (DEBUG_ROLLBACK_MIN)
-            window.api?.debugLog?.('UI.Downgrade', {
-              messageId: (currentMsg as any).id,
-              toolCallId: ob.tool_call?.id,
+          try {
+            window.electron.ipcRenderer.send(LOGGER_EVENTS.AUDIT_UI, {
+              eventId: (currentMsg as any).id,
+              action: 'downgrade_drop',
               block: 'perm',
               from,
-              to,
-              lastAcceptedRevision,
-              incomingEvent,
-              incomingRevision,
-              decision: 'drop'
+              to
             })
+          } catch {}
         }
         if (merged.extra) {
           merged.extra.needsUserAction =
@@ -626,13 +615,7 @@ export const useChatStore = defineStore('chat', () => {
           } as any)
         } else if (msg.tool_call) {
           if (msg.tool_call === 'start') {
-            try {
-              console.log('[Renderer/ToolCallStream/START]', {
-                messageId: curMsg.id,
-                toolCallId: msg.tool_call_id,
-                name: msg.tool_call_name
-              })
-            } catch {}
+            // quiet renderer debug
             // 严格依赖 id；无 id 不创建提示块，避免错配
             if (msg.tool_call_id) {
               // 若已存在同 id 的已完成块，则忽略重复 START（R2/回注场景去重）
@@ -671,13 +654,7 @@ export const useChatStore = defineStore('chat', () => {
                 block.tool_call?.id === msg.tool_call_id &&
                 block.status === 'loading'
             )
-            try {
-              console.log('[Renderer/ToolCallStream/UPDATE]', {
-                found: Boolean(existingToolCallBlock),
-                toolCallId: msg.tool_call_id,
-                name: msg.tool_call_name
-              })
-            } catch {}
+            // quiet renderer debug
             if (
               existingToolCallBlock &&
               existingToolCallBlock.type === 'tool_call' &&
@@ -695,13 +672,7 @@ export const useChatStore = defineStore('chat', () => {
                 block.tool_call?.id === msg.tool_call_id &&
                 block.status === 'loading'
             )
-            try {
-              console.log('[Renderer/ToolCallStream/RUNNING]', {
-                found: Boolean(existingToolCallBlock),
-                toolCallId: msg.tool_call_id,
-                name: msg.tool_call_name
-              })
-            } catch {}
+            // quiet renderer debug
             if (existingToolCallBlock && existingToolCallBlock.type === 'tool_call') {
               // 保持loading状态，但可以添加执行中的标识
               existingToolCallBlock.status = 'loading'
@@ -715,13 +686,7 @@ export const useChatStore = defineStore('chat', () => {
             }
           } else if (msg.tool_call === 'end' || msg.tool_call === 'error') {
             // STREAM 阶段仅提示，不设最终态；保持 loading，等待 ME 定音
-            try {
-              console.log('[Renderer/ToolCallStream/END_OR_ERROR_HINT]', {
-                toolCallId: msg.tool_call_id,
-                name: msg.tool_call_name,
-                status: msg.tool_call
-              })
-            } catch {}
+            // quiet renderer debug
             // 可选：此处不更改块状态，最多补齐参数在 update 分支中已处理
           }
         }
@@ -819,6 +784,13 @@ export const useChatStore = defineStore('chat', () => {
       await threadP.ackStreamDrain(msg.eventId, msg.sseqLast)
       // Set fence to the DRAIN target to drop any late frames until END.
       drainFenceSseqLast.value.set(msg.eventId, msg.sseqLast)
+      try {
+        window.electron.ipcRenderer.send(LOGGER_EVENTS.AUDIT_UI, {
+          eventId: msg.eventId,
+          action: 'fence_set',
+          sseqLast: msg.sseqLast
+        })
+      } catch {}
     } catch (e) {
       console.error('Failed to ack stream drain:', e)
     }
@@ -831,6 +803,12 @@ export const useChatStore = defineStore('chat', () => {
     // Clear barrier fence for this eventId
     drainFenceSseqLast.value.delete(msg.eventId)
     lastReceivedSeq.value.delete(msg.eventId)
+    try {
+      window.electron.ipcRenderer.send(LOGGER_EVENTS.AUDIT_UI, {
+        eventId: msg.eventId,
+        action: 'fence_cleared'
+      })
+    } catch {}
 
     // For barrier END (final=false), keep generating state to allow cancel during pure ME
     const isFinal = Boolean(anyMsg?.final)
@@ -854,17 +832,15 @@ export const useChatStore = defineStore('chat', () => {
     if (!cached) return
     // 兜底：如存在上一次阶段残留的围栏/序列缓存，这里清理以确保新阶段帧不被拦截
     try {
-      const hadFence = drainFenceSseqLast.value.has(msg.eventId)
-      const hadSeq = lastReceivedSeq.value.has(msg.eventId)
-      if (hadFence || hadSeq) {
-        console.warn('[StreamFence] START with stale fence/seq → cleared', {
-          eventId: msg.eventId,
-          hadFence,
-          hadSeq
-        })
-      }
+      // quiet renderer debug for stale fence
       drainFenceSseqLast.value.delete(msg.eventId)
       lastReceivedSeq.value.delete(msg.eventId)
+      try {
+        window.electron.ipcRenderer.send(LOGGER_EVENTS.AUDIT_UI, {
+          eventId: msg.eventId,
+          action: 'fence_cleared'
+        })
+      } catch {}
     } catch {}
     generatingThreadIds.value.add(cached.threadId)
   }

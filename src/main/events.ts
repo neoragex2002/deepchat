@@ -200,6 +200,11 @@ export const DIALOG_EVENTS = {
   RESPONSE: 'dialog:response' // Renderer -> Main: Dialog result response
 }
 
+// 日志相关事件（UI 镜像 -> 主进程审计）
+export const LOGGER_EVENTS = {
+  AUDIT_UI: 'logger:audit-ui'
+}
+
 // Knowledge base events
 export const RAG_EVENTS = {
   FILE_UPDATED: 'rag:file-updated', // File status update

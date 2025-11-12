@@ -17,8 +17,7 @@ import {
 import { presenter } from '@/presenter'
 import { MessageManager } from './messageManager'
 import { eventBus, SendTarget } from '@/eventbus'
-import fs from 'fs'
-import path from 'path'
+// fs/path no longer needed for audit writes (writeAudit covers)
 import {
   AssistantMessage,
   Message,
@@ -38,7 +37,8 @@ import { getFileContext } from './fileContext'
 import { ContentEnricher } from './contentEnricher'
 import { CONVERSATION_EVENTS, STREAM_EVENTS, TAB_EVENTS } from '@/events'
 import { DEFAULT_SETTINGS } from './const'
-import { DEBUG } from '@shared/debug'
+// import { LOG_AUDIT } from '@/logger/config'
+import { writeAudit, writeIODetail, appendIoAggregate } from '@/logger'
 
 interface GeneratingMessageState {
   message: AssistantMessage
@@ -95,10 +95,7 @@ export class ThreadPresenter implements IThreadPresenter {
   private static readonly TOOL_CALL_LIMIT_ENABLED = true
   private static readonly TOOL_CALL_LIMIT_MAX = 100
   private static readonly TOOL_CALL_LIMIT_MODE: 'hard_cut' | 'soft_degrade' = 'soft_degrade'
-  // 调试：是否输出 Step/权限块摘要与内容快照
-  private static readonly DEBUG_STEP_LOG = false
-  // IO 日志：是否输出工具调用的完整请求与响应
-  private static readonly DEBUG_TOOL_LOG = false
+  // Debug flags removed; audit/IO are authoritative
   // 生成状态对象自增ID
   private genStateSeq: number = 0
   // 待执行的 continuation（单位排队，coalesce）
@@ -129,29 +126,8 @@ export class ThreadPresenter implements IThreadPresenter {
   // Gate STREAM frames during submit window (after DRAIN until END)
   private submitWindow: Set<string> = new Set()
 
-  // Runtime events logging (append JSON lines per eventId)
-  private runtimeLogDir(): string {
-    return path.resolve(process.cwd(), 'logs', 'runtime-events')
-  }
-  private ensureRuntimeLogDir(): void {
-    try {
-      fs.mkdirSync(this.runtimeLogDir(), { recursive: true })
-    } catch {}
-  }
-  private writeRuntimeEvent(eventId: string, entry: Record<string, unknown>) {
-    try {
-      // Ensure minimal required fields
-      if (!('kind' in entry)) entry.kind = 'misc'
-      if (!('action' in entry)) entry.action = 'emit'
-      this.ensureRuntimeLogDir()
-      const line = JSON.stringify({ ts: Date.now(), eventId, ...entry }) + '\n'
-      fs.appendFileSync(path.join(this.runtimeLogDir(), `${eventId}.jsonl`), line, 'utf8')
-    } catch (e) {
-      try {
-        console.log('[RT]', { eventId, ...entry })
-      } catch {}
-    }
-  }
+  // Deprecated: please use writeAudit instead for unified audit logs
+  private writeRuntimeEvent(_eventId: string, _entry: Record<string, unknown>) {}
 
   // Increment and return next sseq for given eventId
   private nextSseq(eventId: string): number {
@@ -181,7 +157,9 @@ export class ThreadPresenter implements IThreadPresenter {
       this.drainWaiters.delete(eventId)
       const sentAt = this.barrierSentAt.get(eventId)
       const waitedMs = typeof sentAt === 'number' ? Date.now() - sentAt : undefined
-      this.writeRuntimeEvent(eventId, { kind: 'BARRIER', action: 'ack', sseqLast, waitedMs })
+      try {
+        writeAudit(eventId, 'BARRIER', 'ack', { sseqLast, waitedMs })
+      } catch {}
       waiter.resolve()
     }
   }
@@ -258,15 +236,8 @@ export class ThreadPresenter implements IThreadPresenter {
     } catch {}
   }
 
-  private audit(tag: string, msgId: string, where: string, extra?: Record<string, unknown>) {
-    if (!DEBUG.TP_AUDIT_LOG) return
-    try {
-      const payload: Record<string, unknown> = { ts: Date.now(), tag, msgId, where }
-      if (extra && typeof extra === 'object') {
-        for (const [k, v] of Object.entries(extra)) payload[k] = v
-      }
-      console.log(JSON.stringify(payload))
-    } catch {}
+  private audit(_tag: string, _msgId: string, _where: string, _extra?: Record<string, unknown>) {
+    // Deprecated: no-op. Use writeAudit at call sites.
   }
 
   // 在错误落库前，先把内存中的部分生成内容持久化，避免丢失用户已看到的文本
@@ -306,20 +277,21 @@ export class ThreadPresenter implements IThreadPresenter {
         const start = this.streamStartAt.get(messageId)
         if (typeof start === 'number') {
           const latency = Date.now() - start
-          this.writeRuntimeEvent(messageId, {
-            kind: 'ME',
-            action: 'emit',
-            revision,
-            s_to_submit_latency_ms: latency
-          })
+          try {
+            writeAudit(messageId, 'ME', 'emit', { revision, s_to_submit_latency_ms: latency })
+          } catch {}
         } else {
-          this.writeRuntimeEvent(messageId, { kind: 'ME', action: 'emit', revision })
+          try {
+            writeAudit(messageId, 'ME', 'emit', { revision })
+          } catch {}
         }
         this.submittedOnce.add(messageId)
       } else {
-        this.writeRuntimeEvent(messageId, { kind: 'ME', action: 'emit', revision })
+        try {
+          writeAudit(messageId, 'ME', 'emit', { revision })
+        } catch {}
       }
-      this.audit('ME.emit', messageId, 'TP', { rev: revision })
+      // unified audit emitted above
     } catch {}
   }
 
@@ -395,23 +367,19 @@ export class ThreadPresenter implements IThreadPresenter {
     const { eventId, userStop } = msg
     const state = this.generatingMessages.get(eventId)
     if (state) {
-      console.log(
-        `[ThreadPresenter] Handling LLM agent end for message: ${eventId}, userStop: ${userStop}`
-      )
+      // quiet: end handling
 
       // Gate stream frames during the submit window (stop -> drain/ack -> pure ME -> END)
       // Any late RESPONSE frames will be dropped by sendStreamResponse
       this.submitWindow.add(eventId)
       try {
-        this.writeRuntimeEvent(eventId, { kind: 'BARRIER', action: 'gate_on' })
+        writeAudit(eventId, 'BARRIER', 'gate_on')
       } catch {}
 
       // Short-circuit finalize on user cancel: clear hint layer only
       if (userStop && (state as any)?.isCancelled) {
-        console.log('[Barrier] short-circuit finalize due to userStop & isCancelled')
         try {
-          this.writeRuntimeEvent(eventId, { kind: 'BARRIER', action: 'gate_off' })
-          console.log('[Barrier] gate_off before END (cancel)', { eventId })
+          writeAudit(eventId, 'BARRIER', 'gate_off')
         } catch {}
         this.submitWindow.delete(eventId)
         eventBus.sendToRenderer(STREAM_EVENTS.END, SendTarget.ALL_WINDOWS, {
@@ -426,9 +394,7 @@ export class ThreadPresenter implements IThreadPresenter {
       // 统一准则：以 DB 为准。先刷新当前助手消息的最新内容，避免使用过期的内存态覆盖最新内容
       try {
         /* no-op: keep in-memory content; do not refresh from DB at END */
-      } catch (e) {
-        console.warn('[ThreadPresenter] Failed to refresh latest message before END handling:', e)
-      }
+      } catch {}
 
       // Barrier: STREAM.DRAIN + await ACK (short timeout)
       try {
@@ -437,25 +403,24 @@ export class ThreadPresenter implements IThreadPresenter {
           eventId,
           sseqLast
         })
-        this.writeRuntimeEvent(eventId, { kind: 'BARRIER', action: 'sent', sseqLast })
+        try {
+          writeAudit(eventId, 'BARRIER', 'sent', { sseqLast })
+        } catch {}
         this.barrierSentAt.set(eventId, Date.now())
         await new Promise<void>((resolve) => {
           const timer = setTimeout(() => {
-            console.warn('[Barrier] ACK timeout, continue to ME window', { eventId, sseqLast })
-            this.writeRuntimeEvent(eventId, {
-              kind: 'BARRIER',
-              action: 'timeout',
-              sseqLast,
-              waitedMs: this.cancelConfig.barrierAckTimeoutMs
-            })
+            try {
+              writeAudit(eventId, 'BARRIER', 'timeout', {
+                sseqLast,
+                waitedMs: this.cancelConfig.barrierAckTimeoutMs
+              })
+            } catch {}
             this.drainWaiters.delete(eventId)
             resolve()
           }, this.cancelConfig.barrierAckTimeoutMs)
           this.drainWaiters.set(eventId, { sseqLast, resolve, timer })
         })
-      } catch (e) {
-        console.warn('[Barrier] Unexpected error during drain/ack, continue:', e)
-      }
+      } catch {}
 
       // 限流与权限：在 END 点统一裁决（先限流，再注入权限）
       try {
@@ -465,10 +430,7 @@ export class ThreadPresenter implements IThreadPresenter {
           }
         ).planned_tool_calls
         if (planned && Array.isArray(planned) && planned.length > 0) {
-          console.log(
-            `[Permission] planned_tool_calls at END for message ${eventId}:`,
-            planned.map((p) => p.name)
-          )
+          // quiet console
 
           // 简化累计：若当前累计 n 已达上限，则整批判定超限
           if (ThreadPresenter.TOOL_CALL_LIMIT_ENABLED) {
@@ -484,6 +446,13 @@ export class ThreadPresenter implements IThreadPresenter {
                 batch: planned.length
               })
               if (ThreadPresenter.TOOL_CALL_LIMIT_MODE === 'hard_cut') {
+                try {
+                  writeAudit(eventId, 'LIMIT', 'hard_cut', {
+                    limit: LIMIT,
+                    prev: currentTotal,
+                    batch: planned.length
+                  })
+                } catch {}
                 // 主动掐断：为本批 planned 写错误占位（不执行工具），追加一次终止 error 信息块，完成消息（统一设为 error），并发送 END
                 try {
                   // 刷新缓冲并清理
@@ -559,7 +528,7 @@ export class ThreadPresenter implements IThreadPresenter {
                 // 结束本轮
                 try {
                   this.writeRuntimeEvent(eventId, { kind: 'BARRIER', action: 'gate_off' })
-                  console.log('[Barrier] gate_off before END (hard_cut)', { eventId })
+                  // quiet console; mirrored to audit by writeRuntimeEvent
                 } catch {}
                 this.submitWindow.delete(eventId)
                 eventBus.sendToRenderer(STREAM_EVENTS.END, SendTarget.ALL_WINDOWS, {
@@ -625,10 +594,16 @@ export class ThreadPresenter implements IThreadPresenter {
                   )
                   this.emitMessageEdited(eventId, revision, message.parentId)
                 }
+                try {
+                  writeAudit(eventId, 'LIMIT', 'soft_degrade', {
+                    limit: LIMIT,
+                    prev: currentTotal,
+                    batch: planned.length
+                  })
+                } catch {}
                 // 发送 END，并主动触发继续生成（不中断 TURN）
                 try {
-                  this.writeRuntimeEvent(eventId, { kind: 'BARRIER', action: 'gate_off' })
-                  console.log('[Barrier] gate_off before END (soft_degrade)', { eventId })
+                  writeAudit(eventId, 'BARRIER', 'gate_off')
                 } catch {}
                 this.submitWindow.delete(eventId)
                 eventBus.sendToRenderer(STREAM_EVENTS.END, SendTarget.ALL_WINDOWS, {
@@ -636,10 +611,11 @@ export class ThreadPresenter implements IThreadPresenter {
                   final: false
                 })
                 try {
+                  writeAudit(eventId, 'STREAM', 'end', { final: false })
+                } catch {}
+                try {
                   await this.continueAfterAllDenied(eventId)
-                } catch (e) {
-                  console.warn('[SoftDegrade] continueAfterAllDenied failed:', e)
-                }
+                } catch {}
                 return
               }
             }
@@ -653,10 +629,7 @@ export class ThreadPresenter implements IThreadPresenter {
           try {
             toolDefs = await presenter.mcpPresenter.getAllToolDefinitions()
           } catch (e) {
-            console.warn(
-              '[ThreadPresenter] Failed to fetch tool definitions for permission blocks:',
-              e
-            )
+            // quiet
           }
           const defMap = new Map<
             string,
@@ -664,6 +637,9 @@ export class ThreadPresenter implements IThreadPresenter {
           >()
           for (const td of toolDefs) defMap.set(td.function.name, { server: td.server })
 
+          try {
+            writeAudit(eventId, 'PERM', 'plan', { planned: planned.length })
+          } catch {}
           const now = Date.now()
           let pendingCount = 0
           let grantedCount = 0
@@ -683,7 +659,8 @@ export class ThreadPresenter implements IThreadPresenter {
               const res = await (presenter.mcpPresenter as any).decideToolCallPermission(
                 serverName,
                 call.name,
-                call.arguments
+                call.arguments,
+                eventId
               )
               decision = res.decision
               required = res.required
@@ -745,6 +722,13 @@ export class ThreadPresenter implements IThreadPresenter {
           try {
             state.message.content = content
           } catch {}
+          try {
+            writeAudit(eventId, 'PERM', 'inject', {
+              pending: pendingCount,
+              granted: grantedCount,
+              denied: deniedCount
+            })
+          } catch {}
           this.audit('ME', eventId, 'END.inject')
           this.logPermissionSummary(state.message.content, `END.inject`, eventId)
           console.log(
@@ -756,7 +740,7 @@ export class ThreadPresenter implements IThreadPresenter {
               // 通知渲染层本轮 Provider 流已结束（确保 UI 刷新并展示已注入的块）
               try {
                 this.writeRuntimeEvent(eventId, { kind: 'BARRIER', action: 'gate_off' })
-                console.log('[Barrier] gate_off before END (granted_exec)', { eventId })
+                // quiet
               } catch {}
               this.submitWindow.delete(eventId)
               eventBus.sendToRenderer(STREAM_EVENTS.END, SendTarget.ALL_WINDOWS, {
@@ -769,7 +753,7 @@ export class ThreadPresenter implements IThreadPresenter {
               // 通知渲染层 END，再继续作答流程
               try {
                 this.writeRuntimeEvent(eventId, { kind: 'BARRIER', action: 'gate_off' })
-                console.log('[Barrier] gate_off before END (all_denied)', { eventId })
+                // quiet
               } catch {}
               this.submitWindow.delete(eventId)
               eventBus.sendToRenderer(STREAM_EVENTS.END, SendTarget.ALL_WINDOWS, {
@@ -785,13 +769,16 @@ export class ThreadPresenter implements IThreadPresenter {
           // 语义一致性：进入“等待授权”阶段应结束当前流阶段，让前端解除“生成中”并稳定展示授权块
           try {
             this.writeRuntimeEvent(eventId, { kind: 'BARRIER', action: 'gate_off' })
-            console.log('[Barrier] gate_off before END (pending)', { eventId })
+            // quiet
           } catch {}
           this.submitWindow.delete(eventId)
           eventBus.sendToRenderer(STREAM_EVENTS.END, SendTarget.ALL_WINDOWS, {
             eventId,
             final: true
           })
+          try {
+            writeAudit(eventId, 'STREAM', 'end', { final: true })
+          } catch {}
           this.audit('END', eventId, 'S1')
           return
         }
@@ -809,7 +796,6 @@ export class ThreadPresenter implements IThreadPresenter {
       )
 
       if (hasPendingPermissions) {
-        console.log(`[Permission] Pending permissions, keep generating (message ${eventId})`)
         // 保持消息在generating状态，等待权限响应
         // 但是要更新非权限块为success状态
         const content = state.message.content as AssistantMessageBlock[]
@@ -831,7 +817,6 @@ export class ThreadPresenter implements IThreadPresenter {
         try {
           state.message.content = content
         } catch {}
-        this.logPermissionSummary(state.message.content, `END.pending`, eventId)
         // 处于 pending 状态同样需要向渲染层发送 END(final=true)，让前端显示授权块并解除“生成中”
         this.submitWindow.delete(eventId)
         eventBus.sendToRenderer(STREAM_EVENTS.END, SendTarget.ALL_WINDOWS, {
@@ -841,22 +826,24 @@ export class ThreadPresenter implements IThreadPresenter {
         return
       }
 
-      console.log(`[Thread] Finalizing message ${eventId} - no pending permissions`)
+      // Finalize with no pending permissions
 
       // 正常完成流程（无 pending 权限块）
       await this.finalizeMessage(state, eventId, userStop || false)
     }
 
     try {
-      this.writeRuntimeEvent(eventId, { kind: 'BARRIER', action: 'gate_off' })
-      console.log('[Barrier] gate_off before END (finalize)', { eventId })
+      writeAudit(eventId, 'BARRIER', 'gate_off')
     } catch {}
     this.submitWindow.delete(eventId)
     eventBus.sendToRenderer(STREAM_EVENTS.END, SendTarget.ALL_WINDOWS, {
       eventId,
       final: true
     })
-    this.audit('END', eventId, 'S1')
+    try {
+      writeAudit(eventId, 'STREAM', 'end', { final: true })
+    } catch {}
+    // unified STREAM.end audit emitted above
   }
 
   // 清理所有缓冲相关资源
@@ -879,14 +866,7 @@ export class ThreadPresenter implements IThreadPresenter {
     eventId: string,
     userStop: boolean
   ): Promise<void> {
-    if (ThreadPresenter.DEBUG_STEP_LOG) {
-      try {
-        console.log('[Step/Finalize/Before]', {
-          messageId: eventId,
-          blocks: state.message.content?.length || 0
-        })
-      } catch {}
-    }
+    // quiet: finalize begin
     // 仅将内容类块设为 success；不触碰 tool_call 与权限块
     state.message.content.forEach((block) => {
       if (
@@ -983,14 +963,9 @@ export class ThreadPresenter implements IThreadPresenter {
     }
     this.generatingMessages.delete(eventId)
 
-    if (ThreadPresenter.DEBUG_STEP_LOG) {
-      try {
-        console.log('[Step/Finalize/After]', {
-          messageId: eventId,
-          contentSnapshot: JSON.stringify(state.message.content).slice(0, 4000)
-        })
-      } catch {}
-    }
+    try {
+      writeAudit(eventId, 'ME', 'finalize')
+    } catch {}
 
     // 处理标题更新和会话更新
     await this.handleConversationUpdates(state)
@@ -1426,9 +1401,7 @@ export class ThreadPresenter implements IThreadPresenter {
 
       // 更新消息内容
       // 流式阶段不落库，仅通过 RESPONSE 提示 UI
-      if (ThreadPresenter.DEBUG_STEP_LOG && tool_call) {
-        this.logPermissionSummary(state.message.content, `STREAM.${tool_call}`, eventId)
-      }
+      // debug summary removed; audit covers permission/status
     }
     this.sendStreamResponse(eventId, { ...msg })
   }
@@ -2075,12 +2048,9 @@ export class ThreadPresenter implements IThreadPresenter {
     } else {
       searchBlock.status = 'loading'
     }
+    // quiet
     try {
-      console.log('[Search/Begin]', {
-        eventId: messageId,
-        hasExistingSearchBlock: Boolean(existedSearchBlock),
-        alreadySearching: this.searchingMessages.has(messageId)
-      })
+      writeAudit(messageId, 'SEARCH', 'begin')
     } catch {}
     {
       const { message, revision } = await this.messageManager.editMessageSilently(
@@ -2088,13 +2058,7 @@ export class ThreadPresenter implements IThreadPresenter {
         JSON.stringify(state.message.content)
       )
       this.emitMessageEdited(messageId, revision, message.parentId)
-      try {
-        console.log('[Search/MessageEdited]', {
-          messageId,
-          revision,
-          status: searchBlock.status
-        })
-      } catch {}
+      // quiet
     }
     // 标记消息为搜索状态
     state.isSearching = true
@@ -2110,24 +2074,16 @@ export class ThreadPresenter implements IThreadPresenter {
       const contextMessagesForRewrite = useBoundary
         ? await this.getMessageHistory(options!.boundaryUserMessageId!, contextLimit)
         : contextMessages
+      // quiet
       try {
-        console.log('[Search/RewriteScope]', {
-          eventId: messageId,
+        writeAudit(messageId, 'SEARCH', 'rewrite_scope', {
           useBoundary,
           boundaryUserId: options?.boundaryUserMessageId || null,
           contextLimit
         })
       } catch {}
 
-      const omitPrevSearchInRewrite = Boolean(options?.omitPrevSearchInRewrite)
-      try {
-        if (omitPrevSearchInRewrite) {
-          console.log('[Search/RewriteCtx]', {
-            eventId: messageId,
-            droppedPrevSearch: true
-          })
-        }
-      } catch {}
+      // omitPrevSearchInRewrite removed (console-only)
 
       const formattedContext = contextMessagesForRewrite
         .map((msg) => {
@@ -2154,13 +2110,7 @@ export class ThreadPresenter implements IThreadPresenter {
           JSON.stringify(state.message.content)
         )
         this.emitMessageEdited(messageId, revision, message.parentId)
-        try {
-          console.log('[Search/MessageEdited]', {
-            messageId,
-            revision,
-            status: searchBlock.status
-          })
-        } catch {}
+        // quiet
       }
 
       const optimizedQuery = await this.rewriteUserSearchQuery(
@@ -2172,9 +2122,9 @@ export class ThreadPresenter implements IThreadPresenter {
         console.error('重写搜索查询失败:', err)
         return query
       })
+      // quiet
       try {
-        console.log('[Search/RewriteResult]', {
-          eventId: messageId,
+        writeAudit(messageId, 'SEARCH', 'rewrite_result', {
           optimizedQuery,
           noSearch: optimizedQuery.includes('无须搜索')
         })
@@ -2190,21 +2140,13 @@ export class ThreadPresenter implements IThreadPresenter {
             JSON.stringify(state.message.content)
           )
           this.emitMessageEdited(messageId, revision, message.parentId)
-          try {
-            console.log('[Search/MessageEdited]', {
-              messageId,
-              revision,
-              status: searchBlock.status
-            })
-          } catch {}
+          // quiet
         }
         state.isSearching = false
         this.searchingMessages.delete(messageId)
+        // quiet
         try {
-          console.log('[Search/Skip]', {
-            eventId: messageId,
-            reason: 'no_search_returned_by_rewrite'
-          })
+          writeAudit(messageId, 'SEARCH', 'success', { total: 0 })
         } catch {}
         return []
       }
@@ -2220,14 +2162,11 @@ export class ThreadPresenter implements IThreadPresenter {
           JSON.stringify(state.message.content)
         )
         this.emitMessageEdited(messageId, revision, message.parentId)
-        try {
-          console.log('[Search/MessageEdited]', {
-            messageId,
-            revision,
-            status: searchBlock.status
-          })
-        } catch {}
+        // quiet
       }
+      try {
+        writeAudit(messageId, 'SEARCH', 'reading')
+      } catch {}
 
       // 开始搜索
       const results = await this.searchManager.search(conversationId, optimizedQuery)
@@ -2245,15 +2184,11 @@ export class ThreadPresenter implements IThreadPresenter {
           JSON.stringify(state.message.content)
         )
         this.emitMessageEdited(messageId, revision, message.parentId)
-        try {
-          console.log('[Search/MessageEdited]', {
-            messageId,
-            revision,
-            status: searchBlock.status,
-            total: (searchBlock as any)?.extra?.total
-          })
-        } catch {}
+        // quiet
       }
+      try {
+        writeAudit(messageId, 'SEARCH', 'success', { total: results.length })
+      } catch {}
 
       // 保存搜索结果
       for (const result of results) {
@@ -2272,6 +2207,9 @@ export class ThreadPresenter implements IThreadPresenter {
           })
         )
       }
+      try {
+        writeAudit(messageId, 'SEARCH', 'attachment_saved', { total: results.length })
+      } catch {}
 
       // 检查是否已被取消
       this.throwIfCancelled(messageId)
@@ -2284,13 +2222,7 @@ export class ThreadPresenter implements IThreadPresenter {
           JSON.stringify(state.message.content)
         )
         this.emitMessageEdited(messageId, revision, message.parentId)
-        try {
-          console.log('[Search/MessageEdited]', {
-            messageId,
-            revision,
-            status: searchBlock.status
-          })
-        } catch {}
+        // quiet
       }
 
       // 标记消息搜索完成
@@ -2353,7 +2285,8 @@ export class ThreadPresenter implements IThreadPresenter {
         conversationId,
         queryMsgId,
         selectedVariantsMap,
-        contextMode
+        contextMode,
+        state.message.id
       )
 
       const { providerId, modelId } = conversation.settings
@@ -2375,18 +2308,18 @@ export class ThreadPresenter implements IThreadPresenter {
       // R2/工具继续（contextMode='toolcall_continue'）不再搜索。
       let searchResults: SearchResult[] | null = null
       const isRPrepare = (!queryMsgId && !contextMode) || contextMode === 'msg_retry'
-      const allowSearch = !contextMode || contextMode === 'msg_retry'
+      const gateAllow = !contextMode || contextMode === 'msg_retry'
       try {
-        console.log('[Search/Gate]', {
-          eventId: state.message.id,
+        writeAudit(state.message.id, 'SEARCH', 'gate', {
           contextMode: contextMode || 'default',
           isRPrepare,
-          allowSearch,
-          injectedSearchFlag: (userMessage.content as UserMessageContent).search,
+          gateAllow,
+          userSearchFlag: Boolean((userMessage.content as UserMessageContent).search),
+          willSearch: gateAllow && Boolean((userMessage.content as UserMessageContent).search),
           webSearchCfg: this.configPresenter.getSetting('input_webSearch')
         })
       } catch {}
-      if (allowSearch && (userMessage.content as UserMessageContent).search) {
+      if (gateAllow && (userMessage.content as UserMessageContent).search) {
         try {
           searchResults = await this.startStreamSearch(
             conversationId,
@@ -2410,10 +2343,10 @@ export class ThreadPresenter implements IThreadPresenter {
         }
       } else {
         try {
-          console.log('[Search/GateDecision]', {
-            eventId: state.message.id,
-            allowSearch,
-            userSearchFlag: (userMessage.content as UserMessageContent).search
+          writeAudit(state.message.id, 'SEARCH', 'gate_decision', {
+            gateAllow,
+            userSearchFlag: Boolean((userMessage.content as UserMessageContent).search),
+            willSearch: gateAllow && Boolean((userMessage.content as UserMessageContent).search)
           })
         } catch {}
       }
@@ -2431,7 +2364,9 @@ export class ThreadPresenter implements IThreadPresenter {
         userMessage,
         vision,
         vision ? imageFiles : [],
-        modelConfig.functionCall
+        modelConfig.functionCall,
+        undefined,
+        state.message.id
       )
 
       // 检查是否已被取消
@@ -2478,6 +2413,9 @@ export class ThreadPresenter implements IThreadPresenter {
       eventBus.sendToRenderer(STREAM_EVENTS.START, SendTarget.ALL_WINDOWS, {
         eventId: state.message.id
       })
+      try {
+        writeAudit(state.message.id, 'STREAM', 'start')
+      } catch {}
       this.streamStartAt.set(state.message.id, Date.now())
       for await (const event of stream) {
         const msg = event.data
@@ -2582,7 +2520,9 @@ export class ThreadPresenter implements IThreadPresenter {
         userMessage,
         false,
         [], // 没有图片文件
-        modelConfig.functionCall
+        modelConfig.functionCall,
+        undefined,
+        state.message.id
       )
 
       // 8. 更新生成状态
@@ -2610,6 +2550,9 @@ export class ThreadPresenter implements IThreadPresenter {
       eventBus.sendToRenderer(STREAM_EVENTS.START, SendTarget.ALL_WINDOWS, {
         eventId: state.message.id
       })
+      try {
+        writeAudit(state.message.id, 'STREAM', 'start')
+      } catch {}
       this.streamStartAt.set(state.message.id, Date.now())
       for await (const event of stream) {
         const msg = event.data
@@ -2656,7 +2599,8 @@ export class ThreadPresenter implements IThreadPresenter {
     conversationId: string,
     queryMsgId?: string,
     selectedVariantsMap?: Record<string, string>,
-    contextMode?: 'msg_retry' | 'toolcall_continue'
+    contextMode?: 'msg_retry' | 'toolcall_continue',
+    eventId?: string
   ): Promise<{
     conversation: CONVERSATION
     userMessage: Message
@@ -2670,7 +2614,7 @@ export class ThreadPresenter implements IThreadPresenter {
 
     if (queryMsgId) {
       try {
-        console.log('[Context/Mode]', { mode: contextMode || 'default' })
+        if (eventId) writeAudit(eventId, 'EXEC', 'context_mode', { mode: contextMode || 'default' })
       } catch {}
       // 处理指定消息ID的情况
       const queryMessage = await this.getMessage(queryMsgId)
@@ -2709,11 +2653,13 @@ export class ThreadPresenter implements IThreadPresenter {
 
       // R2 上下文选择范围（仅当上一条助手消息包含已完成的 tool_call 结果时，将其注入上下文用于回放）。
       try {
-        console.log('[R2/ContextPick]', {
-          queryMsgId,
-          resolvedUserMsgId: userMessage.id,
-          baseContextCount: contextMessages.length
-        })
+        if (eventId)
+          writeAudit(eventId, 'EXEC', 'context_pick', {
+            step: 'begin',
+            queryMsgId,
+            resolvedUserMsgId: userMessage.id,
+            baseContextCount: contextMessages.length
+          })
       } catch {}
 
       if (assistantMessageForR2 && Array.isArray(assistantMessageForR2.content)) {
@@ -2737,22 +2683,28 @@ export class ThreadPresenter implements IThreadPresenter {
           contextMessages.push(injected)
           try {
             const variant = (injected as any).is_variant ? 'variant' : 'main'
-            console.log('[R2/UseCurrent]', {
-              assistantId: injected.id,
-              variant
-            })
+            if (eventId)
+              writeAudit(eventId, 'EXEC', 'context_pick', {
+                step: 'use_current',
+                assistantId: injected.id,
+                variant
+              })
           } catch {}
           try {
-            console.log('[R2/ContextPick] InjectedAssistantForReplay', {
-              injectedId: injected.id,
-              newContextCount: contextMessages.length
-            })
+            if (eventId)
+              writeAudit(eventId, 'EXEC', 'context_pick', {
+                step: 'injected_assistant',
+                injectedId: injected.id,
+                newContextCount: contextMessages.length
+              })
           } catch {}
         } else {
           try {
-            console.log('[R2/ContextPick] NoRePlayableToolInAssistant', {
-              assistantId: assistantMessageForR2.id
-            })
+            if (eventId)
+              writeAudit(eventId, 'EXEC', 'context_pick', {
+                step: 'no_replayable_tool',
+                assistantId: assistantMessageForR2.id
+              })
           } catch {}
         }
       }
@@ -2853,7 +2805,8 @@ export class ThreadPresenter implements IThreadPresenter {
     vision: boolean,
     imageFiles: MessageFile[],
     supportsFunctionCall: boolean,
-    modelType?: ModelType
+    modelType?: ModelType,
+    eventId?: string
   ): Promise<{
     finalContent: ChatMessage[]
     promptTokens: number
@@ -2896,7 +2849,8 @@ export class ThreadPresenter implements IThreadPresenter {
     const selectedContextMessages = this.selectContextMessages(
       contextMessages,
       userMessage,
-      remainingContextLength
+      remainingContextLength,
+      eventId
     )
 
     // 格式化消息
@@ -2909,7 +2863,8 @@ export class ThreadPresenter implements IThreadPresenter {
       enrichedUserMessage,
       imageFiles,
       vision,
-      supportsFunctionCall
+      supportsFunctionCall,
+      eventId
     )
 
     // 合并连续的相同角色消息
@@ -2937,14 +2892,16 @@ export class ThreadPresenter implements IThreadPresenter {
         if ((m as any).tool_call_id) toolIds.push((m as any).tool_call_id)
       }
       const missingPairs = toolCallIds.filter((id) => !toolIds.includes(id))
-      console.log('[ContextSummary]', {
-        supportsFunctionCall,
-        assistantToolCalls: toolCallIds.map((s) => (s || '').slice(0, 8)),
-        toolMessages: toolIds.map((s) => (s || '').slice(0, 8)),
-        missingPairs: missingPairs.map((s) => (s || '').slice(0, 8)),
-        totalMessages: mergedMessages.length,
-        promptTokens
-      })
+      // Emit context summary to audit
+      if (eventId)
+        writeAudit(eventId, 'EXEC', 'context_summary', {
+          supportsFunctionCall,
+          assistantToolCalls: toolCallIds.map((s) => (s || '').slice(0, 8)),
+          toolMessages: toolIds.map((s) => (s || '').slice(0, 8)),
+          missingPairs: missingPairs.map((s) => (s || '').slice(0, 8)),
+          totalMessages: mergedMessages.length,
+          promptTokens
+        })
     } catch {}
 
     // 为避免日志过长，默认不打印完整 ContextDump。需要时可临时恢复。
@@ -2955,7 +2912,8 @@ export class ThreadPresenter implements IThreadPresenter {
   private selectContextMessages(
     contextMessages: Message[],
     userMessage: Message,
-    remainingContextLength: number
+    remainingContextLength: number,
+    eventId?: string
   ): Message[] {
     // R2 专用：如存在为回放注入的助手消息（携带工具结果），先从候选集中剔除，避免它参与预算筛选
     const injectedAssistant = contextMessages.find((msg) => (msg as any).__r2Injected === true)
@@ -2970,11 +2928,12 @@ export class ThreadPresenter implements IThreadPresenter {
         )
         adjustedBudget = Math.max(0, remainingContextLength - injectedTokens)
         try {
-          console.log('[R2/Budget]', {
-            injectedTokens,
-            remainingContextLength,
-            adjustedBudget
-          })
+          if (eventId)
+            writeAudit(eventId, 'EXEC', 'budget', {
+              injectedTokens,
+              remainingContextLength,
+              adjustedBudget
+            })
         } catch {}
       } catch {
         // 忽略个别 stringify 异常，保持原预算
@@ -3036,10 +2995,12 @@ export class ThreadPresenter implements IThreadPresenter {
     if (injectedAssistant) {
       selectedMessages.push(injectedAssistant)
       try {
-        console.log('[R2/ContextPick/Final]', {
-          injectedAssistantAppended: true,
-          selectedCount: selectedMessages.length
-        })
+        if (eventId)
+          writeAudit(eventId, 'EXEC', 'context_pick', {
+            step: 'final',
+            injectedAssistantAppended: true,
+            selectedCount: selectedMessages.length
+          })
       } catch {}
     }
     return selectedMessages
@@ -3055,7 +3016,8 @@ export class ThreadPresenter implements IThreadPresenter {
     enrichedUserMessage: string,
     imageFiles: MessageFile[],
     vision: boolean,
-    supportsFunctionCall: boolean
+    supportsFunctionCall: boolean,
+    eventId?: string
   ): ChatMessage[] {
     const formattedMessages: ChatMessage[] = []
 
@@ -3066,7 +3028,9 @@ export class ThreadPresenter implements IThreadPresenter {
       : contextMessages
 
     // 先追加历史（不含注入回放）
-    formattedMessages.push(...this.addContextMessages(nonInjected, vision, supportsFunctionCall))
+    formattedMessages.push(
+      ...this.addContextMessages(nonInjected, vision, supportsFunctionCall, eventId)
+    )
 
     // 添加系统提示
     if (systemPrompt) {
@@ -3090,7 +3054,7 @@ export class ThreadPresenter implements IThreadPresenter {
       //   role: 'user',
       //   content: ARTIFACTS_PROMPT
       // })
-      console.log('artifacts目前由mcp提供，此处为兼容性保留')
+      // quiet
     }
     // 没有 vision 就不用塞进去了
     if (vision && imageFiles.length > 0) {
@@ -3104,7 +3068,9 @@ export class ThreadPresenter implements IThreadPresenter {
 
     // 如果存在回放注入，则最后追加回放（S1 文本 + 工具对）
     if (injected) {
-      formattedMessages.push(...this.addContextMessages([injected], vision, supportsFunctionCall))
+      formattedMessages.push(
+        ...this.addContextMessages([injected], vision, supportsFunctionCall, eventId)
+      )
     }
 
     return formattedMessages
@@ -3127,7 +3093,8 @@ export class ThreadPresenter implements IThreadPresenter {
   private addContextMessages(
     contextMessages: Message[],
     vision: boolean,
-    supportsFunctionCall: boolean
+    supportsFunctionCall: boolean,
+    eventId?: string
   ): ChatMessage[] {
     const resultMessages = [] as ChatMessage[]
 
@@ -3161,12 +3128,15 @@ export class ThreadPresenter implements IThreadPresenter {
               try {
                 const paramsLen = subMsg.tool_call?.params ? subMsg.tool_call.params.length : 0
                 const respLen = subMsg.tool_call?.response ? subMsg.tool_call.response.length : 0
-                console.log('[R2Context/SupportsFC/ReplayPair]', {
-                  toolCallId: subMsg.tool_call?.id,
-                  name: subMsg.tool_call?.name,
-                  paramsLength: paramsLen,
-                  responseLength: respLen
-                })
+                try {
+                  if (eventId)
+                    writeAudit(eventId, 'EXEC', 'supports_fc', {
+                      tool_call_id: subMsg.tool_call?.id,
+                      name: subMsg.tool_call?.name,
+                      paramsLength: paramsLen,
+                      responseLength: respLen
+                    })
+                } catch {}
               } catch {}
               resultMessages.push({
                 role: 'assistant',
@@ -3198,12 +3168,15 @@ export class ThreadPresenter implements IThreadPresenter {
                 const respOk = Boolean(
                   subMsg.tool_call?.response && String(subMsg.tool_call?.response).trim()
                 )
-                console.log('[R2Context/SupportsFC/SkipReason]', {
-                  idOk,
-                  nameOk,
-                  paramsOk,
-                  respOk
-                })
+                try {
+                  if (eventId)
+                    writeAudit(eventId, 'EXEC', 'supports_fc_skip', {
+                      idOk,
+                      nameOk,
+                      paramsOk,
+                      respOk
+                    })
+                } catch {}
               } catch {}
             } else if (subMsg.type === 'search') {
               // 删除强制搜索结果中遗留的[x]引文标记
@@ -3618,7 +3591,9 @@ export class ThreadPresenter implements IThreadPresenter {
       // 设置统一的取消标志
       state.isCancelled = true
       this.cancelStartAt.set(messageId, Date.now())
-      this.writeRuntimeEvent(messageId, { kind: 'CANCEL', action: 'start' })
+      try {
+        writeAudit(messageId, 'CANCEL', 'start')
+      } catch {}
 
       // 刷新剩余缓冲内容
       if (state.adaptiveBuffer) {
@@ -3682,12 +3657,12 @@ export class ThreadPresenter implements IThreadPresenter {
         this.emitMessageEdited(messageId, revision, message.parentId)
         const started = this.cancelStartAt.get(messageId)
         const cancelLatency = typeof started === 'number' ? Date.now() - started : undefined
-        this.writeRuntimeEvent(messageId, {
-          kind: 'CANCEL',
-          action: 'done',
-          revision,
-          cancel_to_submit_latency_ms: cancelLatency
-        })
+        try {
+          writeAudit(messageId, 'CANCEL', 'done', {
+            revision,
+            cancel_to_submit_latency_ms: cancelLatency
+          })
+        } catch {}
       }
 
       // 停止流式生成
@@ -3695,7 +3670,9 @@ export class ThreadPresenter implements IThreadPresenter {
 
       // 屏障期取消：若存在 waiter，输出 BARRIER.cancelled 并清理
       if (this.drainWaiters.has(messageId)) {
-        this.writeRuntimeEvent(messageId, { kind: 'BARRIER', action: 'cancelled' })
+        try {
+          writeAudit(messageId, 'BARRIER', 'cancelled')
+        } catch {}
         this.drainWaiters.delete(messageId)
       }
 
@@ -3704,11 +3681,16 @@ export class ThreadPresenter implements IThreadPresenter {
         try {
           // If submit window gating was active, log gate_off for completeness
           if (this.submitWindow.has(messageId)) {
-            this.writeRuntimeEvent(messageId, { kind: 'BARRIER', action: 'gate_off' })
-            console.log('[Barrier] gate_off before END (cancel-fallback)', { eventId: messageId })
+            try {
+              writeAudit(messageId, 'BARRIER', 'gate_off')
+            } catch {}
             this.submitWindow.delete(messageId)
           }
-          this.writeRuntimeEvent(messageId, { kind: 'END', action: 'sent', technical: true })
+          try {
+            writeAudit(messageId, 'CANCEL', 'end_fallback_used', {
+              fallbackMs: this.cancelConfig.endFallbackMs
+            })
+          } catch {}
           eventBus.sendToRenderer(STREAM_EVENTS.END, SendTarget.ALL_WINDOWS, {
             eventId: messageId,
             final: true
@@ -4797,13 +4779,15 @@ export class ThreadPresenter implements IThreadPresenter {
     permissionType: 'read' | 'write' | 'all',
     remember: boolean = true
   ): Promise<void> {
-    console.log(`[Permission] Handling response`, {
-      messageId,
-      toolCallId,
-      granted,
-      permissionType,
-      remember
-    })
+    // quiet
+    try {
+      writeAudit(messageId, 'PERM', 'user_action', {
+        tool_call_id: toolCallId,
+        decision: granted ? 'grant' : 'deny',
+        permission: permissionType,
+        remember
+      })
+    } catch {}
 
     try {
       // 1. 获取消息并更新权限块状态
@@ -4835,7 +4819,7 @@ export class ThreadPresenter implements IThreadPresenter {
         throw new Error(errorMsg)
       }
 
-      console.log(`[Permission] Found block for tool: ${permissionBlock.tool_call?.name}`)
+      // quiet
 
       // 2. 更新权限块状态
       permissionBlock.status = granted ? 'granted' : 'denied'
@@ -4908,6 +4892,9 @@ export class ThreadPresenter implements IThreadPresenter {
         const g = perms.filter((b) => b.status === 'granted').length
         const d = perms.filter((b) => b.status === 'denied').length
         const e = perms.filter((b) => b.status === 'error').length
+        try {
+          writeAudit(messageId, 'PERM', 'status', { pending: p, granted: g, denied: d, error: e })
+        } catch {}
         this.audit('PERM.update', messageId, 'S1', { perm: { p, g, d, e } })
       } catch {}
       // 同步内存态：确保 resumeStreamCompletion 使用到最新的权限块与工具信息
@@ -4915,7 +4902,7 @@ export class ThreadPresenter implements IThreadPresenter {
         const st = this.generatingMessages.get(messageId)
         if (st) st.message.content = content
       } catch {}
-      console.log(`[Permission] Status updated: ${permissionBlock.status}`)
+      // quiet
 
       // 4. 授权/拒绝后执行“总闸检查”
       try {
@@ -4934,7 +4921,7 @@ export class ThreadPresenter implements IThreadPresenter {
                 const found = defs.find((d) => d.function.name === permissionBlock.tool_call?.name)
                 if (found?.server?.name) serverName = found.server.name as string
               } catch (e) {
-                console.warn('[Permission] Fallback resolve serverName failed:', e)
+                // quiet
               }
             }
           } catch {}
@@ -4947,8 +4934,15 @@ export class ThreadPresenter implements IThreadPresenter {
               /* remember */ true,
               permissionBlock.tool_call?.name
             )
+            try {
+              writeAudit(messageId, 'PERM', 'persist', {
+                scope: 'server',
+                permission: permissionType,
+                remember: true
+              })
+            } catch {}
           } catch (e) {
-            console.warn('[Permission] Persisting server permission failed:', e)
+            // quiet
           }
         }
       } catch {}
@@ -4960,13 +4954,9 @@ export class ThreadPresenter implements IThreadPresenter {
         )
         const pendingCount = permissionBlocks.filter((b) => b.status === 'pending').length
         const grantedCount = permissionBlocks.filter((b) => b.status === 'granted').length
-        const deniedCount = permissionBlocks.filter((b) => b.status === 'denied').length
+        // deniedCount not required for gating
 
-        console.log(`[Permission] Gating counts for message ${messageId}:`, {
-          pendingCount,
-          grantedCount,
-          deniedCount
-        })
+        // quiet
 
         if (pendingCount > 0) {
           // 仍有待处理项，等待后续响应
@@ -4982,11 +4972,11 @@ export class ThreadPresenter implements IThreadPresenter {
         // 全部被拒绝：注入说明并触发一次继续作答
         await this.continueAfterAllDenied(messageId)
       } catch (gateError) {
-        console.error('[Permission] Gating failed:', gateError)
+        // quiet
         throw gateError
       }
     } catch (error) {
-      console.error(`[Permission] Failed to handle response:`, error)
+      // quiet
 
       // 确保消息状态正确更新
       try {
@@ -5001,10 +4991,10 @@ export class ThreadPresenter implements IThreadPresenter {
           const res = await this.messageManager.handleMessageError(messageId, String(error))
           this.emitMessageEdited(messageId, res.revision, res.message.parentId)
         } else {
-          console.warn('[Permission] SKIP.updateError: message not found', { messageId })
+          // quiet
         }
       } catch (updateError) {
-        console.error(`[Permission] Failed to update message error status:`, updateError)
+        // quiet
       }
 
       throw error
@@ -5101,7 +5091,7 @@ export class ThreadPresenter implements IThreadPresenter {
       this.audit('SKIP.exec', messageId, 'EXECUTE', { reason: 'cancelled-before-exec' })
       return
     }
-    console.log(`[Permission] Executing granted tools and continuing: ${messageId}`)
+    // quiet
     let message: Message | null = null
     try {
       message = await this.messageManager.getMessage(messageId)
@@ -5158,9 +5148,8 @@ export class ThreadPresenter implements IThreadPresenter {
     const genState = this.generatingMessages.get(messageId)
     // continue check (quiet)
     if (genState?.continuationInProgress) {
-      const stateId = (genState as any)?.__id
       this.pendingContinuation.add(messageId)
-      console.log('[Continue/Enqueue]', { messageId, stateId })
+      // quiet
       return
     }
 
@@ -5191,7 +5180,7 @@ export class ThreadPresenter implements IThreadPresenter {
           }
         } catch (e) {
           console.warn(
-            '[Permission] Unable to resolve server for tool, proceeding without server meta:',
+            // quiet: fallback resolve server meta
             e
           )
         }
@@ -5210,11 +5199,21 @@ export class ThreadPresenter implements IThreadPresenter {
             serverName,
             required,
             /*remember*/ false,
-            tc.name
+            tc.name,
+            messageId
           )
         } catch (e) {
           console.warn('[ThreadPresenter] grantPermission(one-time) failed (will still try):', e)
         }
+        try {
+          writeAudit(messageId, 'PERM', 'persist', {
+            scope: 'internal_grant',
+            permission: required,
+            remember: false,
+            server: serverName,
+            tool: tc.name
+          })
+        } catch {}
         console.log(
           `[ThreadPresenter] Prepared one-time internal grant for tool execution, tool: ${tc.name}, server: ${serverName}, required: ${required}`
         )
@@ -5227,6 +5226,19 @@ export class ThreadPresenter implements IThreadPresenter {
           server,
           arguments: effectiveArgs
         })
+        try {
+          writeIODetail(messageId, 'tool_request', {
+            tool_call_id: tc.id,
+            tool: tc.name,
+            server: server.name,
+            arguments: effectiveArgs
+          } as any)
+          writeAudit(messageId, 'EXEC', 'tool_start', {
+            tool_call_id: tc.id,
+            server: server.name,
+            tool: tc.name
+          })
+        } catch {}
         const toolRequest = {
           id: tc.id,
           type: 'function',
@@ -5236,32 +5248,29 @@ export class ThreadPresenter implements IThreadPresenter {
           },
           server
         }
-        if (ThreadPresenter.DEBUG_TOOL_LOG) {
-          try {
-            console.log('[IO/Tool/Request]', {
-              messageId,
-              toolCallId: tc.id,
+        const result = await presenter.mcpPresenter.callTool({
+          ...(toolRequest as any),
+          eventId: messageId
+        } as any)
+        try {
+          writeIODetail(messageId, 'tool_response', {
+            tool_call_id: tc.id,
+            ok: !Boolean((result as any)?.isError || (result as any)?.rawData?.isError),
+            content: (result as any)?.content,
+            structured: (result as any)?.rawData || (result as any)?.structured
+          } as any)
+          appendIoAggregate(messageId, {
+            type: 'tool_exec',
+            meta: {
+              tool_call_id: tc.id,
               server: server.name,
-              name: tc.name,
-              arguments: effectiveArgs
-            })
-          } catch {}
-        }
-        const result = await presenter.mcpPresenter.callTool(toolRequest)
-        if (ThreadPresenter.DEBUG_TOOL_LOG) {
-          try {
-            const respStr =
-              typeof result.content === 'string' ? result.content : JSON.stringify(result.content)
-            console.log('[IO/Tool/Response]', {
-              messageId,
-              toolCallId: tc.id,
-              server: server.name,
-              name: tc.name,
-              isError: Boolean((result as any)?.isError || result.rawData?.isError),
-              content: respStr
-            })
-          } catch {}
-        }
+              tool: tc.name,
+              timestamp: Date.now()
+            },
+            ok: !Boolean((result as any)?.isError || (result as any)?.rawData?.isError)
+          })
+        } catch {}
+        // quiet tool IO console; IO/AUDIT already persisted
 
         // 去除二次确认：若底层返回权限不足（已在 ToolManager 映射为错误），按普通错误处理
 
@@ -5303,8 +5312,9 @@ export class ThreadPresenter implements IThreadPresenter {
           toolBlock.tool_call.server_description = server.description
         }
         try {
-          this.audit('TOOL.result', messageId, 'EXECUTE', {
-            tool: { id: tc?.id, ok: !isErr }
+          writeAudit(messageId, 'EXEC', 'tool_result', {
+            tool_call_id: tc?.id,
+            ok: !isErr
           })
         } catch {}
         // 标记对应授权块为已执行（consumed），避免后续重复执行
@@ -5315,6 +5325,24 @@ export class ThreadPresenter implements IThreadPresenter {
         } catch {}
       } catch (e) {
         console.error('[ThreadPresenter] Tool execution failed:', e)
+        try {
+          writeAudit(messageId, 'EXEC', 'tool_error', {
+            tool_call_id: tc?.id,
+            error: String(e)
+          })
+        } catch {}
+        try {
+          appendIoAggregate(messageId, {
+            type: 'tool_exec',
+            meta: {
+              tool_call_id: tc?.id,
+              server: serverName,
+              tool: tc?.name,
+              timestamp: Date.now()
+            },
+            ok: false
+          })
+        } catch {}
         // 标记失败
         let toolBlock = content.find((b) => b.type === 'tool_call' && b.tool_call?.id === tc?.id)
         if (!toolBlock) {
@@ -5393,34 +5421,28 @@ export class ThreadPresenter implements IThreadPresenter {
       return
     }
     // 触发继续作答
-    console.log('[ThreadPresenter] Starting continue stream', {
-      conversationId,
-      messageId
-    })
+    // quiet
     {
       const cur = this.generatingMessages.get(messageId)
       if (cur) {
         cur.continuationInProgress = true
-        const stateId = (cur as any)?.__id
-        console.log('[Continue/State]', { messageId, stateId, set: true })
+        // quiet
       }
     }
     try {
-      this.audit('CONT.start', messageId, 'R2')
       await this.startStreamCompletion(conversationId, messageId, undefined, 'toolcall_continue')
     } finally {
       {
         const cur = this.generatingMessages.get(messageId)
         if (cur) {
           cur.continuationInProgress = false
-          const stateId = (cur as any)?.__id
-          console.log('[Continue/State]', { messageId, stateId, set: false })
+          // quiet
         }
       }
-      this.audit('CONT.end', messageId, 'R2')
+      // quiet
       if (this.pendingContinuation.has(messageId)) {
         this.pendingContinuation.delete(messageId)
-        console.log('[Continue/Dequeue]', { messageId })
+        // quiet
         await this.executeGrantedToolsAndContinue(messageId)
       }
     }
@@ -5428,21 +5450,12 @@ export class ThreadPresenter implements IThreadPresenter {
 
   // 调试：打印权限块摘要
   private logPermissionSummary(
-    content: AssistantMessageBlock[] | undefined,
-    where: string,
-    messageId: string
+    _content: AssistantMessageBlock[] | undefined,
+    _where: string,
+    _messageId: string
   ) {
-    if (!content) return
-    try {
-      const perms = content.filter(
-        (b) => b.type === 'action' && (b as any).action_type === 'tool_call_permission'
-      )
-      const pending = perms.filter((b) => b.status === 'pending').length
-      const granted = perms.filter((b) => b.status === 'granted').length
-      const denied = perms.filter((b) => b.status === 'denied').length
-      const error = perms.filter((b) => b.status === 'error').length
-      console.log('[Permission/Summary]', { where, messageId, pending, granted, denied, error })
-    } catch {}
+    // Deprecated: summary is covered via writeAudit('PERM','status')
+    return
   }
 
   /**
@@ -5505,7 +5518,7 @@ export class ThreadPresenter implements IThreadPresenter {
     const state = this.generatingMessages.get(eventId)
     if (!state) return
 
-    console.log(`[ThreadPresenter] Processing large content in chunks: ${content.length} bytes`)
+    // quiet
 
     const lastBlock = state.message.content[state.message.content.length - 1]
     let contentBlock: any

@@ -36,6 +36,7 @@ import { TogetherProvider } from './providers/togetherProvider'
 import { GrokProvider } from './providers/grokProvider'
 import { GroqProvider } from './providers/groqProvider'
 import { presenter } from '@/presenter'
+import { writeIODetail, writeAudit, LOG_IO_DETAIL } from '@/logger'
 import { ZhipuProvider } from './providers/zhipuProvider'
 import { LMStudioProvider } from './providers/lmstudioProvider'
 import { OpenAIResponsesProvider } from './providers/openAIResponsesProvider'
@@ -47,10 +48,7 @@ import { ModelscopeProvider } from './providers/modelscopeProvider'
 import { VercelAIGatewayProvider } from './providers/vercelAIGatewayProvider'
 import { LLMTraceWriter } from './llmTrace'
 
-// IO logs: output full LLM request messages and streamed responses
-const DEBUG_LLM_IO_LOG = true
-// IO detail logs: toggle writing detailed tool definitions (toolsRaw) and SSE frames
-const DEBUG_LLM_IO_DETAIL = false
+// Debug flags removed; use LOG_IO/LOG_IO_DETAIL in logger/config instead
 
 // Rate limit configuration interface
 interface RateLimitConfig {
@@ -709,7 +707,7 @@ export class LLMProviderPresenter implements ILlmProviderPresenter {
     forcedSearch?: boolean,
     searchStrategy?: 'turbo' | 'max'
   ): AsyncGenerator<LLMAgentEvent, void, unknown> {
-    console.log(`[Agent Loop] Starting agent loop for event: ${eventId} with model: ${modelId}`)
+    // quiet console; mirrored via audit STREAM.start/iteration
     // Phase index per eventId to distinguish R1/R2 when the same assistant message continues
     ;(this as any)._llmIoPhaseCounters =
       (this as any)._llmIoPhaseCounters || new Map<string, number>()
@@ -810,8 +808,17 @@ export class LLMProviderPresenter implements ILlmProviderPresenter {
         const currentToolChunks: Record<string, { name: string; arguments_chunk: string }> = {}
 
         try {
-          console.log(`[Agent Loop] Iteration start for event: ${eventId}`)
+          // quiet
+          try {
+            writeIODetail(eventId, 'llm_iteration', { phase: 'begin' } as any)
+          } catch {}
+          try {
+            writeAudit(eventId, 'STREAM', 'iteration', { phase: 'begin' })
+          } catch {}
           const mcpTools = await presenter.mcpPresenter.getAllToolDefinitions(enabledMcpTools)
+          try {
+            if (LOG_IO_DETAIL) writeIODetail(eventId, 'tool_definitions', { tools: mcpTools || [] })
+          } catch {}
           const canExecute = this.canExecuteImmediately(providerId)
           if (!canExecute) {
             const config = this.getProviderRateLimitConfig(providerId)
@@ -838,16 +845,13 @@ export class LLMProviderPresenter implements ILlmProviderPresenter {
           }
 
           // Call the provider's core stream method, expecting LLMCoreStreamEvent
-          if (DEBUG_LLM_IO_LOG) {
-            try {
-              console.log('[IO/LLM/Request]', {
-                eventId,
-                providerId,
-                modelId,
-                messageCount: conversationMessages.length
-              })
-            } catch {}
-          }
+          try {
+            writeIODetail(eventId, 'llm_request', {
+              provider: providerId,
+              model: modelId,
+              messageCount: conversationMessages.length
+            } as any)
+          } catch {}
           // Dump request body (normalized, provider-agnostic)
           try {
             trace.writeRequest({
@@ -858,7 +862,7 @@ export class LLMProviderPresenter implements ILlmProviderPresenter {
                 function: { name: t.function.name, parameters: (t as any).inputSchema || {} }
               })),
               // Only persist raw tool definitions when detailed IO logging is enabled
-              ...(DEBUG_LLM_IO_DETAIL ? { toolsRaw: mcpTools || [] } : {}),
+              ...(LOG_IO_DETAIL ? { toolsRaw: mcpTools || [] } : {}),
               stream: true,
               temperature,
               maxTokens,
@@ -888,7 +892,7 @@ export class LLMProviderPresenter implements ILlmProviderPresenter {
             }
             // console.log('presenter chunk', JSON.stringify(chunk), currentContent)
             // Add structured frame for full trace (provider-agnostic)
-            if (DEBUG_LLM_IO_DETAIL) {
+            if (LOG_IO_DETAIL) {
               try {
                 trace.addFrame(chunk)
               } catch {}
@@ -896,6 +900,10 @@ export class LLMProviderPresenter implements ILlmProviderPresenter {
 
             // --- Event Handling (using LLMCoreStreamEvent structure) ---
             // Per-chunk response logging is intentionally muted; we log aggregated final text instead
+            // Detail IO: mirror raw frames
+            try {
+              if (LOG_IO_DETAIL) writeIODetail(eventId, 'llm_sse_frame', { frame: chunk } as any)
+            } catch {}
             switch (chunk.type) {
               case 'text':
                 if (chunk.content) {
@@ -1025,6 +1033,9 @@ export class LLMProviderPresenter implements ILlmProviderPresenter {
                   try {
                     trace.setUsage({ ...totalUsage })
                   } catch {}
+                  try {
+                    writeIODetail(eventId, 'llm_usage_agg', { ...totalUsage } as any)
+                  } catch {}
                 }
                 break
               case 'image_data':
@@ -1064,11 +1075,15 @@ export class LLMProviderPresenter implements ILlmProviderPresenter {
                 }
                 break
               case 'stop':
-                console.log(
-                  `Provider stream stopped for event ${eventId}. Reason: ${chunk.stop_reason}`
-                )
+                // quiet
                 try {
                   trace.setStopReason(chunk.stop_reason)
+                } catch {}
+                try {
+                  writeIODetail(eventId, 'llm_stop_reason', { reason: chunk.stop_reason } as any)
+                } catch {}
+                try {
+                  writeAudit(eventId, 'PROVIDER', 'stop_reason', { reason: chunk.stop_reason })
                 } catch {}
                 if (chunk.stop_reason === 'tool_use') {
                   // Consolidate any remaining tool call chunks
@@ -1113,13 +1128,10 @@ export class LLMProviderPresenter implements ILlmProviderPresenter {
           }
 
           // IO aggregated: log final text for this iteration
-          if (DEBUG_LLM_IO_LOG) {
-            try {
-              if (typeof currentContent === 'string' && currentContent.length > 0) {
-                console.log('[IO/LLM/FinalText]', { eventId, text: currentContent })
-              }
-            } catch {}
-          }
+          try {
+            if (typeof currentContent === 'string' && currentContent.length > 0)
+              writeIODetail(eventId, 'llm_final_text', { text: currentContent } as any)
+          } catch {}
 
           // Finalize and write response trace
           try {
@@ -1171,7 +1183,13 @@ export class LLMProviderPresenter implements ILlmProviderPresenter {
         }
       } // --- End of Agent Loop (while) ---
 
-      console.log(`[Agent Loop] Agent loop completed for event: ${eventId}`)
+      // quiet
+      try {
+        writeIODetail(eventId, 'llm_iteration', { phase: 'end' } as any)
+      } catch {}
+      try {
+        writeAudit(eventId, 'STREAM', 'iteration', { phase: 'end' })
+      } catch {}
     } catch (error) {
       // Catch errors from the generator setup phase (before the loop)
       if (abortController.signal.aborted) {
@@ -1214,14 +1232,6 @@ export class LLMProviderPresenter implements ILlmProviderPresenter {
       }
       // Yield the final END event (include planned_tool_calls in collect-only mode)
       if (plannedToolCallsForEnd && plannedToolCallsForEnd.length > 0) {
-        if (DEBUG_LLM_IO_LOG) {
-          try {
-            console.log('[IO/LLM/PlannedTools]', {
-              eventId,
-              planned: plannedToolCallsForEnd.map((t) => ({ id: t.id, name: t.name }))
-            })
-          } catch {}
-        }
         yield {
           type: 'end',
           data: { eventId, userStop, planned_tool_calls: plannedToolCallsForEnd }

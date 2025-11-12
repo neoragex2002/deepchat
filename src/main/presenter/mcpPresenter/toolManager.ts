@@ -47,7 +47,8 @@ export class ToolManager {
   public async decidePermission(
     serverName: string,
     toolName: string,
-    argsString?: string | null
+    argsString?: string | null,
+    eventId?: string
   ): Promise<{
     decision: 'AUTO_GRANT' | 'AUTO_DENY' | 'REQUIRE_USER_PERMISSION'
     required: 'read' | 'write' | 'all'
@@ -104,25 +105,37 @@ export class ToolManager {
         perToolCovers = this.coversList(lists, required)
       } catch {}
 
-      console.log('[ToolManager/AuthDecider]', {
-        server: serverName,
-        tool: toolName,
-        required,
-        serverCovers,
-        perToolCovers
-      })
+      // Print decision info to console (as before) and also audit if eventId provided
 
       if (serverCovers || perToolCovers) {
+        if (eventId) {
+          const { writeAudit } = await import('@/logger')
+          try {
+            writeAudit(eventId, 'PERM', 'decide', {
+              server: serverName,
+              tool: toolName,
+              required,
+              decision: 'AUTO_GRANT'
+            })
+          } catch {}
+        }
         return { decision: 'AUTO_GRANT', required }
       }
     } catch {}
 
     // 3) Heuristic fallback: be conservative — require user permission
-    console.log('[ToolManager/AuthDecider] Require user permission', {
-      server: serverName,
-      tool: toolName,
-      required
-    })
+    // quiet
+    if (eventId) {
+      const { writeAudit } = await import('@/logger')
+      try {
+        writeAudit(eventId, 'PERM', 'decide', {
+          server: serverName,
+          tool: toolName,
+          required,
+          decision: 'REQUIRE_USER_PERMISSION'
+        })
+      } catch {}
+    }
     return { decision: 'REQUIRE_USER_PERMISSION', required }
   }
 
@@ -502,16 +515,11 @@ export class ToolManager {
 
   async callTool(toolCall: MCPToolCall): Promise<MCPToolResponse> {
     try {
+      const eventId = (toolCall as any)?.eventId as string | undefined
       const finalName = toolCall.function.name
       const argsString = toolCall.function.arguments
 
-      // Full arguments logging (debug)
-      console.info('[MCP] Call', {
-        toolCallId: toolCall.id,
-        tool: finalName,
-        server: toolCall.server?.name || 'unknown',
-        rawArguments: argsString
-      })
+      // quiet
 
       // Ensure definitions and map are loaded/cached
       await this.getAllToolDefinitions()
@@ -539,13 +547,7 @@ export class ToolManager {
       const { client: targetClient, originalName } = targetInfo
       const toolServerName = targetClient.serverName
 
-      // Log the call details including original name (full)
-      console.info('[MCP] ToolManager calling tool', {
-        requestedName: finalName,
-        originalName: originalName,
-        serverName: toolServerName,
-        rawArguments: argsString
-      })
+      // quiet
 
       // Parse arguments
       let args: Record<string, unknown> | null = null
@@ -591,9 +593,7 @@ export class ToolManager {
         // 消费时两把键同时删除，保证“一次性授权只能用一次”
         this.oneTimeGrantsByServerTool.delete(otKey)
         this.oneTimeGrantsByServerTool.delete(altKey)
-        console.log('[ToolManager] One-time grant consumed (server/tool).', {
-          consumedKeys: [otKey, altKey]
-        })
+        // quiet
       }
       if (!hasPermission) {
         // Use originalName for permission check (silent) against server.autoApprove
@@ -619,20 +619,14 @@ export class ToolManager {
         // No second-confirmation path: treat as execution error and let LLM adjust.
         const permissionType = requiredPermission
         try {
-          const previewArgs = (() => {
-            try {
-              return JSON.stringify(args)?.slice(0, 500)
-            } catch {
-              return String(args).slice(0, 500)
-            }
-          })()
-          console.info('[MCP] Perm.denied', {
-            toolCallId: toolCall.id,
-            tool: originalName,
-            server: toolServerName,
-            permissionType,
-            argsPreview: previewArgs
-          })
+          if (eventId) {
+            const { writeAudit } = await import('@/logger')
+            writeAudit(eventId, 'PERM', 'denied', {
+              server: toolServerName,
+              tool: originalName,
+              required: permissionType
+            })
+          }
         } catch {}
         return {
           toolCallId: toolCall.id,
@@ -685,80 +679,7 @@ export class ToolManager {
       }
 
       // Log tool result with full content for debugging
-      try {
-        try {
-          console.info('[MCP] Tool full result', JSON.stringify(result, null, 2))
-        } catch {
-          console.info('[MCP] Tool full result (raw object printed next):')
-          // eslint-disable-next-line no-console
-          console.info(result)
-        }
-        const MAX_LOG_CHARS = 1000
-        const summarizeArrayContent = (items: unknown[]): unknown => {
-          // Only log types and short previews to avoid huge dumps
-          return items.slice(0, 5).map((it) => {
-            if (typeof it === 'string')
-              return { type: 'text', preview: JSON.stringify(it).slice(0, 200) }
-            const anyItem = it as {
-              type?: string
-              text?: string
-              mimeType?: string
-              resource?: unknown
-            }
-            if (anyItem && anyItem.type === 'text' && typeof anyItem.text === 'string') {
-              return { type: 'text', preview: JSON.stringify(anyItem.text).slice(0, 200) }
-            }
-            if (anyItem && anyItem.type === 'image') {
-              return { type: 'image', mimeType: anyItem.mimeType || 'unknown' }
-            }
-            if (anyItem && anyItem.type === 'resource') {
-              return { type: 'resource' }
-            }
-            return { type: typeof it }
-          })
-        }
-        const contentSummary = (() => {
-          if (typeof result.content === 'string') {
-            const s = JSON.stringify(result.content)
-            return { kind: 'string', length: s.length, preview: s.slice(0, MAX_LOG_CHARS) }
-          }
-          if (Array.isArray(result.content)) {
-            return {
-              kind: 'array',
-              length: result.content.length,
-              items: summarizeArrayContent(result.content)
-            }
-          }
-          return { kind: typeof result.content }
-        })()
-        const structuredSummary = (() => {
-          const anyRes = result as unknown as { structured_content?: any }
-          if (!anyRes || !anyRes.structured_content) return undefined
-          const sc = anyRes.structured_content
-          const keys = [
-            'exit_code',
-            'duration_seconds',
-            'timed_out',
-            'line_count',
-            'truncated',
-            'budgets',
-            'effective_arguments'
-          ]
-          const out: Record<string, unknown> = {}
-          for (const k of keys) if (k in sc) out[k] = sc[k]
-          return out
-        })()
-        console.info('[MCP] Tool result', {
-          toolCallId: toolCall.id,
-          tool: originalName,
-          server: toolServerName,
-          isError: result.isError,
-          content: contentSummary,
-          structured: structuredSummary
-        })
-      } catch (e) {
-        console.warn('[MCP] Failed to log tool result preview:', e)
-      }
+      // quiet
 
       // Trigger event
       eventBus.send(MCP_EVENTS.TOOL_CALL_RESULT, SendTarget.ALL_WINDOWS, response)
@@ -830,7 +751,8 @@ export class ToolManager {
     serverName: string,
     permissionType: 'read' | 'write' | 'all',
     remember: boolean = true,
-    toolName?: string
+    toolName?: string,
+    eventId?: string
   ): Promise<void> {
     console.log(
       `[ToolManager] Granting permission: ${permissionType} for server: ${serverName}, remember: ${remember}`
@@ -876,10 +798,16 @@ export class ToolManager {
         const keyFinal = `${serverName}|${finalName}`
         this.oneTimeGrantsByServerTool.set(keyOriginal, effective)
         this.oneTimeGrantsByServerTool.set(keyFinal, effective)
-        console.log('[ToolManager] Temporary one-time grant recorded (server/tool).', {
-          keyOriginal,
-          keyFinal
-        })
+        if (eventId) {
+          const { writeAudit } = await import('@/logger')
+          try {
+            writeAudit(eventId, 'PERM', 'one_time_grant_recorded', {
+              server: serverName,
+              tool: finalName,
+              permission: effective
+            })
+          } catch {}
+        }
       }
     }
   }

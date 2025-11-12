@@ -154,3 +154,8 @@ export const RAG_EVENTS = {
 export const SYSTEM_EVENTS = {
   SYSTEM_THEME_UPDATED: 'system:theme-updated'
 }
+
+// 日志相关事件（UI -> Main 审计镜像）
+export const LOGGER_EVENTS = {
+  AUDIT_UI: 'logger:audit-ui'
+}

@@ -6,14 +6,14 @@ import iconWin from '../../../../resources/icon.ico?asset' // App icon (Windows)
 import { is } from '@electron-toolkit/utils' // Electron utilities
 import { IConfigPresenter, IWindowPresenter } from '@shared/presenter' // Window Presenter interface
 import { eventBus } from '@/eventbus' // Event bus
-import { CONFIG_EVENTS, SYSTEM_EVENTS, WINDOW_EVENTS } from '@/events' // System/Window/Config event constants
+import { CONFIG_EVENTS, SYSTEM_EVENTS, WINDOW_EVENTS, LOGGER_EVENTS } from '@/events' // System/Window/Config event constants
 import { presenter } from '../' // Global presenter registry
 import windowStateManager from 'electron-window-state' // Window state manager
 import { SHORTCUT_EVENTS } from '@/events' // Shortcut event constants
 // TrayPresenter is globally managed in main/index.ts, this Presenter is not responsible for its lifecycle
 import { TabPresenter } from '../tabPresenter' // TabPresenter type
-import { DEBUG_ROLLBACK_MIN } from '@shared/debug'
 import { FloatingChatWindow } from './FloatingChatWindow' // Floating chat window
+import { writeAudit } from '@/logger'
 
 /**
  * Window Presenter, responsible for managing all BrowserWindow instances and their lifecycles.
@@ -55,15 +55,15 @@ export class WindowPresenter implements IWindowPresenter {
       event.returnValue = event.sender.id
     })
 
-    // Minimal UI->Main debug logging channel (guarded by DEBUG_ROLLBACK_MIN)
-    ipcMain.on('debug:ui-log', (_event, data: { label: string; payload: any }) => {
+    // UI -> Main audit mirror channel
+    ipcMain.on(LOGGER_EVENTS.AUDIT_UI, (_event, data: any) => {
       try {
-        if (DEBUG_ROLLBACK_MIN) {
-          const safe = JSON.stringify(data?.payload ?? {})
-          console.log(`[${data?.label || 'UI.Log'}]`, safe)
+        const { eventId, action, ...rest } = data || {}
+        if (eventId && action) {
+          writeAudit(String(eventId), 'UI', String(action), { ...rest })
         }
       } catch (e) {
-        console.warn('Failed to print UI debug log:', e)
+        console.warn('Failed to write UI audit mirror:', e)
       }
     })
 

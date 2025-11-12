@@ -185,12 +185,13 @@ export class McpPresenter implements IMCPPresenter {
   public async decideToolCallPermission(
     serverName: string,
     toolName: string,
-    args: string | undefined | null
+    args: string | undefined | null,
+    eventId?: string
   ): Promise<{
     decision: 'AUTO_GRANT' | 'AUTO_DENY' | 'REQUIRE_USER_PERMISSION'
     required: 'read' | 'write' | 'all'
   }> {
-    return await this.toolManager.decidePermission(serverName, toolName, args)
+    return await this.toolManager.decidePermission(serverName, toolName, args, eventId)
   }
 
   // =============== McpRouter marketplace APIs ===============
@@ -1185,13 +1186,20 @@ export class McpPresenter implements IMCPPresenter {
     serverName: string,
     permissionType: 'read' | 'write' | 'all',
     remember: boolean = false,
-    toolName?: string
+    toolName?: string,
+    eventId?: string
   ): Promise<void> {
     try {
       console.log(
         `[MCP] Granting ${permissionType} permission for server: ${serverName}, remember: ${remember}, toolName: ${toolName || 'n/a'}`
       )
-      await this.toolManager.grantPermission(serverName, permissionType, remember, toolName)
+      await this.toolManager.grantPermission(
+        serverName,
+        permissionType,
+        remember,
+        toolName,
+        eventId
+      )
       console.log(
         `[MCP] Successfully granted ${permissionType} permission for server: ${serverName}`
       )

@@ -1251,7 +1251,8 @@ export interface IMCPPresenter {
     serverName: string,
     permissionType: 'read' | 'write' | 'all',
     remember?: boolean,
-    toolName?: string
+    toolName?: string,
+    eventId?: string
   ): Promise<void>
   // NPM Registry management methods
   getNpmRegistryStatus?(): Promise<{

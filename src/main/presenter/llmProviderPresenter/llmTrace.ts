@@ -42,8 +42,8 @@ export class LLMTraceWriter {
     providerId: string
     modelId: string
   }) {
-    // Use 'llm-trace' folder to match project documentation
-    this.baseDir = opts.baseDir || path.resolve(process.cwd(), 'logs', 'llm-trace')
+    // Aggregated JSON big objects stored under logs/io
+    this.baseDir = opts.baseDir || path.resolve(process.cwd(), 'logs', 'io')
     this.convId = opts.conversationId
     this.eventId = opts.eventId
     this.phaseIndex = opts.phaseIndex
