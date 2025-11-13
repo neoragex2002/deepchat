@@ -61,16 +61,16 @@
 
 | Kind | 职责 | Actions |
 | :--- | :--- | :--- |
-| **STREAM** | **流式生成阶段管理** | `start`, `end`, `error`, `iteration` |
+| **STREAM** | **流式生成阶段管理** | `start`, `end`, `iteration` |
 | **BARRIER** | **同步屏障管理 (stop=tool_use 后)** | `sent`, `ack`, `timeout`, `gate_on`, `gate_off`, `cancelled` |
 | **ME** | **权威提交 (Message Edited)** | `emit`, `finalize` |
 | **PERM** | **授权全生命周期** | `plan`, `inject`, `user_action`, `persist`, `status`, `decide`, `denied` |
-| **EXEC** | **工具执行与继续作答** | `tool_start`, `tool_result`, `tool_error`, `continue_start`, `continue_state`, `continue_end`, `context_mode`, `context_pick`, `budget`, `supports_fc`, `context_summary` |
+| **EXEC** | **工具执行与继续作答** | `tool_start`, `tool_result`, `tool_error`, `context_mode`, `context_pick`, `budget`, `supports_fc`, `context_summary` |
 | **LIMIT** | **工具调用限流** | `soft_degrade`, `hard_cut` |
 | **SEARCH** | **R-prepare 搜索迷你阶段** | `begin`, `rewrite_scope`, `rewrite_result`, `reading`, `success`, `error`, `attachment_saved`, `gate`, `gate_decision` |
 | **CANCEL** | **统一取消 (ACE) 流程** | `start`, `done`, `end_fallback_used` |
 | **PROVIDER** | **底层 LLM Provider 状态** | `stop_reason`, `usage_agg`, `error` |
-| **UI** | **渲染端关键镜像事件** | `drain_ack`, `fence_set`, `fence_cleared`, `downgrade_drop` |
+| **UI** | **渲染端关键镜像事件** | `fence_set`, `fence_cleared`, `downgrade_drop` |
 
 *注：详细的 `action` 及其携带的字段见附录 A。*
 
@@ -101,15 +101,17 @@
 2.  **`PROVIDER.stop_reason`** (`reason: "tool_use"`): LLM 决定使用工具，S 阶段结束。
 3.  **`BARRIER.gate_on`**: 系统进入同步屏障，准备隔离 STREAM 和 ME。
 4.  **`BARRIER.sent`**: 向 UI 发送 `DRAIN` 信号，要求排干流式渲染队列。
-5.  **`UI.drain_ack`** 或 **`BARRIER.ack`**: UI 确认渲染完毕，屏障解除。
-6.  **`PERM.plan`**: 系统规划出需要授权的工具。
-7.  **`PERM.user_action`** (`decision: "grant"`): 用户批准了工具的执行。
-8.  **`EXEC.tool_start`**: 工具开始执行。
-9.  **`EXEC.tool_result`** (`ok: true`): 工具成功执行完毕。
-10. **`ME.emit`**: 将工具结果作为权威状态提交。
-11. **`EXEC.continue_start`**: 启动 R2 阶段，让模型继续作答。
-12. **`STREAM.end`** (`final: true`): R2 阶段结束，整个 Agent 交互轮次完成。
-13. **`BARRIER.gate_off`**: 关闭屏障门控。
+5.  **`UI.fence_set`**: (UI 侧) 收到 DRAIN，设置围栏。
+6.  **`BARRIER.ack`**: (主进程侧) 收到 UI 的 ACK，屏障解除。
+7.  **`PERM.plan`**: 系统规划出需要授权的工具。
+8.  **`PERM.user_action`** (`decision: "grant"`): 用户批准了工具的执行。
+9.  **`EXEC.tool_start`**: 工具开始执行。
+10. **`EXEC.tool_result`** (`ok: true`): 工具成功执行完毕。
+11. **`ME.emit`**: 将工具结果作为权威状态提交。
+12. **`EXEC.context_mode`**: (R2) 开始准备继续作答。
+13. **`STREAM.start`**: R2 阶段的流式开始。
+14. **`STREAM.end`** (`final: true`): R2 阶段结束，整个 Agent 交互轮次完成。
+15. **`BARRIER.gate_off`**: 关闭屏障门控。
 
 ---
 
@@ -138,6 +140,7 @@ IO 日志通过 `type` 字段来区分不同的记录类型。
 *   **IO 聚合 (`logs/io/<eventId>.json`)**
     *   **结构：** JSON 数组，每个元素代表一次相位/阶段（如 LLM 请求响应、工具执行）。
     *   **LLM 聚合：** 每个 LLM 请求响应相位包含 `phaseIndex`, `request` (meta, body), `response` (meta, status, reconstructed, error?, planned_tool_calls?)。
+        *   `request.body` 是**深拷贝**的快照，防止后续内存修改污染原始请求记录。
         *   `reconstructed`: 包含模型重构的助手消息 (`role:'assistant'`, `content`, `tool_calls[]`, `stop_reason?`, `usage?`)。
         *   `sseRaw`/`frames` 仅在 `LOG_IO_DETAIL=true` 时写入。
     *   **工具执行聚合：** 追加元素 `{ type:'tool_exec', ok:boolean, meta:{ tool_call_id, server, tool, timestamp } }`。成功与失败路径均写一条。
@@ -178,7 +181,7 @@ IO 日志通过 `type` 字段来区分不同的记录类型。
 
 ## 6. 实施指南与最佳实践
 
-*   **写盘职责：** 日志的写盘操作应由主进程统一负责，以避免多进程并发写入导致的文件损坏。渲染层的 UI 事件应以轻量级消息回传主进程后落盘。
+*   **写盘职责：** 日志的写盘操作由主进程统一负责，以避免多进程并发写入导致的文件损坏。渲染层的 UI 事件以轻量级消息（通过 `LOGGER_EVENTS.AUDIT_UI` IPC 通道）回传主进程后落盘。
 *   **冗余控制：**
     *   大型载荷（payload）一律进入 IO 日志；审计日志仅记录摘要和关键标识。
     *   同义信息不重复记录。例如，`final: true` 仅在 `STREAM.end` 中出现一次。
@@ -208,7 +211,6 @@ IO 日志通过 `type` 字段来区分不同的记录类型。
 *   **STREAM** (流阶段)
     *   `start` {}
     *   `end` { `final`: boolean } // final=true 才解除“生成中”
-    *   `error` { `error`: string }
     *   `iteration` { `phase`: 'begin'|'end' } // 仅保留低频起止
 
 *   **ME** (权威提交)
@@ -232,9 +234,6 @@ IO 日志通过 `type` 字段来区分不同的记录类型。
     *   `tool_start` { `tool_call_id`: string, `server`: string, `tool`: string }
     *   `tool_result` { `tool_call_id`: string, `ok`: boolean, `durationMs`?: number }
     *   `tool_error` { `tool_call_id`: string, `error`: string }
-    *   `continue_start` {}
-    *   `continue_state` { `set`: boolean, `stateId`: number }
-    *   `continue_end` {}
     *   `context_mode` { `mode`: 'toolcall_continue'|'msg_retry' }
     *   `context_pick` { `step`: 'begin'|'use_current'|'injected_assistant'|'final', `queryMsgId`?: string, `resolvedUserMsgId`?: string, `baseContextCount`?: number, `assistantId`?: string, `variant`?: 'main'|'variant', `injectedId`?: string, `newContextCount`?: number, `injectedAssistantAppended`?: boolean, `selectedCount`?: number }
     *   `budget` { `injectedTokens`: number, `remainingContextLength`: number, `adjustedBudget`: number }
@@ -263,7 +262,6 @@ IO 日志通过 `type` 字段来区分不同的记录类型。
     *   `error` { `error`: string }
 
 *   **UI** (渲染端镜像)
-    *   `drain_ack` { `sseqLast`: number }
     *   `fence_set` { `sseqLast`: number }
     *   `fence_cleared` {}
     *   `downgrade_drop` { `block`: 'tool'|'perm', `from`: string|number, `to`: string|number }

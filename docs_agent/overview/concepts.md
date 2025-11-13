@@ -198,7 +198,6 @@ sequenceDiagram
 *   **Provider 收敛与 `planned_tool_calls`：** `src/main/presenter/llmProviderPresenter/index.ts` (核心逻辑), `src/main/presenter/llmProviderPresenter/llmTrace.ts` (IO 日志记录)
 *   **日志落盘：** `src/main/logger/audit.ts` (审计日志), `src/main/logger/aggregate.ts` (聚合逻辑), `src/main/logger/io.ts` (IO 日志)
 *   **UI 消息合并逻辑：** `src/renderer/src/stores/chat.ts` (特别是 `mergeAssistantMessage` 及其调用点)
-*   **术语定义源：** `docs_luy/background/terminology.md` (原始详细定义)
 
 ---
 

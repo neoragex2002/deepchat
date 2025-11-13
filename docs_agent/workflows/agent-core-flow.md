@@ -159,7 +159,7 @@ sequenceDiagram
 
 ### 3.4 阶段 4: 纯 ME (Message Edited) 阶段
 
-*   **目的：** 在同步屏障后，集中处理所有需要**权威落库**的业务逻辑，包括限流、权限决策与注入、工具执行。此阶段所有对 UI 的状态更新都通过 `MESSAGE_EDITED` 事件完成，**不再有 `STREAM` 事件**。
+  * **目的：** 在同步屏障后，集中处理所有需要**权威落库**的业务逻辑，包括限流、权限决策与注入、工具执行。此阶段所有对 UI 的状态更新都通过 `MESSAGE_EDITED` 事件完成，**不再有 `STREAM.RESPONSE` 事件**。
 *   **核心模块：** `ThreadPresenter` 统一协调 `ToolManager` 和 `MessageManager`。
 
 #### 3.4.1 限流检查 (LIMIT)
@@ -182,7 +182,7 @@ sequenceDiagram
 
 *   **时机：** 限流检查通过后，TP 对 `planned_tool_calls` 进行权限决策。
 *   **机制：**
-    1.  TP 调用 `ToolManager` 内的 **Auth Decider** 对每个工具进行权限预判，给出 `AUTO_GRANT`, `AUTO_DENY`, `REQUIRE_USER_PERMISSION` 决策。
+    1.  TP 调用 `ToolManager` 内的 **Auth Decider** 对每个工具进行预判，给出 `AUTO_GRANT`, `AUTO_DENY`, `REQUIRE_USER_PERMISSION` 决策。
     2.  TP 将生成的权限块（`pending`, `granted`, `denied`）通过一次 `MESSAGE_EDITED` 注入到消息中。UI 接收到权威更新后，展示待处理的权限块。
     3.  用户在 UI 上的“允许/拒绝”操作触发 `PERM.user_action` 事件，TP 接收后更新权限状态，并通过 `MESSAGE_EDITED` 再次提交。
     4.  **L1/L2 安全架构集成：** 权限决策阶段会与 L1 语义权限系统（确定性分类器）交互，确保 LLM 无法通过误报 `action` 类型绕过权限。
@@ -201,8 +201,8 @@ sequenceDiagram
 
 #### 3.4.4 阶段总结 (ME Phase Conclusion)
 
-*   在所有限流、权限、工具执行操作完成后，TP 会记录 `BARRIER.gate_off`，表示门控解除。
-*   最后，TP 发送 `STREAM.END` 事件，其唯一作用是**清理 UI 提示层**。`final` 标记（`true` 或 `false`）决定了 UI 是否应解除“生成中”的状态。
+  * **门控解除：** 在所有限流、权限、工具执行操作完成后，TP 会记录 `BARRIER.gate_off`。
+  * **清层信号：** 最后，TP 发送 `STREAM.END` 事件，其唯一作用是**清理 UI 提示层**。`final` 标记（`true` 或 `false`）决定了 UI 是否应解除“生成中”的状态。
 
 ### 3.5 阶段 5: R2 (Continuation / Iteration)
 

@@ -125,7 +125,7 @@ flowchart TD
 
 2.  **确定性动作分类器（强制验证）：**
     *   为了防止 LLM 被提示注入欺骗（例如，声明 `inspect` 但命令是 `rm -rf /`），系统会运行一个**极简的、确定性的分类器**。
-    *   该分类器**不信任 LLM 的 `action` 字段**，而是**只检查**命令的第一个词（即二进制名称）或核心操作符。
+    *   该分类器**不信任 LLM 的 `action` 字段**（如果 LLM 提供了的话），而是**只检查**命令的第一个词（即二进制名称）或核心操作符。
     *   使用一个内部 `Map` 或 `switch` 语句，将二进制名称强制映射到正确的动作空间（例如，`rm` -> `write`, `cat` -> `read`）。
     *   **审计与告警：** 如果 LLM 声明的权限与分类器判定的不一致，**必须记录一条高优先级告警日志**（例如 `PERM.classification_mismatch { claimed: 'inspect', actual: 'write', command: '...' }`），表明可能存在欺骗尝试。
     *   **决策覆盖：** 分类器判定的“真实动作”将**覆盖** LLM 的原始声明，作为后续策略判断的依据。
@@ -141,7 +141,7 @@ flowchart TD
 
 ### **4.4. 与 DeepChat 工作流的集成点**
 
-*   **集成点：** L1 权限决策发生在 `workflows/agent-core-flow.md` 中定义的 **纯 ME 阶段**，具体由 `ThreadPresenter` 调用 `ToolManager.AuthDecider` 完成。
+*   **集成点：** L1 权限决策发生在 `workflows/agent-core-flow.md` 中定义的 **纯 ME 阶段**，具体由 `ThreadPresenter` 调用 `ToolManager.decidePermission` 完成。
 *   **UI 交互：** 当决策为 `CONFIRM` 时，`ThreadPresenter` 会将一个 `tool_call_permission` 类型的 action block 注入到助手消息中，并通过 `MESSAGE_EDITED` 事件权威地更新 UI。UI 渲染可交互的权限请求块。
 *   **授权响应：** 用户在 UI 上的授权/拒绝操作，会通过 `ThreadPresenter.handlePermissionResponse` 更新权限块状态，并通过 `MESSAGE_EDITED` 再次权威提交。
 *   **日志：** L1 决策过程和结果通过 `overview/logging-spec.md` 中定义的 `PERM` 类别审计日志（`PERM.plan`, `PERM.inject`, `PERM.user_action`, `PERM.persist`, `PERM.status`, `PERM.decide`, `PERM.denied`）进行全面记录。
@@ -327,4 +327,4 @@ profile mcp_agent_profile /bin/bash flags=(complain) { # rbash 底层也是 /bin
 *   **L2 安全执行器 (ShellServer)：** `src/main/presenter/mcpPresenter/inMemoryServers/shellServer.ts` (命令解析与执行部分)。
 *   **一次性/记住授权逻辑：** `src/main/presenter/mcpPresenter/toolManager.ts` (`grantPermission`, `tempApprovals`, `toolsAutoApprove`)。
 *   **JIT-Refresh 逻辑：** `src/main/presenter/threadPresenter/index.ts` (工具执行结果处理及上下文注入)。
-*   **日志记录：** `src/main/presenter/llmProviderPresenter/llmTrace.ts` 和 `src/main/presenter/threadPresenter/index.ts` (审计日志打点)。
+*   **日志记录：** `src/main/logger/audit.ts` 和 `src/main/logger/io.ts` (审计日志打点)。
