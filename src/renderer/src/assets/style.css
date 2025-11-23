@@ -3,7 +3,6 @@
 @tailwind base;
 @tailwind components;
 @tailwind utilities;
-@plugin @tailwindcss/typography;
 
 @font-face {
   font-family: 'Geist';
@@ -85,6 +84,11 @@
     /* 亮黄 */
     --usage-high: 0 72% 51%;
     /* 亮红 */
+    /* Scrollbar tokens (light) */
+    --scrollbar-size: 8px;
+    --scrollbar-thumb: var(--base-300);
+    --scrollbar-thumb-hover: var(--base-400);
+    --scrollbar-track: transparent;
   }
 
   .dark {
@@ -128,6 +132,11 @@
     /* 暗黄 */
     --usage-high: 0 70% 65%;
     /* 暗红 */
+    /* Scrollbar tokens (dark) */
+    --scrollbar-size: 8px;
+    --scrollbar-thumb: var(--base-700);
+    --scrollbar-thumb-hover: var(--base-600);
+    --scrollbar-track: transparent;
   }
 }
 
@@ -162,4 +171,30 @@
   .font-text {
     font-weight: var(--text-weight);
   }
+}
+
+/* Global scrollbar styling (Chromium/WebKit + Firefox) */
+* {
+  scrollbar-width: thin; /* Firefox */
+  scrollbar-color: hsl(var(--scrollbar-thumb)) transparent; /* Firefox */
+}
+
+*::-webkit-scrollbar {
+  width: var(--scrollbar-size);
+  height: var(--scrollbar-size);
+}
+
+*::-webkit-scrollbar-thumb {
+  background: hsl(var(--scrollbar-thumb));
+  border-radius: 8px;
+  border: 2px solid transparent; /* creates inner padding */
+  background-clip: content-box;
+}
+
+*::-webkit-scrollbar-thumb:hover {
+  background: hsl(var(--scrollbar-thumb-hover));
+}
+
+*::-webkit-scrollbar-track {
+  background: var(--scrollbar-track);
 }

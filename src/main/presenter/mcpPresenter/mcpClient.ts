@@ -164,11 +164,10 @@ export class McpClient {
           this.client = new Client(
             { name: 'DeepChat', version: app.getVersion() },
             {
-              capabilities: {
-                resources: {},
-                tools: {},
-                prompts: {}
-              }
+              // Client capabilities schema changed in newer MCP SDK versions.
+              // Only advertise supported client-side capabilities here.
+              // Leaving empty defers to defaults and avoids using server-side keys (tools/resources/prompts).
+              capabilities: {}
             }
           )
 

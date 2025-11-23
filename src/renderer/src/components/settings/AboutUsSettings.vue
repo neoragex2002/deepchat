@@ -143,7 +143,9 @@
       <DialogHeader>
         <DialogTitle>{{ t('about.disclaimerTitle') }}</DialogTitle>
         <DialogDescription>
-          <div class="max-h-[300px] overflow-y-auto" v-html="disclaimerContent"></div>
+          <div class="max-h-[300px] overflow-y-auto">
+            <MarkdownRenderer :content="t('searchDisclaimer')" />
+          </div>
         </DialogDescription>
       </DialogHeader>
       <DialogFooter>
@@ -155,7 +157,7 @@
 
 <script setup lang="ts">
 import { usePresenter } from '@/composables/usePresenter'
-import { computed, onMounted, ref } from 'vue'
+import { onMounted, ref } from 'vue'
 import { useI18n } from 'vue-i18n'
 import { Button } from '@/components/ui/button'
 import { Icon } from '@iconify/vue'
@@ -174,7 +176,7 @@ import {
   SelectTrigger,
   SelectValue
 } from '@/components/ui/select'
-import { renderMarkdown, getCommonMarkdown } from 'vue-renderer-markdown'
+import MarkdownRenderer from '@/components/markdown/MarkdownRenderer.vue'
 import { useUpgradeStore } from '@/stores/upgrade'
 import { useLanguageStore } from '@/stores/language'
 
@@ -231,8 +233,7 @@ const handleCheckUpdate = async () => {
   // 不再自动打开对话框，而是由下载完成后自动弹出
 }
 
-const md = getCommonMarkdown()
-const disclaimerContent = computed(() => renderMarkdown(md, t('searchDisclaimer')))
+// 使用统一的 MarkdownRenderer 组件替代字符串渲染
 
 onMounted(async () => {
   deviceInfo.value = await devicePresenter.getDeviceInfo()

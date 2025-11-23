@@ -1,88 +1,36 @@
 <!-- eslint-disable vue/no-v-html -->
 <template>
   <div class="prose prose-sm dark:prose-invert w-full max-w-none break-all">
-    <NodeRenderer :content="content" @copy="$emit('copy', $event)" />
+    <NodeRenderer
+      :key="themeStore.isDark ? 'dark' : 'light'"
+      :content="content"
+      :message-id="messageId"
+      :thread-id="threadId"
+      @copy="$emit('copy', $event)"
+    />
   </div>
 </template>
 
 <script setup lang="ts">
-import { usePresenter } from '@/composables/usePresenter'
-import { useArtifactStore } from '@/stores/artifact'
-import { useReferenceStore } from '@/stores/reference'
+import { useThemeStore } from '@/stores/theme'
+import NodeRenderer from 'vue-renderer-markdown'
+import { defineEmits } from 'vue'
 import { nanoid } from 'nanoid'
-import { h, ref } from 'vue'
-import NodeRenderer, {
-  CodeBlockNode,
-  ReferenceNode,
-  setCustomComponents
-} from 'vue-renderer-markdown'
+// VRM 自定义组件已在全局模块 src/renderer/src/lib/vrm-init.ts 中注册
 
-defineProps<{
+const props = defineProps<{
   content: string
   debug?: boolean
+  messageId?: string
+  threadId?: string
 }>()
 
-// 组件映射表
-const artifactStore = useArtifactStore()
-// 生成唯一的 message ID 和 thread ID，用于 MarkdownRenderer
-const messageId = `artifact-msg-${nanoid()}`
-const threadId = `artifact-thread-${nanoid()}`
-const referenceStore = useReferenceStore()
-const threadPresenter = usePresenter('threadPresenter')
-const referenceNode = ref<HTMLElement | null>(null)
+const themeStore = useThemeStore()
 
-setCustomComponents({
-  reference: (_props) =>
-    h(ReferenceNode, {
-      ..._props,
-      messageId,
-      threadId,
-      onClick() {
-        threadPresenter.getSearchResults(_props.messageId ?? '').then((results) => {
-          const index = parseInt(_props.node.id)
-          if (index < results.length) {
-            window.open(results[index - 1].url, '_blank', 'noopener,noreferrer')
-          }
-        })
-      },
-      onMouseEnter() {
-        console.log('Mouse entered')
-        referenceStore.hideReference()
-        threadPresenter.getSearchResults(_props.messageId ?? '').then((results) => {
-          const index = parseInt(_props.node.id)
-          if (index - 1 < results.length && referenceNode.value) {
-            referenceStore.showReference(
-              results[index - 1],
-              referenceNode.value.getBoundingClientRect()
-            )
-          }
-        })
-      },
-      onMouseLeave() {
-        console.log('Mouse left')
-        referenceStore.hideReference()
-      }
-    }),
-  code_block: (_props) =>
-    h(CodeBlockNode, {
-      ..._props,
-      onPreviewCode(v) {
-        artifactStore.showArtifact(
-          {
-            id: v.id,
-            type: v.artifactType,
-            title: v.artifactTitle,
-            language: v.language,
-            content: v.node.code,
-            status: 'loaded'
-          },
-          messageId,
-          threadId
-        )
-      }
-    })
-})
-
+// Provide stable ids for preview/reference within this message scope.
+// Prefer caller-provided IDs (real message/thread) and fallback to random.
+const messageId = props.messageId || `artifact-msg-${nanoid()}`
+const threadId = props.threadId || `artifact-thread-${nanoid()}`
 defineEmits(['copy'])
 </script>
 

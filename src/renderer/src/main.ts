@@ -9,6 +9,8 @@ import router from './router'
 import { createI18n } from 'vue-i18n'
 import locales from './i18n'
 import 'vue-virtual-scroller/dist/vue-virtual-scroller.css'
+// Initialize VRM custom components and preload Monaco languages once at startup
+import './lib/vrm-init'
 import 'katex/dist/katex.min.css'
 
 const i18n = createI18n({

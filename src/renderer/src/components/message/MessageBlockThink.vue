@@ -23,10 +23,11 @@
       ref="messageBlock"
       class="w-full relative prose prose-sm dark:prose-invert max-w-full leading-7 break-all"
     >
-      <NodeRenderer
-        :renderCodeBlocksAsPre="true"
+      <MarkdownRenderer
         :content="props.block.content || ''"
-      ></NodeRenderer>
+        :message-id="props.messageId"
+        :thread-id="props.threadId"
+      />
     </div>
 
     <Icon
@@ -44,13 +45,15 @@ import { Icon } from '@iconify/vue'
 import { AssistantMessageBlock } from '@shared/chat'
 import { computed, onMounted, ref, watch } from 'vue'
 import { useI18n } from 'vue-i18n'
-import NodeRenderer from 'vue-renderer-markdown'
+import MarkdownRenderer from '@/components/markdown/MarkdownRenderer.vue'
 const props = defineProps<{
   block: AssistantMessageBlock
   usage: {
     reasoning_start_time: number
     reasoning_end_time: number
   }
+  messageId?: string
+  threadId?: string
 }>()
 const { t } = useI18n()
 

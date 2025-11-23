@@ -39,6 +39,8 @@
             v-else-if="block.type === 'reasoning_content'"
             :block="block"
             :usage="message.usage"
+            :message-id="currentMessage.id"
+            :thread-id="currentThreadId"
           />
           <MessageBlockSearch
             v-else-if="block.type === 'search'"

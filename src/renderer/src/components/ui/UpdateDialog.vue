@@ -9,8 +9,7 @@
               <p>{{ t('update.version') }}: {{ upgrade.updateInfo?.version }}</p>
               <p>{{ t('update.releaseDate') }}: {{ upgrade.updateInfo?.releaseDate }}</p>
               <p>{{ t('update.releaseNotes') }}:</p>
-              <p class="whitespace-pre-line"
-                v-html="renderMarkdown(getCommonMarkdown(), upgrade.updateInfo?.releaseNotes || '')" />
+              <MarkdownRenderer :content="upgrade.updateInfo?.releaseNotes || ''" />
 
               <!-- 显示下载进度 -->
               <div v-if="upgrade.isDownloading && upgrade.updateProgress" class="mt-4">
@@ -74,7 +73,7 @@ import {
   DialogTitle
 } from '@/components/ui/dialog'
 import { useUpgradeStore } from '@/stores/upgrade'
-import { renderMarkdown, getCommonMarkdown } from 'vue-renderer-markdown'
+import MarkdownRenderer from '@/components/markdown/MarkdownRenderer.vue'
 
 const { t } = useI18n()
 const upgrade = useUpgradeStore()

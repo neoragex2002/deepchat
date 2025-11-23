@@ -60,7 +60,8 @@ export default defineConfig({
         '@shell': resolve('src/renderer/shell'),
         '@shared': resolve('src/shared'),
         vue: 'vue/dist/vue.esm-bundler.js'
-      }
+      },
+      dedupe: ['monaco-editor']
     },
     css: {
       postcss: {
