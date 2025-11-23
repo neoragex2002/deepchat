@@ -1,4 +1,12 @@
-import { clipboard, contextBridge, nativeImage, webUtils, webFrame, ipcRenderer } from 'electron'
+import {
+  clipboard,
+  contextBridge,
+  nativeImage,
+  webUtils,
+  webFrame,
+  ipcRenderer,
+  shell
+} from 'electron'
 import { exposeElectronAPI } from '@electron-toolkit/preload'
 
 // Cache variables
@@ -36,6 +44,14 @@ const api = {
       ipcRenderer.send('debug:ui-log', { label, payload })
     } catch (e) {
       console.error('Preload: debugLog failed:', e)
+    }
+  },
+  openExternal: (url: string) => {
+    try {
+      return shell.openExternal(url)
+    } catch (e) {
+      console.error('Preload: openExternal failed:', e)
+      return Promise.resolve(false)
     }
   }
 }

@@ -16,3 +16,19 @@ interface ImportMetaEnv {
 interface ImportMeta {
   readonly env: ImportMetaEnv
 }
+
+declare global {
+  interface Window {
+    api: {
+      copyText: (text: string) => void
+      copyImage: (imageDataUrl: string) => void
+      getPathForFile: (file: File) => string
+      getWindowId: () => number | null
+      getWebContentsId: () => number
+      debugLog: (label: string, payload: unknown) => void
+      openExternal?: (url: string) => Promise<boolean> | void
+    }
+  }
+}
+
+export {}

@@ -25,16 +25,9 @@ import 'monaco-editor/esm/vs/basic-languages/shell/shell.contribution'
 import 'monaco-editor/esm/vs/basic-languages/powershell/powershell.contribution'
 import 'monaco-editor/esm/vs/basic-languages/sql/sql.contribution'
 import 'monaco-editor/esm/vs/basic-languages/dockerfile/dockerfile.contribution'
-import {
-  CodeBlockNode,
-  MermaidBlockNode,
-  ReferenceNode,
-  setCustomComponents
-} from 'vue-renderer-markdown'
+import { CodeBlockNode, MermaidBlockNode, setCustomComponents } from 'vue-renderer-markdown'
 import { useThemeStore } from '@/stores/theme'
 import { useArtifactStore } from '@/stores/artifact'
-import { usePresenter } from '@/composables/usePresenter'
-import { useReferenceStore } from '@/stores/reference'
 import { nanoid } from 'nanoid'
 
 // Register VRM custom components once at app start.
@@ -45,35 +38,6 @@ export function initVrmCustomComponents() {
   if (initialized) return
 
   setCustomComponents({
-    reference: (_props: any) => {
-      const threadPresenter = usePresenter('threadPresenter')
-      const referenceStore = useReferenceStore()
-      return h(ReferenceNode, {
-        ..._props,
-        onClick() {
-          threadPresenter.getSearchResults(_props.messageId ?? '').then((results) => {
-            const index = parseInt(_props.node.id)
-            if (index < results.length) {
-              window.open(results[index - 1].url, '_blank', 'noopener,noreferrer')
-            }
-          })
-        },
-        onMouseEnter(ev: MouseEvent) {
-          referenceStore.hideReference()
-          threadPresenter.getSearchResults(_props.messageId ?? '').then((results) => {
-            const index = parseInt(_props.node.id)
-            const el = (ev?.currentTarget as HTMLElement) || null
-            const rect = el?.getBoundingClientRect()
-            if (index - 1 < results.length && rect) {
-              referenceStore.showReference(results[index - 1], rect)
-            }
-          })
-        },
-        onMouseLeave() {
-          referenceStore.hideReference()
-        }
-      })
-    },
     mermaid: (_props: any) => {
       const themeStore = useThemeStore()
       return h(MermaidBlockNode, {

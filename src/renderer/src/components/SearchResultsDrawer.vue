@@ -65,7 +65,9 @@ defineEmits<{
   'update:open': [value: boolean]
 }>()
 
+import { openExternalSafe } from '@/lib/openExternal'
+
 const openUrl = (url: string) => {
-  window.open(url, '_blank')
+  openExternalSafe(url)
 }
 </script>
